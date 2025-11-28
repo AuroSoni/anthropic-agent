@@ -1,7 +1,7 @@
 import pytest
 
-from anthropic_agent.src.tools.base import ToolRegistry
-from anthropic_agent.src.tools.decorators import tool
+from anthropic_agent.tools.base import ToolRegistry
+from anthropic_agent.tools.decorators import tool
 
 
 @pytest.fixture()

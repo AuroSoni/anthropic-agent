@@ -436,7 +436,8 @@ class AnthropicAgent:
                 self.container_id = accumulated_message.container.id
             
             # Register any server-side generated files referenced in the assistant message
-            self._register_files_from_message(accumulated_message, step)
+            # TODO: Implement file backend
+            # self._register_files_from_message(accumulated_message, step)
             
             # Check if there are tool calls to execute
             # Only process tool calls if stop_reason is "tool_use"
@@ -570,8 +571,9 @@ class AnthropicAgent:
             }, step_number=step)
 
             # If file_backend is configured, enrich registry entries with backend metadata
-            if self.file_backend:
-                await self._process_generated_files(step)
+            # TODO: Implement file backend
+            # if self.file_backend:
+            #     await self._process_generated_files(step)
 
             # Always stream and return the full registry of known files (current and previous runs)
             all_files_metadata: list[dict[str, Any]] = list(self.file_registry.values())
@@ -798,7 +800,8 @@ class AnthropicAgent:
             self.container_id = accumulated_message.container.id
 
         # Register any server-side generated files referenced in the final summary
-        self._register_files_from_message(accumulated_message, self.max_steps)
+        # TODO: Implement file backend
+        # self._register_files_from_message(accumulated_message, self.max_steps)
 
         # Update memory store with final conversation results
         if self.memory_store:
@@ -837,8 +840,9 @@ class AnthropicAgent:
         }, step_number=self.max_steps)
 
         # If file_backend is configured, enrich registry entries with backend metadata
-        if self.file_backend:
-            await self._process_generated_files(self.max_steps)
+        # TODO: Implement file backend
+        # if self.file_backend:
+        #     await self._process_generated_files(self.max_steps)
 
         # Always stream and return the full registry of known files (current and previous runs)
         all_files_metadata: list[dict[str, Any]] = list(self.file_registry.values())

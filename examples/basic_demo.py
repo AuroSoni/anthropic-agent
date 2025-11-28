@@ -1,7 +1,7 @@
 """Example usage of AnthropicAgent with math tools."""
 import asyncio
 from anthropic_agent import AnthropicAgent
-from anthropic_agent.src.tools.sample_tools import SAMPLE_TOOL_SCHEMAS, execute_tool
+from anthropic_agent.tools.sample_tools import SAMPLE_TOOL_SCHEMAS, execute_tool
 
 
 async def main():

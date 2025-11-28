@@ -26,9 +26,9 @@ try:
 except ImportError:
     pass  # dotenv not installed, skip loading .env file
 
-# Core exports (source lives under src/)
-from .src.core import AgentResult, AnthropicAgent, anthropic_stream_with_backoff
-from .src.streaming import render_stream, stream_to_aqueue, FormatterType
+# Core exports
+from .core import AgentResult, AnthropicAgent, anthropic_stream_with_backoff
+from .streaming import render_stream, stream_to_aqueue, FormatterType
 
 __version__ = "0.1.0"
 

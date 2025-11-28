@@ -1,7 +1,7 @@
 import pytest
 
-from anthropic_agent.src.tools.decorators import tool
-from anthropic_agent.src.tools.type_hint_utils import TypeHintParsingException
+from anthropic_agent.tools.decorators import tool
+from anthropic_agent.tools.type_hint_utils import TypeHintParsingException
 
 
 def test_tool_decorator_attaches_schema() -> None:
