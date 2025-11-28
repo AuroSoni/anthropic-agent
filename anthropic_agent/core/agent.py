@@ -1141,7 +1141,7 @@ class AnthropicAgent:
             "log_id": len(self._run_logs_buffer) + 1,
             "agent_uuid": self.agent_uuid,
             "run_id": self._run_id,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(),
             "step_number": step_number,
             "action_type": action_type,
             "action_data": action_data,
@@ -1190,10 +1190,14 @@ class AnthropicAgent:
             "api_kwargs": self.api_kwargs,
             "last_known_input_tokens": self._last_known_input_tokens,
             "last_known_output_tokens": self._last_known_output_tokens,
-            # Preserve created_at from existing config, or set to now
-            "created_at": existing_config.get("created_at", datetime.now().isoformat()),
-            "updated_at": datetime.now().isoformat(),
-            "last_run_at": self._run_start_time.isoformat() if self._run_start_time else None,
+            # Preserve created_at from existing config, or set to now (as datetime)
+            "created_at": (
+                datetime.fromisoformat(existing_config["created_at"].replace("Z", "+00:00"))
+                if isinstance(existing_config.get("created_at"), str)
+                else (existing_config.get("created_at") or datetime.now())
+            ),
+            "updated_at": datetime.now(),
+            "last_run_at": self._run_start_time if self._run_start_time else None,
             # Increment total_runs counter
             "total_runs": existing_config.get("total_runs", 0) + 1,
         }
@@ -1243,8 +1247,8 @@ class AnthropicAgent:
             "conversation_id": str(uuid.uuid4()),
             "agent_uuid": self.agent_uuid,
             "run_id": self._run_id,
-            "started_at": self._run_start_time.isoformat(),
-            "completed_at": datetime.now().isoformat(),
+            "started_at": self._run_start_time,
+            "completed_at": datetime.now(),
             "user_message": user_message,
             "final_response": final_response,
             "messages": result.conversation_history,
@@ -1258,7 +1262,7 @@ class AnthropicAgent:
             },
             # Persist full file metadata snapshot associated with this run
             "generated_files": files_metadata,
-            "created_at": datetime.now().isoformat(),
+            "created_at": datetime.now(),
         }
         
         await self.db_backend.save_conversation_history(conversation)

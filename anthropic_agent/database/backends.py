@@ -136,6 +136,12 @@ class FilesystemBackend:
         (self.base_path / "conversation_history").mkdir(exist_ok=True)
         (self.base_path / "agent_runs").mkdir(exist_ok=True)
     
+    def _json_default(self, obj: Any) -> str:
+        """JSON serializer for objects not serializable by default json code."""
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+    
     async def save_agent_config(self, config: dict) -> None:
         """Save agent configuration to JSON file."""
         agent_uuid = config["agent_uuid"]
@@ -144,7 +150,7 @@ class FilesystemBackend:
         # Write atomically by writing to temp file then renaming
         temp_file = config_file.with_suffix(".tmp")
         with open(temp_file, "w") as f:
-            json.dump(config, f, indent=2)
+            json.dump(config, f, indent=2, default=self._json_default)
         temp_file.replace(config_file)
         
         logger.debug(f"Saved agent config for {agent_uuid}")
@@ -183,7 +189,7 @@ class FilesystemBackend:
         # Save conversation with padded sequence number
         conv_file = conv_dir / f"{next_sequence:03d}.json"
         with open(conv_file, "w") as f:
-            json.dump(conversation, f, indent=2)
+            json.dump(conversation, f, indent=2, default=self._json_default)
         
         # Update index
         index = {
@@ -238,7 +244,7 @@ class FilesystemBackend:
         # Write all logs in JSONL format
         with open(log_file, "w") as f:
             for log_entry in logs:
-                f.write(json.dumps(log_entry) + "\n")
+                f.write(json.dumps(log_entry, default=self._json_default) + "\n")
         
         logger.debug(f"Saved {len(logs)} log entries for run {run_id}")
     
@@ -321,12 +327,6 @@ class SQLBackend:
             self._pool = None
             logger.info("Closed PostgreSQL connection pool")
     
-    def _serialize_json(self, value: Any) -> str | None:
-        """Serialize a value to JSON string for JSONB columns."""
-        if value is None:
-            return None
-        return json.dumps(value)
-    
     def _parse_datetime(self, value: Any) -> str | None:
         """Parse datetime to ISO format string."""
         if value is None:
@@ -334,6 +334,59 @@ class SQLBackend:
         if isinstance(value, datetime):
             return value.isoformat()
         return str(value)
+    
+    def _json_default(self, obj: Any) -> str:
+        """JSON serializer for objects not serializable by default json code."""
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+    
+    def _to_jsonb(self, value: Any) -> str | None:
+        """Serialize a Python object to JSON string for JSONB columns.
+        
+        Asyncpg requires JSON strings for JSONB columns; it does not auto-serialize
+        Python dicts/lists. This method handles datetime serialization within the data.
+        """
+        if value is None:
+            return None
+        return json.dumps(value, default=self._json_default)
+    
+    def _from_jsonb(self, value: Any) -> Any:
+        """Deserialize JSONB column value to Python object.
+        
+        Handles both cases:
+        - If asyncpg already decoded JSONB to dict/list, return as-is
+        - If value is a string (legacy data or edge case), parse with json.loads
+        """
+        if value is None:
+            return None
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                return value  # Return as-is if not valid JSON
+        return value  # Already a dict/list
+    
+    def _to_datetime(self, value: Any) -> datetime | None:
+        """Coerce possible ISO string timestamps to datetime objects for SQL parameters.
+        
+        Accepts None, datetime, or ISO-like strings (with optional trailing 'Z').
+        Returns a datetime or None if parsing fails.
+        """
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            # Handle common 'Z' suffix for UTC
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            try:
+                return datetime.fromisoformat(text)
+            except Exception:
+                return None
+        return None
     
     async def save_agent_config(self, config: dict) -> None:
         """Save/update agent configuration using UPSERT.
@@ -394,24 +447,24 @@ class SQLBackend:
                 config.get("thinking_tokens"),
                 config.get("max_tokens"),
                 config.get("container_id"),
-                self._serialize_json(config.get("messages")),
-                self._serialize_json(config.get("tool_schemas")),
+                self._to_jsonb(config.get("messages")),
+                self._to_jsonb(config.get("tool_schemas")),
                 config.get("tool_names"),
-                self._serialize_json(config.get("server_tools")),
+                self._to_jsonb(config.get("server_tools")),
                 config.get("beta_headers"),
-                self._serialize_json(config.get("api_kwargs")),
+                self._to_jsonb(config.get("api_kwargs")),
                 config.get("formatter"),
                 config.get("stream_meta_history_and_tool_results", False),
                 config.get("compactor_type"),
                 config.get("memory_store_type"),
-                self._serialize_json(config.get("file_registry")),
+                self._to_jsonb(config.get("file_registry")),
                 config.get("max_retries"),
                 config.get("base_delay"),
                 config.get("last_known_input_tokens"),
                 config.get("last_known_output_tokens"),
-                config.get("created_at"),
-                config.get("updated_at"),
-                config.get("last_run_at"),
+                self._to_datetime(config.get("created_at")),
+                self._to_datetime(config.get("updated_at")),
+                self._to_datetime(config.get("last_run_at")),
                 config.get("total_runs"),
             )
         
@@ -456,17 +509,17 @@ class SQLBackend:
             "thinking_tokens": row["thinking_tokens"],
             "max_tokens": row["max_tokens"],
             "container_id": row["container_id"],
-            "messages": row["messages"],  # asyncpg auto-decodes JSONB
-            "tool_schemas": row["tool_schemas"],
+            "messages": self._from_jsonb(row["messages"]),
+            "tool_schemas": self._from_jsonb(row["tool_schemas"]),
             "tool_names": list(row["tool_names"]) if row["tool_names"] else [],
-            "server_tools": row["server_tools"],
+            "server_tools": self._from_jsonb(row["server_tools"]),
             "beta_headers": list(row["beta_headers"]) if row["beta_headers"] else [],
-            "api_kwargs": row["api_kwargs"],
+            "api_kwargs": self._from_jsonb(row["api_kwargs"]),
             "formatter": row["formatter"],
             "stream_meta_history_and_tool_results": row["stream_meta_history_and_tool_results"],
             "compactor_type": row["compactor_type"],
             "memory_store_type": row["memory_store_type"],
-            "file_registry": row["file_registry"],
+            "file_registry": self._from_jsonb(row["file_registry"]),
             "max_retries": row["max_retries"],
             "base_delay": row["base_delay"],
             "last_known_input_tokens": row["last_known_input_tokens"],
@@ -506,16 +559,16 @@ class SQLBackend:
                 conversation.get("conversation_id"),
                 conversation.get("agent_uuid"),
                 conversation.get("run_id"),
-                conversation.get("started_at"),
-                conversation.get("completed_at"),
+                self._to_datetime(conversation.get("started_at")),
+                self._to_datetime(conversation.get("completed_at")),
                 conversation.get("user_message"),
                 conversation.get("final_response"),
-                self._serialize_json(conversation.get("messages")),
+                self._to_jsonb(conversation.get("messages")),
                 conversation.get("stop_reason"),
                 conversation.get("total_steps"),
-                self._serialize_json(conversation.get("usage")),
-                self._serialize_json(conversation.get("generated_files")),
-                conversation.get("created_at"),
+                self._to_jsonb(conversation.get("usage")),
+                self._to_jsonb(conversation.get("generated_files")),
+                self._to_datetime(conversation.get("created_at")),
             )
         
         logger.debug(
@@ -565,11 +618,11 @@ class SQLBackend:
                 "completed_at": self._parse_datetime(row["completed_at"]),
                 "user_message": row["user_message"],
                 "final_response": row["final_response"],
-                "messages": row["messages"],
+                "messages": self._from_jsonb(row["messages"]),
                 "stop_reason": row["stop_reason"],
                 "total_steps": row["total_steps"],
-                "usage": row["usage"],
-                "generated_files": row["generated_files"],
+                "usage": self._from_jsonb(row["usage"]),
+                "generated_files": self._from_jsonb(row["generated_files"]),
                 "sequence_number": row["sequence_number"],
                 "created_at": self._parse_datetime(row["created_at"]),
             })
@@ -610,11 +663,11 @@ class SQLBackend:
             (
                 agent_uuid,
                 run_id,
-                log.get("timestamp"),
+                self._to_datetime(log.get("timestamp")),
                 log.get("step_number"),
                 log.get("action_type"),
-                self._serialize_json(log.get("action_data")),
-                self._serialize_json(log.get("messages_snapshot")),
+                self._to_jsonb(log.get("action_data")),
+                self._to_jsonb(log.get("messages_snapshot")),
                 log.get("messages_count"),
                 log.get("estimated_tokens"),
                 log.get("duration_ms"),
@@ -665,8 +718,8 @@ class SQLBackend:
                 "timestamp": self._parse_datetime(row["timestamp"]),
                 "step_number": row["step_number"],
                 "action_type": row["action_type"],
-                "action_data": row["action_data"],
-                "messages_snapshot": row["messages_snapshot"],
+                "action_data": self._from_jsonb(row["action_data"]),
+                "messages_snapshot": self._from_jsonb(row["messages_snapshot"]),
                 "messages_count": row["messages_count"],
                 "estimated_tokens": row["estimated_tokens"],
                 "duration_ms": row["duration_ms"],
