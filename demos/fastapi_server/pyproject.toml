@@ -1,10 +1,15 @@
 [project]
 name = "fastapi-server"
 version = "0.1.0"
-description = "Add your description here"
+description = "Demo FastAPI server with Anthropic Agent integration"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "anthropic-agent",
     "fastapi>=0.122.0",
+    "python-dotenv>=1.0.0",
     "uvicorn>=0.38.0",
 ]
+
+[tool.uv.sources]
+anthropic-agent = { workspace = true }

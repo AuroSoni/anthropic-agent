@@ -319,13 +319,17 @@ name = "fastapi-server"
 version = "0.1.0"
 source = { virtual = "demos/fastapi_server" }
 dependencies = [
+    { name = "anthropic-agent" },
     { name = "fastapi" },
+    { name = "python-dotenv" },
     { name = "uvicorn" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "anthropic-agent", editable = "." },
     { name = "fastapi", specifier = ">=0.122.0" },
+    { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "uvicorn", specifier = ">=0.38.0" },
 ]
 
