@@ -23,20 +23,21 @@ CREATE TABLE agent_config (
     messages JSONB,  -- Current compacted messages state
     
     -- Tools configuration
-    tools JSONB,  -- Tool schemas/configurations
-    tool_names TEXT[],  -- Quick reference
+    tool_schemas JSONB,  -- Client-side tool schemas [{name, description, input_schema}]
+    tool_names TEXT[],  -- Quick reference list of tool names
+    server_tools JSONB,  -- Anthropic server tools (code_execution, web_search, etc.)
     
     -- Beta features
     beta_headers TEXT[],  -- e.g., ["code-execution-2025-08-25"]
     
+    -- API configuration
+    api_kwargs JSONB,  -- Pass-through API params (temperature, top_p, stop_sequences, etc.)
+    
     -- Component configuration
     formatter VARCHAR(50),  -- "xml", "json", etc.
-    compactor_type VARCHAR(50),  -- "tool_result_removal", "none"
-    compactor_config JSONB,  -- threshold, etc.
-    memory_store_type VARCHAR(50),  -- "placeholder", "none"
-    memory_store_config JSONB,
-    file_backend_type VARCHAR(50),  -- "local", "s3", "none"
-    file_backend_config JSONB,
+    stream_meta_history_and_tool_results BOOLEAN DEFAULT FALSE,  -- Include metadata in stream
+    compactor_type VARCHAR(50),  -- "tool_result_removal", "none" (type name only)
+    memory_store_type VARCHAR(50),  -- "placeholder", "none" (type name only)
     
     -- File registry (consolidated across all runs)
     file_registry JSONB,  -- {file_id: {filename, storage_path, ...}}
@@ -53,10 +54,7 @@ CREATE TABLE agent_config (
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW(),
     last_run_at TIMESTAMP,
-    total_runs INTEGER DEFAULT 0,
-    
-    -- Optional: final_answer_check (if serializable)
-    final_answer_check_config JSONB
+    total_runs INTEGER DEFAULT 0
 );
 
 -- Indexes
@@ -86,7 +84,7 @@ CREATE INDEX idx_agent_config_last_run ON agent_config(last_run_at DESC);
   ],
   
   # Tools configuration
-  "tools": [
+  "tool_schemas": [
     {
       "name": "web_search",
       "description": "...",
@@ -94,16 +92,24 @@ CREATE INDEX idx_agent_config_last_run ON agent_config(last_run_at DESC);
     }
   ],
   "tool_names": ["web_search", "calculator"],
+  "server_tools": [
+    {"type": "code_execution_20250825"}  # Anthropic server tools
+  ],
   
   # Beta features
   "beta_headers": ["code-execution-2025-08-25"],
   
+  # API configuration
+  "api_kwargs": {
+    "temperature": 0.7,
+    "top_p": 0.9
+  },
+  
   # Component configuration
   "formatter": "xml",
-  "compactor_type": "tool_result_removal",
-  "compactor_config": {"threshold": 100000},
-  "memory_store_type": "placeholder",
-  "memory_store_config": {},
+  "stream_meta_history_and_tool_results": false,
+  "compactor_type": "ToolResultRemovalCompactor",  # Type name only
+  "memory_store_type": "PlaceholderMemoryStore",  # Type name only
   
   # File registry
   "file_registry": {
@@ -162,17 +168,11 @@ CREATE TABLE conversation_history (
     stop_reason VARCHAR(50),  -- "end_turn", "max_steps", "tool_use", etc.
     total_steps INTEGER,
     
-    -- Token usage
-    input_tokens INTEGER,
-    output_tokens INTEGER,
-    cache_creation_input_tokens INTEGER DEFAULT 0,
-    cache_read_input_tokens INTEGER DEFAULT 0,
+    -- Token usage (nested structure)
+    usage JSONB,  -- {input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens}
     
     -- Files generated in this run
     generated_files JSONB,  -- [{file_id, filename, storage_path, step, ...}]
-    
-    -- Quick summary (optional, for UI preview)
-    summary TEXT,  -- Generated summary or first 200 chars
     
     -- Sequence for pagination
     sequence_number INTEGER,  -- Auto-incrementing within agent_uuid
@@ -292,7 +292,6 @@ EXECUTE FUNCTION set_conversation_sequence();
   
   # Metadata
   "sequence_number": 1,
-  "summary": "Created sales chart visualization",
   "created_at": "2025-11-25T10:02:30Z"
 }
 ```
@@ -327,10 +326,8 @@ CREATE TABLE agent_runs (
     
     -- Action type
     action_type VARCHAR(100) NOT NULL,
-    -- Examples: "run_started", "memory_retrieval", "compaction", 
-    --           "api_call", "api_response", "tool_execution", 
-    --           "memory_update", "final_answer_validation", 
-    --           "run_completed", "error"
+    -- Currently implemented: "run_started", "api_response_received", "tool_execution", 
+    --                        "compaction", "run_completed", "final_summary_generation"
     
     -- Action details (flexible JSON)
     action_data JSONB NOT NULL,
@@ -341,10 +338,7 @@ CREATE TABLE agent_runs (
     estimated_tokens INTEGER,  -- Token count at this action
     
     -- Performance metrics
-    duration_ms INTEGER,  -- How long this action took
-    
-    -- Metadata
-    created_at TIMESTAMP DEFAULT NOW()
+    duration_ms INTEGER  -- How long this action took (optional)
 );
 
 -- Indexes for efficient querying
@@ -533,48 +527,48 @@ data/
 
 ## Action Types Taxonomy
 
-For `agent_runs.action_type`, here's a comprehensive list:
+For `agent_runs.action_type`, here's the list of actions. Actions marked with ✓ are currently implemented.
 
 ### Run Lifecycle
-- `run_started` - Agent.run() called
-- `run_completed` - Successful completion
-- `run_failed` - Error occurred
-- `max_steps_reached` - Hit max steps limit
+- ✓ `run_started` - Agent.run() called
+- ✓ `run_completed` - Successful completion
+- `run_failed` - Error occurred (not implemented)
+- `max_steps_reached` - Hit max steps limit (not implemented)
 
 ### Memory Operations
-- `memory_retrieval` - Retrieved context from memory store
-- `memory_update` - Updated memory store post-run
-- `memory_before_compact` - Memory hook before compaction
-- `memory_after_compact` - Memory hook after compaction
+- `memory_retrieval` - Retrieved context from memory store (not implemented)
+- `memory_update` - Updated memory store post-run (not implemented)
+- `memory_before_compact` - Memory hook before compaction (not implemented)
+- `memory_after_compact` - Memory hook after compaction (not implemented)
 
 ### Compaction
-- `compaction` - Compaction applied (or skipped)
-- `context_transformation` - Any message list modification
+- ✓ `compaction` - Compaction applied (logged when compaction_applied=true)
+- `context_transformation` - Any message list modification (not implemented)
 
 ### API Communication
-- `api_call_started` - Request sent to Anthropic
-- `api_response_received` - Response received
-- `api_retry` - Retry after error
-- `api_error` - API call failed
+- `api_call_started` - Request sent to Anthropic (not implemented)
+- ✓ `api_response_received` - Response received with stop_reason and token usage
+- `api_retry` - Retry after error (not implemented)
+- `api_error` - API call failed (not implemented)
 
 ### Tool Execution
-- `tool_execution` - Tool called and executed
-- `tool_error` - Tool execution failed
+- ✓ `tool_execution` - Tool called and executed (with tool_name, tool_use_id, success)
+- `tool_error` - Tool execution failed (not implemented, errors logged within tool_execution)
 
 ### Validation
-- `final_answer_validation` - Final answer check applied
-- `final_answer_validation_failed` - Validation failed, retrying
+- `final_answer_validation` - Final answer check applied (not implemented)
+- `final_answer_validation_failed` - Validation failed, retrying (not implemented)
 
 ### File Operations
-- `file_generated` - File created by code execution
-- `file_downloaded` - File downloaded from Anthropic
-- `file_stored` - File stored in backend
-- `file_error` - File operation failed
+- `file_generated` - File created by code execution (not implemented)
+- `file_downloaded` - File downloaded from Anthropic (not implemented)
+- `file_stored` - File stored in backend (not implemented)
+- `file_error` - File operation failed (not implemented)
 
 ### Special Cases
-- `final_summary_generation` - Max steps summary generated
-- `streaming_chunk` - (optional) Stream chunk sent
-- `error` - General error
+- ✓ `final_summary_generation` - Max steps summary generated
+- `streaming_chunk` - (optional) Stream chunk sent (not implemented)
+- `error` - General error (not implemented)
 
 ---
 

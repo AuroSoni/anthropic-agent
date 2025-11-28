@@ -390,7 +390,7 @@ class AnthropicAgent:
             
             # Always pass through compactor (it decides whether to compact)
             if self.compactor:
-                self._apply_compaction() # self._last_known_input_tokens is used here.
+                self._apply_compaction(step_number=step)  # self._last_known_input_tokens is used here.
             
             # Prepare request parameters
             request_params = self._prepare_request_params()
@@ -417,6 +417,13 @@ class AnthropicAgent:
                 "cache_creation_input_tokens": accumulated_message.usage.cache_creation_input_tokens,
                 "cache_read_input_tokens": accumulated_message.usage.cache_read_input_tokens,
             })
+            
+            # Log: API response received
+            self._log_action("api_response_received", {
+                "stop_reason": accumulated_message.stop_reason,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+            }, step_number=step)
             
             # Add assistant's response to live context and conversation history
             # assistant_message = {
@@ -452,6 +459,7 @@ class AnthropicAgent:
                     # TODO: Execute tool calls parallelly.
                     tool_results = []
                     for tool_call in tool_calls:
+                        is_error = False
                         try:
                             # Execute the tool (support both sync and async executors)
                             result = self.execute_tool_call(tool_call.name, tool_call.input)
@@ -465,12 +473,20 @@ class AnthropicAgent:
                             })
                         except Exception as e:
                             # Handle tool execution errors
+                            is_error = True
                             tool_results.append({
                                 "type": "tool_result",
                                 "tool_use_id": tool_call.id,
                                 "content": f"Error executing tool: {str(e)}",
                                 "is_error": True
                             })
+                        
+                        # Log: tool execution
+                        self._log_action("tool_execution", {
+                            "tool_name": tool_call.name,
+                            "tool_use_id": tool_call.id,
+                            "success": not is_error,
+                        }, step_number=step)
                     
                     # Add tool results to live context and conversation history
                     tool_result_message = {
@@ -646,7 +662,7 @@ class AnthropicAgent:
         
         return self.tool_registry.execute(tool_name, tool_input)
     
-    def _apply_compaction(self) -> None:
+    def _apply_compaction(self, step_number: int = 0) -> None:
         """Apply compaction to self.messages and log the event.
         
         This method is called before each API call. The compactor itself decides
@@ -655,6 +671,9 @@ class AnthropicAgent:
         
         Memory integration: If a memory store is configured, it is called before
         and after compaction to extract and preserve important information.
+        
+        Args:
+            step_number: Current step number in the agent loop (for logging)
         """
         if not self.compactor:
             return
@@ -691,6 +710,10 @@ class AnthropicAgent:
                 "action": "compaction",
                 "details": metadata
             })
+            
+            # Log: compaction applied (to run logs buffer)
+            self._log_action("compaction", metadata, step_number=step_number)
+            
             logger.info(f"Compaction applied: {metadata}")
     
     async def _generate_final_summary(
@@ -715,7 +738,7 @@ class AnthropicAgent:
         
         # Apply compaction before final call
         if self.compactor:
-            self._apply_compaction()
+            self._apply_compaction(step_number=self.max_steps)
         
         # Create temporary system prompt for summary
         summary_system_prompt = (
@@ -1139,8 +1162,13 @@ class AnthropicAgent:
         """
         Save current agent configuration to database.
         
-        This  method saves the resumable agent configuration to the database.
+        This method saves the resumable agent configuration to the database.
+        Preserves created_at from existing config and increments total_runs.
         """
+        # Load existing config to preserve created_at and increment total_runs
+        existing_config = await self.db_backend.load_agent_config(self.agent_uuid)
+        existing_config = existing_config or {}
+        
         config = {
             "agent_uuid": self.agent_uuid,
             "system_prompt": self.system_prompt,
@@ -1155,14 +1183,19 @@ class AnthropicAgent:
             "beta_headers": self.beta_headers,
             "server_tools": self.server_tools,
             "formatter": self.formatter,
+            "stream_meta_history_and_tool_results": self.stream_meta_history_and_tool_results,
             "file_registry": self.file_registry,
             "max_retries": self.max_retries,
             "base_delay": self.base_delay,
             "api_kwargs": self.api_kwargs,
             "last_known_input_tokens": self._last_known_input_tokens,
             "last_known_output_tokens": self._last_known_output_tokens,
+            # Preserve created_at from existing config, or set to now
+            "created_at": existing_config.get("created_at", datetime.now().isoformat()),
             "updated_at": datetime.now().isoformat(),
             "last_run_at": self._run_start_time.isoformat() if self._run_start_time else None,
+            # Increment total_runs counter
+            "total_runs": existing_config.get("total_runs", 0) + 1,
         }
         
         # Add component configs

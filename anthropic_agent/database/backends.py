@@ -7,9 +7,10 @@ for storing agent configuration, conversation history, and detailed run logs.
 import json
 import logging
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, Any
 from datetime import datetime
 
+import asyncpg
 
 logger = logging.getLogger(__name__)
 
@@ -264,16 +265,15 @@ class FilesystemBackend:
 
 
 class SQLBackend:
-    """Placeholder for PostgreSQL backend implementation.
+    """PostgreSQL backend implementation using asyncpg.
     
-    TODO: Implement using asyncpg or sqlalchemy with async support.
-    Schema defined in anthropic_agent/src/database/schemas.md
+    Features:
+    - Connection pooling with lazy initialization
+    - UPSERT for agent_config updates
+    - Batch inserts for run logs
+    - Proper JSONB handling
     
-    Planned features:
-    - Connection pooling
-    - Transactions for atomic writes
-    - Indexes for efficient queries
-    - Partitioning for large-scale deployments
+    Schema defined in anthropic_agent/database/schemas.md
     """
     
     def __init__(
@@ -285,28 +285,243 @@ class SQLBackend:
         
         Args:
             connection_string: PostgreSQL connection string
-            pool_size: Connection pool size
+                e.g., "postgresql://user:pass@host:5432/dbname"
+            pool_size: Maximum connection pool size (default: 10)
             
         Raises:
-            NotImplementedError: SQLBackend is not yet implemented
+            ImportError: If asyncpg is not installed
         """
-        raise NotImplementedError(
-            "SQLBackend not yet implemented. "
-            "Use FilesystemBackend for now. "
-            "See anthropic_agent/src/database/schemas.md for planned schema."
-        )
+        
+        self._connection_string = connection_string
+        self._pool_size = pool_size
+        self._pool: "asyncpg.Pool | None" = None
+    
+    async def _get_pool(self) -> "asyncpg.Pool":
+        """Get or create the connection pool (lazy initialization).
+        
+        Returns:
+            asyncpg connection pool
+        """
+        if self._pool is None:
+            self._pool = await asyncpg.create_pool(
+                self._connection_string,
+                min_size=1,
+                max_size=self._pool_size
+            )
+            logger.info(f"Created PostgreSQL connection pool (max_size={self._pool_size})")
+        return self._pool
+    
+    async def close(self) -> None:
+        """Close the connection pool.
+        
+        Should be called before application shutdown.
+        """
+        if self._pool is not None:
+            await self._pool.close()
+            self._pool = None
+            logger.info("Closed PostgreSQL connection pool")
+    
+    def _serialize_json(self, value: Any) -> str | None:
+        """Serialize a value to JSON string for JSONB columns."""
+        if value is None:
+            return None
+        return json.dumps(value)
+    
+    def _parse_datetime(self, value: Any) -> str | None:
+        """Parse datetime to ISO format string."""
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.isoformat()
+        return str(value)
     
     async def save_agent_config(self, config: dict) -> None:
-        """Save agent configuration to database."""
-        raise NotImplementedError
+        """Save/update agent configuration using UPSERT.
+        
+        Args:
+            config: Agent configuration dict with agent_uuid as primary key
+        """
+        pool = await self._get_pool()
+        
+        query = """
+            INSERT INTO agent_config (
+                agent_uuid, system_prompt, model, max_steps, thinking_tokens,
+                max_tokens, container_id, messages, tool_schemas, tool_names,
+                server_tools, beta_headers, api_kwargs, formatter,
+                stream_meta_history_and_tool_results, compactor_type,
+                memory_store_type, file_registry, max_retries, base_delay,
+                last_known_input_tokens, last_known_output_tokens,
+                created_at, updated_at, last_run_at, total_runs
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+                $21, $22, $23, $24, $25, $26
+            )
+            ON CONFLICT (agent_uuid) DO UPDATE SET
+                system_prompt = EXCLUDED.system_prompt,
+                model = EXCLUDED.model,
+                max_steps = EXCLUDED.max_steps,
+                thinking_tokens = EXCLUDED.thinking_tokens,
+                max_tokens = EXCLUDED.max_tokens,
+                container_id = EXCLUDED.container_id,
+                messages = EXCLUDED.messages,
+                tool_schemas = EXCLUDED.tool_schemas,
+                tool_names = EXCLUDED.tool_names,
+                server_tools = EXCLUDED.server_tools,
+                beta_headers = EXCLUDED.beta_headers,
+                api_kwargs = EXCLUDED.api_kwargs,
+                formatter = EXCLUDED.formatter,
+                stream_meta_history_and_tool_results = EXCLUDED.stream_meta_history_and_tool_results,
+                compactor_type = EXCLUDED.compactor_type,
+                memory_store_type = EXCLUDED.memory_store_type,
+                file_registry = EXCLUDED.file_registry,
+                max_retries = EXCLUDED.max_retries,
+                base_delay = EXCLUDED.base_delay,
+                last_known_input_tokens = EXCLUDED.last_known_input_tokens,
+                last_known_output_tokens = EXCLUDED.last_known_output_tokens,
+                updated_at = EXCLUDED.updated_at,
+                last_run_at = EXCLUDED.last_run_at,
+                total_runs = EXCLUDED.total_runs
+        """
+        
+        async with pool.acquire() as conn:
+            await conn.execute(
+                query,
+                config.get("agent_uuid"),
+                config.get("system_prompt"),
+                config.get("model"),
+                config.get("max_steps"),
+                config.get("thinking_tokens"),
+                config.get("max_tokens"),
+                config.get("container_id"),
+                self._serialize_json(config.get("messages")),
+                self._serialize_json(config.get("tool_schemas")),
+                config.get("tool_names"),
+                self._serialize_json(config.get("server_tools")),
+                config.get("beta_headers"),
+                self._serialize_json(config.get("api_kwargs")),
+                config.get("formatter"),
+                config.get("stream_meta_history_and_tool_results", False),
+                config.get("compactor_type"),
+                config.get("memory_store_type"),
+                self._serialize_json(config.get("file_registry")),
+                config.get("max_retries"),
+                config.get("base_delay"),
+                config.get("last_known_input_tokens"),
+                config.get("last_known_output_tokens"),
+                config.get("created_at"),
+                config.get("updated_at"),
+                config.get("last_run_at"),
+                config.get("total_runs"),
+            )
+        
+        logger.debug(f"Saved agent config for {config.get('agent_uuid')}")
     
     async def load_agent_config(self, agent_uuid: str) -> dict | None:
-        """Load agent configuration from database."""
-        raise NotImplementedError
+        """Load agent configuration from database.
+        
+        Args:
+            agent_uuid: Agent session UUID
+            
+        Returns:
+            Agent configuration dict, or None if not found
+        """
+        pool = await self._get_pool()
+        
+        query = """
+            SELECT 
+                agent_uuid, system_prompt, model, max_steps, thinking_tokens,
+                max_tokens, container_id, messages, tool_schemas, tool_names,
+                server_tools, beta_headers, api_kwargs, formatter,
+                stream_meta_history_and_tool_results, compactor_type,
+                memory_store_type, file_registry, max_retries, base_delay,
+                last_known_input_tokens, last_known_output_tokens,
+                created_at, updated_at, last_run_at, total_runs
+            FROM agent_config
+            WHERE agent_uuid = $1
+        """
+        
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(query, agent_uuid)
+        
+        if row is None:
+            return None
+        
+        # Convert row to dict with proper type handling
+        config = {
+            "agent_uuid": str(row["agent_uuid"]),
+            "system_prompt": row["system_prompt"],
+            "model": row["model"],
+            "max_steps": row["max_steps"],
+            "thinking_tokens": row["thinking_tokens"],
+            "max_tokens": row["max_tokens"],
+            "container_id": row["container_id"],
+            "messages": row["messages"],  # asyncpg auto-decodes JSONB
+            "tool_schemas": row["tool_schemas"],
+            "tool_names": list(row["tool_names"]) if row["tool_names"] else [],
+            "server_tools": row["server_tools"],
+            "beta_headers": list(row["beta_headers"]) if row["beta_headers"] else [],
+            "api_kwargs": row["api_kwargs"],
+            "formatter": row["formatter"],
+            "stream_meta_history_and_tool_results": row["stream_meta_history_and_tool_results"],
+            "compactor_type": row["compactor_type"],
+            "memory_store_type": row["memory_store_type"],
+            "file_registry": row["file_registry"],
+            "max_retries": row["max_retries"],
+            "base_delay": row["base_delay"],
+            "last_known_input_tokens": row["last_known_input_tokens"],
+            "last_known_output_tokens": row["last_known_output_tokens"],
+            "created_at": self._parse_datetime(row["created_at"]),
+            "updated_at": self._parse_datetime(row["updated_at"]),
+            "last_run_at": self._parse_datetime(row["last_run_at"]),
+            "total_runs": row["total_runs"],
+        }
+        
+        logger.debug(f"Loaded agent config for {agent_uuid}")
+        return config
     
     async def save_conversation_history(self, conversation: dict) -> None:
-        """Save conversation history entry to database."""
-        raise NotImplementedError
+        """Save conversation history entry.
+        
+        Note: sequence_number is auto-generated by database trigger.
+        
+        Args:
+            conversation: Conversation data dict
+        """
+        pool = await self._get_pool()
+        
+        query = """
+            INSERT INTO conversation_history (
+                conversation_id, agent_uuid, run_id, started_at, completed_at,
+                user_message, final_response, messages, stop_reason, total_steps,
+                usage, generated_files, created_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+            )
+        """
+        
+        async with pool.acquire() as conn:
+            await conn.execute(
+                query,
+                conversation.get("conversation_id"),
+                conversation.get("agent_uuid"),
+                conversation.get("run_id"),
+                conversation.get("started_at"),
+                conversation.get("completed_at"),
+                conversation.get("user_message"),
+                conversation.get("final_response"),
+                self._serialize_json(conversation.get("messages")),
+                conversation.get("stop_reason"),
+                conversation.get("total_steps"),
+                self._serialize_json(conversation.get("usage")),
+                self._serialize_json(conversation.get("generated_files")),
+                conversation.get("created_at"),
+            )
+        
+        logger.debug(
+            f"Saved conversation history for agent {conversation.get('agent_uuid')}, "
+            f"run {conversation.get('run_id')}"
+        )
     
     async def load_conversation_history(
         self, 
@@ -314,8 +529,53 @@ class SQLBackend:
         limit: int = 20, 
         offset: int = 0
     ) -> list[dict]:
-        """Load paginated conversation history from database."""
-        raise NotImplementedError
+        """Load paginated conversation history (latest first).
+        
+        Args:
+            agent_uuid: Agent session UUID
+            limit: Maximum number of conversations to return
+            offset: Number of conversations to skip
+            
+        Returns:
+            List of conversation dicts, sorted by sequence_number descending
+        """
+        pool = await self._get_pool()
+        
+        query = """
+            SELECT 
+                conversation_id, agent_uuid, run_id, started_at, completed_at,
+                user_message, final_response, messages, stop_reason, total_steps,
+                usage, generated_files, sequence_number, created_at
+            FROM conversation_history
+            WHERE agent_uuid = $1
+            ORDER BY sequence_number DESC
+            LIMIT $2 OFFSET $3
+        """
+        
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(query, agent_uuid, limit, offset)
+        
+        conversations = []
+        for row in rows:
+            conversations.append({
+                "conversation_id": str(row["conversation_id"]),
+                "agent_uuid": str(row["agent_uuid"]),
+                "run_id": str(row["run_id"]),
+                "started_at": self._parse_datetime(row["started_at"]),
+                "completed_at": self._parse_datetime(row["completed_at"]),
+                "user_message": row["user_message"],
+                "final_response": row["final_response"],
+                "messages": row["messages"],
+                "stop_reason": row["stop_reason"],
+                "total_steps": row["total_steps"],
+                "usage": row["usage"],
+                "generated_files": row["generated_files"],
+                "sequence_number": row["sequence_number"],
+                "created_at": self._parse_datetime(row["created_at"]),
+            })
+        
+        logger.debug(f"Loaded {len(conversations)} conversations for {agent_uuid}")
+        return conversations
     
     async def save_agent_run_logs(
         self, 
@@ -323,14 +583,95 @@ class SQLBackend:
         run_id: str, 
         logs: list[dict]
     ) -> None:
-        """Save agent run logs to database."""
-        raise NotImplementedError
+        """Save batched agent run logs.
+        
+        Args:
+            agent_uuid: Agent session UUID
+            run_id: Unique run identifier
+            logs: List of log entries to save
+        """
+        if not logs:
+            return
+        
+        pool = await self._get_pool()
+        
+        query = """
+            INSERT INTO agent_runs (
+                agent_uuid, run_id, timestamp, step_number, action_type,
+                action_data, messages_snapshot, messages_count, estimated_tokens,
+                duration_ms
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+            )
+        """
+        
+        # Prepare batch data
+        records = [
+            (
+                agent_uuid,
+                run_id,
+                log.get("timestamp"),
+                log.get("step_number"),
+                log.get("action_type"),
+                self._serialize_json(log.get("action_data")),
+                self._serialize_json(log.get("messages_snapshot")),
+                log.get("messages_count"),
+                log.get("estimated_tokens"),
+                log.get("duration_ms"),
+            )
+            for log in logs
+        ]
+        
+        async with pool.acquire() as conn:
+            await conn.executemany(query, records)
+        
+        logger.debug(f"Saved {len(logs)} log entries for run {run_id}")
     
     async def load_agent_run_logs(
         self, 
         agent_uuid: str, 
         run_id: str
     ) -> list[dict]:
-        """Load agent run logs from database."""
-        raise NotImplementedError
+        """Load all logs for a specific run.
+        
+        Args:
+            agent_uuid: Agent session UUID
+            run_id: Unique run identifier
+            
+        Returns:
+            List of log entries in chronological order
+        """
+        pool = await self._get_pool()
+        
+        query = """
+            SELECT 
+                log_id, agent_uuid, run_id, timestamp, step_number, action_type,
+                action_data, messages_snapshot, messages_count, estimated_tokens,
+                duration_ms
+            FROM agent_runs
+            WHERE agent_uuid = $1 AND run_id = $2
+            ORDER BY timestamp ASC
+        """
+        
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(query, agent_uuid, run_id)
+        
+        logs = []
+        for row in rows:
+            logs.append({
+                "log_id": row["log_id"],
+                "agent_uuid": str(row["agent_uuid"]),
+                "run_id": str(row["run_id"]),
+                "timestamp": self._parse_datetime(row["timestamp"]),
+                "step_number": row["step_number"],
+                "action_type": row["action_type"],
+                "action_data": row["action_data"],
+                "messages_snapshot": row["messages_snapshot"],
+                "messages_count": row["messages_count"],
+                "estimated_tokens": row["estimated_tokens"],
+                "duration_ms": row["duration_ms"],
+            })
+        
+        logger.debug(f"Loaded {len(logs)} log entries for run {run_id}")
+        return logs
 
