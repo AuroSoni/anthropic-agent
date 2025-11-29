@@ -5,6 +5,7 @@ from typing import Any
 
 from fastapi import FastAPI
 
+from agent import router as agent_router
 from db import db
 
 
@@ -23,6 +24,9 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+# Include agent router for streaming endpoints
+app.include_router(agent_router)
 
 
 @app.get("/health")
