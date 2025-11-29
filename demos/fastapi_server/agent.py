@@ -109,8 +109,16 @@ async def stream_agent_response(
         # Create queue for streaming
         queue: asyncio.Queue[str | None] = asyncio.Queue()
         
-        # Consumer task to yield chunks from queue
-        async def consume_queue() -> None:
+        # Run the agent in background (this will populate the queue)
+        async def run_agent_and_signal():
+            result = await agent.run(user_prompt, queue)
+            await queue.put(None)  # Signal completion
+            return result
+        
+        agent_task = asyncio.create_task(run_agent_and_signal())
+        
+        # Yield chunks as they arrive from the queue
+        try:
             while True:
                 chunk = await queue.get()
                 if chunk is None:
@@ -118,22 +126,11 @@ async def stream_agent_response(
                 # Format as SSE event
                 yield f"data: {json.dumps({'event': 'chunk', 'content': chunk})}\n\n"
                 queue.task_done()
-        
-        # Start the consumer
-        consumer = consume_queue()
-        
-        # Run the agent (this will populate the queue)
-        agent_task = asyncio.create_task(agent.run(user_prompt, queue))
-        
-        # Yield chunks as they arrive
-        try:
-            async for chunk in consumer:
-                yield chunk
         except asyncio.CancelledError:
             agent_task.cancel()
             raise
         
-        # Wait for agent to complete
+        # Wait for agent to complete and get result
         result = await agent_task
         
         # Send completion metadata
