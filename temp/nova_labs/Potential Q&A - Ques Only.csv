@@ -1,0 +1,141 @@
+#,Question
+1,Summarize Paytm’s latest quarterly performance and key drivers.
+2,Provide a 3-year historical financial trend for Paytm.
+3,Break down Paytm’s business segments and their contribution to revenue & profitability.
+4,"Provide a competitive landscape vs PhonePe, BharatPe & Google Pay."
+5,Extract all regulatory events affecting Paytm since 2022.
+6,Summarize all Paytm investor calls since 2022 into a single management commentary tracker.
+7,What triggered the major stock price movements (>5%) in the last 12 months?
+8,Provide TPV and lending distribution trends for the last 8 quarters.
+9,What is Paytm’s merchant network growth trend?
+10,Provide a timeline of product launches since 2022.
+11,Extract all SEBI filings related to ESOP/insider trading.
+12,Give a breakdown of Paytm’s cost structure.
+13,Provide a detailed analysis of Paytm Payments Bank (PPBL) related issues & its financial impact.
+14,Provide Paytm’s valuation multiples vs global fintech peers.
+15,Extract cash flow trends & working capital analysis.
+16,Provide a full SWOT analysis of Paytm.
+17,Provide the list of all subsidiaries & their financial performance.
+18,Summarize key risks highlighted by management in filings.
+19,Provide Paytm's customer acquisition cost and lifetime value estimates (if disclosed).
+20,Provide analyst consensus expectations vs actual results for last 4 quarters.
+21,Extract all litigation & contingent liability updates.
+22,"What is the status of Paytm’s partnerships (banks, NBFCs)?"
+23,Provide insights on the distribution of Paytm’s loan book.
+24,Provide YoY profitability bridge (Contribution Profit → EBITDA → PAT).
+25,Give a detailed capital structure & liquidity position.
+26,Create Paytm’s operating metrics dashboard.
+27,Provide major board & management changes since 2022.
+28,"Give a summary of all shareholding changes (promoter, FPI, mutual fund)."
+29,Provide Paytm's stated medium-term guidance.
+30,"Build a base-case, bull-case & bear-case scenario for the next 3 years."
+31,"Summarize Paytm’s latest quarterly results (revenue, contribution profit, EBITDA, PAT)."
+32,Provide YoY and QoQ growth across revenue and key profitability metrics for last 8 quarters.
+33,"Break down revenue by business segments (payments, financial services, commerce, cloud, devices)."
+34,Provide a 3-year historical P&L (revenue → EBITDA → PAT) consolidated.
+35,Provide contribution margin (payments-only) historical trend and drivers.
+36,Provide TPV (Total Payment Volume) trends for payments—last 8 quarters.
+37,Give lending distribution (disbursements) trends and partner breakdown.
+38,"Provide merchant network growth (count, devices deployed, ARPU)."
+39,Provide active user metrics (MAU/DAU/registered) and engagement trends.
+40,Provide product launch timeline since 2022 with business impact assessment.
+41,Extract all regulatory events affecting Paytm since 2022 (RBI/SEBI/others).
+42,Summarize the Paytm Payments Bank (PPBL) restrictions/status and quantified impact.
+43,Provide an 8-quarter bridge from contribution profit → EBITDA → PAT.
+44,"Give Paytm’s capital structure & liquidity position (cash, borrowings, undrawn lines)."
+45,"Provide cash flow trends (operating, investing, financing) last 5 years."
+46,Provide working capital analysis and operating cycle dynamics.
+47,List and summarise material litigation & contingent liabilities.
+48,"Provide shareholding pattern changes (promoter, FPI, MF) over last 8 quarters."
+49,"Extract ESOP grants, outstanding, and potential dilution schedule."
+50,Provide a timeline of board & senior management changes since 2022.
+51,Provide analyst consensus vs reported results for the last 4 quarters and surprises.
+52,"Build base/bull/bear financial scenarios for next 3 years (revenue, EBITDA, key assumptions)."
+53,"Provide valuation multiples vs Indian & global fintech peers (P/S, EV/Rev)."
+54,"Provide a competitor comparison: PhonePe, Google Pay, BharatPe on KPIs (TPV, merchants, revenue)."
+55,Identify causes of all >5% single-day stock moves in last 12 months.
+56,Provide share issuance / buyback / capital raising history since IPO.
+57,"Provide detailed breakdown of operating costs (personnel, marketing, processing, tech)."
+58,"Provide unit economics for device (point-of-sale) business: cost, margin, payback."
+59,"Provide unit economics for payments business: take-rate, direct costs, contribution per TPV."
+60,"Provide unit economics for lending distribution: commission per loan, effective margin."
+61,List all subsidiaries & associates with short description and last reported financials.
+62,Provide disclosures on related-party transactions & quantification.
+63,Provide analyst/credit downgrades or regulatory fines and quantification.
+64,Extract and summarise all Earnings Presentations since 2022 (themes & changes).
+65,Provide a risk matrix (probability & impact) for top 10 risks.
+66,Provide Paytm’s policy/approach on data privacy & security (disclosed).
+67,"Provide a reconciliation of reported KPIs vs statutory numbers (e.g., Contribution profit definition vs GAAP)."
+68,Provide a timeline of material press controversies and management responses.
+69,Provide a table of large customers/merchant concentration (if disclosed).
+70,Provide geographical revenue distribution (if disclosed).
+71,Provide detailed description and financials of any NBFC/Bank partnerships.
+72,"Provide audit qualifications, if any, and auditor commentary over time."
+73,Provide loan book asset-quality proxies (if direct book not disclosed).
+74,Provide all SEC/overseas filings (if any) or cross-border exposures.
+75,Provide a historical cost of revenue / gross margin analysis.
+76,Provide a customer acquisition cost (CAC) and LTV analysis (if disclosed or inferable).
+77,Provide a summary of corporate governance disclosures and board committee composition.
+78,Provide ESG or sustainability disclosures and any KPIs reported.
+79,Provide a list and assessment of strategic M&A / investments since 2022.
+80,"Provide merchant take-up & economics for value-added services (loans, insurance)."
+81,Provide breakdown of marketing spend and ROI where possible.
+82,Provide data on promotional/discount spend and its impact on take-rate.
+83,Provide investor sentiment summary (news tone & social media trends since 2022).
+84,Provide list of material tax issues or disputes and quantification.
+85,Provide an overview of technology stack/disaster recovery disclosures (if any).
+86,Provide a cross-check of KPI definitions used across filings (consistency check).
+87,Provide a timeline and financial summary of any government/central programs Paytm participates in.
+88,Provide a reconciliation of disclosures between IR site and exchange filings (spot-check 10 items).
+89,Provide broker/analyst note excerpts on key turning points (if in DB).
+90,Provide an assessment of concentration risk in payments processing (vendor/rails).
+91,Provide KPIs for customer retention & churn (cohort analysis if available).
+92,Provide a summary of any product/platform outages and remediation steps.
+93,Provide a detailed competitor pricing & merchant discounting comparison.
+94,Provide an analysis of marketing / sales channel efficiency across offline/online.
+95,Provide a historical timeline of strategic guidance given by management and actual vs guided outcomes.
+96,Provide list of proprietary indexes or third-party datasets the platform used in its analysis.
+97,Provide mapping of which exchange filing / slide supports each key assertion in the platform’s report.
+98,"Provide quantitative sensitivity & scenario tables for key variables (TPV, take-rate, marketing spend)."
+99,Provide a summarized “what management said” tracker across all earnings calls since 2022.
+100,Provide a reconciliation of investor concerns raised in media vs management replies.
+101,Provide an independence check on platform’s calculation (recompute 10 KPIs from raw filings).
+102,Provide well-sourced footnotes for every material number used in a draft report.
+103,Provide an executive summary suitable for a sell-side research note (600–900 words).
+104,Provide a reproducible checklist for verifying any claim made by the platform (QA steps).
+105,"Produce a final “report-ready” pack: tables, charts, slide-ready visuals and an assumptions appendix."
+106,Chart Paytm’s quarterly revenue trend since FY22.
+107,Chart Paytm’s contribution margin % by quarter since FY22.
+108,Plot Paytm’s EBITDA (reported & adjusted) over the last 12 quarters.
+109,Chart monthly/quarterly GMV across Paytm Payments Bank & Paytm Payments Services.
+110,Visualize Paytm’s merchant base growth over time.
+111,"Chart Paytm’s loan distribution (merchant loans, personal loans, Postpaid) over last 10 quarters."
+112,Plot Paytm’s device deployment growth: Soundbox + card machines.
+113,Chart Paytm’s payment processing revenue vs. cost of processing over last 12 quarters.
+114,Visualize user engagement: MTU (monthly transacting users) since FY22.
+115,Chart Paytm’s payments net take-rate over time.
+116,Show trend of Paytm Postpaid active users and outstanding loan book.
+117,"Chart Paytm’s UPI market share versus PhonePe, Google Pay."
+118,Visualize merchant discount rate (MDR)-related revenue by quarter.
+119,Plot marketing expense as % of revenues over the last 12 quarters.
+120,Chart employee cost trend including ESOP expenses.
+121,Visualize Paytm’s cash & cash equivalents trend.
+122,"Chart Paytm Payments Bank metrics — deposits, wallet balances, FASTag issuance."
+123,Plot Paytm’s NPA trend across loan products.
+124,"Visualize break-up of Paytm’s revenue into Payments, Financial Services, Commerce."
+125,Chart monthly share price & volume of Paytm since 2022.
+126,Plot Paytm’s market cap vs. revenue (valuation trend).
+127,Chart analyst consensus targets vs. actual stock performance.
+128,Visualize key regulatory events (timelines) alongside revenue/GMV.
+129,Chart Paytm’s net take-rate split by merchant category (offline vs online).
+130,"Visualize the impact of Paytm Payments Bank restrictions on metrics (MTU, GMV, deposits)."
+131,Plot Paytm’s operational profitability timeline (CM positive → EBITDA positive → PAT).
+132,Chart Paytm’s post-paid loan origination vs repayments.
+133,Visualize Paytm’s advertising and promotional expenses over time.
+134,Chart cash burn vs cash runway.
+135,Plot Paytm’s UPI incentives (if disclosed) vs costs.
+136,Chart fintech sector comparison: Paytm vs PB Fintech vs Nykaa vs Zomato (revenues/EBITDA).
+137,Visualize Paytm’s customer acquisition cost trend.
+138,Plot Paytm’s Soundbox revenues vs merchant subscription revenues.
+139,Visualize Paytm’s monthly UPI payouts/incentives.
+140,Plot churn rate of merchants (if disclosed or estimable).
