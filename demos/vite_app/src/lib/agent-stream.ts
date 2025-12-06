@@ -1,6 +1,12 @@
-import type { AgentNode } from './xml-parser';
-import { AnthropicStreamParser } from './anthropic-parser';
-import type { AnthropicEvent } from './anthropic-types';
+import {
+  type AgentNode,
+  type AnthropicEvent,
+  type StreamFormat,
+  AnthropicStreamParser,
+  XmlStreamParser,
+  parseMetaInit,
+  stripMetaInit,
+} from './parsers';
 
 export interface AgentState {
   status: 'idle' | 'streaming' | 'complete' | 'error';
@@ -9,11 +15,14 @@ export interface AgentState {
   completion?: AgentCompletion;
   error?: string;
   rawContent: string; // Kept for debugging/inspection
+  streamFormat?: StreamFormat; // Format detected from meta_init
 }
 
 export interface AgentMetadata {
   agent_uuid: string;
   model: string;
+  user_query?: string;
+  message_history?: any[];
 }
 
 export interface AgentCompletion {
@@ -30,6 +39,7 @@ export interface AgentConfig {
   system_prompt?: string;
   model?: string;
   max_steps?: number;
+  formatter?: StreamFormat;
   // Add other config options as needed
 }
 
@@ -38,6 +48,11 @@ export type AgentStreamCallbacks = {
   onComplete?: (state: AgentState) => void;
   onError?: (error: string) => void;
 };
+
+/**
+ * Union type for both parser implementations.
+ */
+type StreamParser = AnthropicStreamParser | XmlStreamParser;
 
 export async function streamAgent(
   userPrompt: string,
@@ -54,7 +69,11 @@ export async function streamAgent(
   callbacks.onUpdate(initialState);
 
   let currentState = { ...initialState };
-  const parser = new AnthropicStreamParser();
+  
+  // Parser selection: will be determined from meta_init
+  let parser: StreamParser | null = null;
+  let streamFormat: StreamFormat | null = null;
+  let metaInitProcessed = false;
 
   try {
     const response = await fetch('http://localhost:8000/agent/run', {
@@ -108,24 +127,73 @@ export async function streamAgent(
                 },
               };
             } else if (eventData.event === 'chunk') {
-              // Accumulate raw content for debugging
-              currentState.rawContent += eventData.content;
-
-              // Parse the content as an Anthropic Event
-              try {
-                const anthropicEvent = JSON.parse(eventData.content) as AnthropicEvent;
-                parser.processEvent(anthropicEvent);
-                
-                // Update nodes from parser state
-                currentState.nodes = parser.getNodes();
-              } catch (e) {
-                // Fallback: If it's not valid JSON or not a recognized event,
-                // we might be receiving plain text or legacy XML fragments.
-                // In a strict "raw" mode this shouldn't happen, but for robustness:
-                console.warn('Failed to parse Anthropic event JSON:', e);
+              let content = eventData.content as string;
+              
+              // Check for meta_init on first chunk
+              if (!metaInitProcessed) {
+                const metaInit = parseMetaInit(content);
+                if (metaInit) {
+                  streamFormat = metaInit.format;
+                  currentState.streamFormat = streamFormat;
+                  
+                  // Update metadata from meta_init
+                  currentState.metadata = {
+                    ...currentState.metadata,
+                    agent_uuid: metaInit.agent_uuid,
+                    model: metaInit.model,
+                    user_query: metaInit.user_query,
+                    message_history: metaInit.message_history,
+                  };
+                  
+                  // Initialize parser based on format
+                  if (streamFormat === 'raw') {
+                    parser = new AnthropicStreamParser();
+                  } else {
+                    parser = new XmlStreamParser();
+                  }
+                  
+                  // Strip meta_init from content before processing
+                  content = stripMetaInit(content);
+                  metaInitProcessed = true;
+                }
               }
               
+              // Fallback: if no meta_init received, default to raw parser
+              if (!parser) {
+                console.warn('No meta_init received, defaulting to raw parser');
+                parser = new AnthropicStreamParser();
+                streamFormat = 'raw';
+                currentState.streamFormat = streamFormat;
+                metaInitProcessed = true;
+              }
+              
+              // Skip empty content after stripping meta_init
+              if (!content.trim()) {
+                callbacks.onUpdate(currentState);
+                continue;
+              }
+              
+              // Accumulate raw content for debugging
+              currentState.rawContent += content;
+
+              // Process content based on format
+              if (streamFormat === 'raw') {
+                // Raw format: content is JSON-encoded Anthropic events
+                try {
+                  const anthropicEvent = JSON.parse(content) as AnthropicEvent;
+                  (parser as AnthropicStreamParser).processEvent(anthropicEvent);
+                } catch (e) {
+                  console.warn('Failed to parse Anthropic event JSON:', e);
+                }
+              } else {
+                // XML format: content is plain XML text
+                (parser as XmlStreamParser).appendChunk(content);
+              }
+              
+              // Update nodes from parser state (aggressive real-time updates)
+              currentState.nodes = parser.getNodes();
               currentState = { ...currentState }; // Trigger update
+              
             } else if (eventData.event === 'complete') {
               currentState = {
                 ...currentState,

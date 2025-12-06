@@ -353,6 +353,18 @@ class AnthropicAgent:
             "formatter": formatter or self.formatter
         }, step_number=0)
         
+        # Emit meta_init tag to signal stream format and provide metadata
+        if queue is not None:
+            meta_init = {
+                "format": formatter if formatter is not None else self.formatter,
+                "user_query": prompt if isinstance(prompt, str) else json.dumps(prompt),
+                "message_history": self.conversation_history,
+                "agent_uuid": self.agent_uuid,
+                "model": self.model,
+            }
+            escaped_json = html.escape(json.dumps(meta_init), quote=True)
+            await queue.put(f'<meta_init data="{escaped_json}"></meta_init>')
+        
         # Retrieve and inject semantic memories
         if self.memory_store:
             self.messages = self.memory_store.retrieve(

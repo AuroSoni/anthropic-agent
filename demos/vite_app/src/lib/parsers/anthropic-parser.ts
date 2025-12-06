@@ -1,8 +1,5 @@
-import { type AgentNode, parseMixedContent } from './xml-parser';
-import type {
-  AnthropicEvent,
-  ContentBlockType
-} from './anthropic-types';
+import type { AgentNode, AnthropicEvent, ContentBlockType } from './types';
+import { parseMixedContent } from './xml-parser';
 
 interface BlockState {
   type: ContentBlockType;
@@ -18,10 +15,21 @@ interface BlockState {
   isComplete: boolean;
 }
 
+/**
+ * AnthropicStreamParser processes raw Anthropic streaming events.
+ * 
+ * It maintains internal state for each content block and converts
+ * them to a normalized AgentNode[] tree structure.
+ * 
+ * Designed for aggressive real-time updates: getNodes() can be called
+ * after every event to get the current tree state.
+ */
 export class AnthropicStreamParser {
   private blocks: Map<number, BlockState> = new Map();
   
-  // Process a single raw event from the stream
+  /**
+   * Process a single raw event from the stream.
+   */
   processEvent(event: AnthropicEvent): void {
     switch (event.type) {
       case 'message_start':
@@ -92,7 +100,10 @@ export class AnthropicStreamParser {
     }
   }
 
-  // Convert current state to AgentNode[]
+  /**
+   * Convert current state to AgentNode[].
+   * Can be called at any time for real-time updates.
+   */
   getNodes(): AgentNode[] {
     const nodes: AgentNode[] = [];
     // Sort blocks by index to ensure order
@@ -154,4 +165,12 @@ export class AnthropicStreamParser {
 
     return nodes;
   }
+
+  /**
+   * Reset the parser state.
+   */
+  reset(): void {
+    this.blocks.clear();
+  }
 }
+

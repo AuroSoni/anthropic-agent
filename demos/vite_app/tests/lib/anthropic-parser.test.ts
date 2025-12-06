@@ -1,13 +1,13 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { AnthropicStreamParser } from '../../src/lib/anthropic-parser';
+import {
+  AnthropicStreamParser,
+  type AnthropicEvent,
+  type MessageStartEvent,
+  type ContentBlockStartEvent,
+  type ContentBlockDeltaEvent,
+  type ContentBlockStopEvent,
+} from '../../src/lib/parsers';
 import { example_1 } from '../../src/lib/raw_stream_examples';
-import type {
-  AnthropicEvent,
-  MessageStartEvent,
-  ContentBlockStartEvent,
-  ContentBlockDeltaEvent,
-  ContentBlockStopEvent,
-} from '../../src/lib/anthropic-types';
 
 // Helper to create events
 const createMessageStart = (): MessageStartEvent => ({

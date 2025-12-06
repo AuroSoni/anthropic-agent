@@ -1,3 +1,26 @@
+/**
+ * Core types for the agent stream parser library.
+ * These types are used across all parsers and can be exported for use in other projects.
+ */
+
+// ============================================================================
+// Node Types (for parsed output tree)
+// ============================================================================
+
+export type AgentNodeType = 'text' | 'element';
+
+export interface AgentNode {
+  type: AgentNodeType;
+  content?: string; // For text nodes
+  tagName?: string; // For element nodes
+  attributes?: Record<string, string>; // For element nodes
+  children?: AgentNode[]; // For element nodes
+}
+
+// ============================================================================
+// Anthropic Event Types (for raw format parsing)
+// ============================================================================
+
 export type AnthropicEventType = 
   | 'message_start'
   | 'message_delta'
@@ -90,3 +113,25 @@ export type AnthropicEvent =
   | ContentBlockStartEvent 
   | ContentBlockDeltaEvent 
   | ContentBlockStopEvent;
+
+// ============================================================================
+// Stream Format Types
+// ============================================================================
+
+/**
+ * Stream format type: "xml" or "raw"
+ */
+export type StreamFormat = 'xml' | 'raw';
+
+/**
+ * MetaInit contains initialization metadata sent at the start of a stream.
+ * Emitted as <meta_init data="..."></meta_init> by the backend.
+ */
+export interface MetaInit {
+  format: StreamFormat;
+  user_query: string;
+  message_history: any[];
+  agent_uuid: string;
+  model: string;
+}
+

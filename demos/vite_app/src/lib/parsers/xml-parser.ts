@@ -1,12 +1,4 @@
-export type AgentNodeType = 'text' | 'element';
-
-export interface AgentNode {
-  type: AgentNodeType;
-  content?: string; // For text nodes
-  tagName?: string; // For element nodes
-  attributes?: Record<string, string>; // For element nodes
-  children?: AgentNode[]; // For element nodes
-}
+import type { AgentNode } from './types';
 
 /**
  * Parses a string containing mixed text and XML-like tags into a tree structure.
@@ -115,3 +107,4 @@ function parseAttributes(attrString: string): Record<string, string> {
   }
   return attrs;
 }
+
