@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from agent import router as agent_router
 from db import db
@@ -23,6 +24,15 @@ app = FastAPI(
     description="Demo API for anthropic-agent package",
     version="0.1.0",
     lifespan=lifespan,
+)
+
+# Add CORS middleware for frontend access
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],  # Vite dev server
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Include agent router for streaming endpoints

@@ -1,6 +1,7 @@
 # Move to anthropic_agent/core/agent.py
 import asyncio
 import json
+import html
 import anthropic
 import logging
 import uuid
@@ -435,16 +436,13 @@ class AnthropicAgent:
                 include=["role", "content"],
                 exclude_unset=True,
                 exclude=getattr(accumulated_message, "__api_exclude__", None),
+                warnings=False
             )
             self.messages.append(assistant_message)
             self.conversation_history.append(assistant_message)
             logger.debug("Assistant message: %s", assistant_message)
             if accumulated_message.container != None:
                 self.container_id = accumulated_message.container.id
-            
-            # Register any server-side generated files referenced in the assistant message
-            # TODO: Implement file backend
-            # self._register_files_from_message(accumulated_message, step)
             
             # Check if there are tool calls to execute
             # Only process tool calls if stop_reason is "tool_use"
@@ -460,12 +458,14 @@ class AnthropicAgent:
                     tool_results = []
                     for tool_call in tool_calls:
                         is_error = False
+                        result_content = None
                         try:
                             # Execute the tool (support both sync and async executors)
                             result = self.execute_tool_call(tool_call.name, tool_call.input)
                             # Check if result is a coroutine (async function)
                             if asyncio.iscoroutine(result):
                                 result = await result
+                            result_content = result
                             tool_results.append({
                                 "type": "tool_result",
                                 "tool_use_id": tool_call.id,
@@ -474,12 +474,28 @@ class AnthropicAgent:
                         except Exception as e:
                             # Handle tool execution errors
                             is_error = True
+                            result_content = f"Error executing tool: {str(e)}"
                             tool_results.append({
                                 "type": "tool_result",
                                 "tool_use_id": tool_call.id,
-                                "content": f"Error executing tool: {str(e)}",
+                                "content": result_content,
                                 "is_error": True
                             })
+                        
+                        # Stream tool result to queue in XML format
+                        if queue is not None:
+                            tool_use_id = html.escape(str(tool_call.id), quote=True)
+                            tool_name = html.escape(str(tool_call.name), quote=True)
+                            # Serialize result content to string
+                            if result_content is None:
+                                content_str = ""
+                            elif isinstance(result_content, str):
+                                content_str = result_content
+                            else:
+                                content_str = json.dumps(result_content, default=str)
+                            await queue.put(
+                                f'<content-block-tool_result id="{tool_use_id}" name="{tool_name}"><![CDATA[{content_str}]]></content-block-tool_result>'
+                            )
                         
                         # Log: tool execution
                         self._log_action("tool_execution", {
@@ -568,6 +584,7 @@ class AnthropicAgent:
             # Build AgentResult (generated_files populated after file processing/registry aggregation)
             result = AgentResult(
                 final_message=accumulated_message,
+                final_answer=self._extract_final_answer(accumulated_message),
                 conversation_history=self.conversation_history.copy(),
                 stop_reason=accumulated_message.stop_reason,
                 model=accumulated_message.model,
@@ -586,15 +603,11 @@ class AnthropicAgent:
                 "total_output_tokens": accumulated_message.usage.output_tokens,
             }, step_number=step)
 
-            # If file_backend is configured, enrich registry entries with backend metadata
-            # TODO: Implement file backend
-            # if self.file_backend:
-            #     await self._process_generated_files(step)
+            # Finalize file processing (extract, store, stream)
+            await self._finalize_file_processing(queue)
 
-            # Always stream and return the full registry of known files (current and previous runs)
+            # Get updated metadata
             all_files_metadata: list[dict[str, Any]] = list(self.file_registry.values())
-            if queue and all_files_metadata:
-                await self._stream_file_metadata(queue, all_files_metadata)
 
             # Update result with all known files for this agent
             result.generated_files = all_files_metadata
@@ -716,6 +729,35 @@ class AnthropicAgent:
             
             logger.info(f"Compaction applied: {metadata}")
     
+    def _extract_final_answer(self, message: BetaMessage) -> str:
+        """Extract and concatenate text from all content blocks in the message.
+        
+        Text blocks are collected only from the blocks appearing after the last
+        tool use block. If no tool use block is present, all text blocks are returned.
+        
+        Args:
+            message: The assistant message object
+            
+        Returns:
+            Concatenated text from the relevant text blocks
+        """
+        if not message or not message.content:
+            return ""
+
+        start_index = 0
+        # Find the index of the last tool_use block, if any
+        for i, block in enumerate(message.content):
+            if getattr(block, 'type', '') in ['server_tool_use', 'web_search_tool_result', 'tool_use', 'tool_result']:
+                start_index = i + 1
+        
+        full_text = []
+        for block in message.content[start_index:]:
+            # Check if block is a text block (standard or beta)
+            if hasattr(block, 'text') and getattr(block, 'type', '') == 'text':
+                full_text.append(block.text)
+        
+        return "".join(full_text)
+
     async def _generate_final_summary(
         self,
         queue: Optional[asyncio.Queue] = None,
@@ -814,6 +856,7 @@ class AnthropicAgent:
                 include=["role", "content"],
                 exclude_unset=True,
                 exclude=getattr(accumulated_message, "__api_exclude__", None),
+                warnings=False
             )
         self.messages.append(assistant_message)
         self.conversation_history.append(assistant_message)
@@ -821,10 +864,6 @@ class AnthropicAgent:
         # Update container ID if present
         if accumulated_message.container is not None:
             self.container_id = accumulated_message.container.id
-
-        # Register any server-side generated files referenced in the final summary
-        # TODO: Implement file backend
-        # self._register_files_from_message(accumulated_message, self.max_steps)
 
         # Update memory store with final conversation results
         if self.memory_store:
@@ -844,6 +883,7 @@ class AnthropicAgent:
         # Build AgentResult (generated_files populated from file_registry below)
         result = AgentResult(
             final_message=accumulated_message,
+            final_answer=self._extract_final_answer(accumulated_message),
             conversation_history=self.conversation_history.copy(),
             stop_reason=accumulated_message.stop_reason,
             model=accumulated_message.model,
@@ -862,15 +902,11 @@ class AnthropicAgent:
             "total_output_tokens": accumulated_message.usage.output_tokens,
         }, step_number=self.max_steps)
 
-        # If file_backend is configured, enrich registry entries with backend metadata
-        # TODO: Implement file backend
-        # if self.file_backend:
-        #     await self._process_generated_files(self.max_steps)
+        # Finalize file processing (extract, store, stream)
+        await self._finalize_file_processing(queue)
 
-        # Always stream and return the full registry of known files (current and previous runs)
+        # Get updated metadata
         all_files_metadata: list[dict[str, Any]] = list(self.file_registry.values())
-        if queue and all_files_metadata:
-            await self._stream_file_metadata(queue, all_files_metadata)
 
         # Update result with all known files for this agent
         result.generated_files = all_files_metadata
@@ -970,8 +1006,11 @@ class AnthropicAgent:
             params["tools"] = filtered_tools
         if thinking:
             params["thinking"] = thinking
-        # if betas:
-        #     params["betas"] = betas # This is not supported by the count_tokens API
+            
+        # Pass betas as extra headers since the count_tokens API doesn't support the 'betas' parameter directly
+        if betas:
+            params["extra_headers"] = {"anthropic-beta": ",".join(betas)}
+            
         # if container:
         #     params["container"] = container   # This is not supported by the count_tokens API
         
@@ -1425,18 +1464,49 @@ class AnthropicAgent:
 
         self.file_registry[file_id] = updated
 
-    def _register_files_from_message(self, messages: BetaMessage, step: int) -> None:
+    def _register_files_from_message(self, message: BetaMessage | dict[str, Any], step: int) -> None:
         """Scan a message or content structure and register any file references.
         
         This is called incrementally for each assistant response and for
         tool-result messages, so that file_ids are discovered per-step
         instead of by scanning self.messages at the end of a run.
         """
-
-        file_ids = self.extract_file_ids(messages)
+        file_ids = self.extract_file_ids(message)
         
-        # Update the file registry information for the files
-    
+        for file_id in file_ids:
+            self._upsert_file_registry_entry(
+                file_id=file_id,
+                filename=f"file_{file_id}",  # Placeholder until filename is available
+                step=step,
+            )
+            
+    async def _finalize_file_processing(self, queue: Optional[asyncio.Queue] = None) -> None:
+        """
+        Finalize file processing at the end of a run.
+        1. Extract all file IDs from conversation history.
+        2. Process (download/store) files via backend.
+        3. Stream file metadata to the client.
+        """
+        # 1. Extract and register all files from history
+        # We use the final step count for simplicity, or 0 if unknown
+        current_step = getattr(self, "total_steps", 0) # total_steps might not be set on self yet
+        # Actually run() sets 'step' variable. We can just pass 0 or use a counter if we iterate.
+        # Since we are doing this at the end, we can just scan everything.
+        
+        for i, message in enumerate(self.conversation_history):
+            # rough step approximation or just use 0. 
+            # ideally we would know the step for each message, but history is flat list.
+            self._register_files_from_message(message, step=0)
+
+        # 2. Process files via backend (download & store)
+        if self.file_backend:
+            await self._process_generated_files(step=0)
+
+        # 3. Stream metadata
+        all_files_metadata: list[dict[str, Any]] = list(self.file_registry.values())
+        if queue and all_files_metadata:
+            await self._stream_file_metadata(queue, all_files_metadata)
+
     async def _download_file(self, file_id: str) -> tuple[FileMetadata, bytes]:
         """Download file content from Anthropic Files API.
         
@@ -1451,7 +1521,8 @@ class AnthropicAgent:
         """
         try:
             # Download file using Files API
-            file_content = await self.client.beta.files.download(file_id)
+            response = await self.client.beta.files.download(file_id)
+            file_content = await response.read()
             file_metadata = await self.client.beta.files.retrieve_metadata(file_id)
             return file_metadata, file_content
         
@@ -1459,15 +1530,64 @@ class AnthropicAgent:
             logger.error(f"Failed to download file {file_id}: {e}", exc_info=True)
             raise
     
-    def extract_file_ids(messages: BetaMessage) -> list[str]:
+    def extract_file_ids(self, message: BetaMessage | dict[str, Any]) -> list[str]:
         file_ids = []
-        for item in messages.content:
-            if item.type == 'bash_code_execution_tool_result':
-                content_item = item.content
-                if content_item.type == 'bash_code_execution_result':
-                    for file in content_item.content:
-                        if hasattr(file, 'file_id'):
-                            file_ids.append(file.file_id)
+        
+        if isinstance(message, dict):
+            content = message.get("content")
+        else:
+            content = getattr(message, "content", None)
+            
+        if not content:
+            return file_ids
+            
+        # Ensure content is iterable
+        if not isinstance(content, list):
+            logger.warning(f"Message content is not a list: {type(content)}")
+            return file_ids
+
+        for item in content:
+            # Handle both object and dict access for item
+            if isinstance(item, dict):
+                item_type = item.get("type")
+                item_content = item.get("content")
+            else:
+                item_type = getattr(item, "type", "")
+                item_content = getattr(item, "content", None)
+            
+            # logger.debug(f"Scanning content item type: {item_type}")
+
+            # Check for both specific beta type and generic tool_result that might contain bash result
+            if item_type == 'bash_code_execution_tool_result' or item_type == 'tool_result':
+                # content_item is the nested bash_code_execution_result
+                
+                if not item_content:
+                    continue
+
+                if isinstance(item_content, dict):
+                    inner_type = item_content.get("type")
+                    files = item_content.get("content", [])
+                elif hasattr(item_content, "type"):
+                    inner_type = getattr(item_content, "type", "")
+                    files = getattr(item_content, "content", [])
+                else:
+                    # Content is likely a string or list, not the expected nested structure
+                    continue
+                
+                # logger.debug(f"Found potentially relevant result with inner type: {inner_type}")
+
+                if inner_type == 'bash_code_execution_result':
+                    if isinstance(files, list):
+                        for file in files:
+                            # Handle both object and dict access for file
+                            if isinstance(file, dict):
+                                file_id = file.get("file_id")
+                            else:
+                                file_id = getattr(file, "file_id", None)
+                                
+                            if file_id:
+                                logger.info(f"Found file_id: {file_id}")
+                                file_ids.append(file_id)
         return file_ids
 
     async def _process_generated_files(self, step: int) -> list[dict]:
@@ -1495,7 +1615,13 @@ class AnthropicAgent:
             try:
                 # Download file content from Anthropic Files API
                 logger.info(f"Downloading file {filename} ({file_id}) for backend storage")
-                content = await self._download_file(file_id)
+                # content is a tuple (FileMetadata, bytes) - we need index 1 for content bytes
+                file_metadata_api, content_bytes = await self._download_file(file_id)
+                # Update filename from metadata if available
+                if hasattr(file_metadata_api, 'filename') and file_metadata_api.filename:
+                    filename = file_metadata_api.filename
+                    # Update registry entry with new filename
+                    registry_entry["filename"] = filename
 
                 # Decide whether to store or update based on existing backend metadata
                 has_backend_metadata = "storage_backend" in registry_entry
@@ -1503,7 +1629,7 @@ class AnthropicAgent:
                     metadata = self.file_backend.update(
                         file_id=file_id,
                         filename=filename,
-                        content=content,
+                        content=content_bytes,
                         existing_metadata=registry_entry,
                         agent_uuid=self.agent_uuid,
                     )
@@ -1511,7 +1637,7 @@ class AnthropicAgent:
                     metadata = self.file_backend.store(
                         file_id=file_id,
                         filename=filename,
-                        content=content,
+                        content=content_bytes,
                         agent_uuid=self.agent_uuid,
                     )
 
@@ -1551,8 +1677,8 @@ class AnthropicAgent:
         if not metadata:
             return
         
-        # Format as JSON inside CDATA
+        # Format as JSON inside custom content block
         files_json = json.dumps({"files": metadata}, indent=2)
-        meta_tag = f'<meta type="server-files"><![CDATA[{files_json}]]></meta>\n'
+        meta_tag = f'<content-block-meta_files>\n{files_json}\n</content-block-meta_files>'
         
         await queue.put(meta_tag)
