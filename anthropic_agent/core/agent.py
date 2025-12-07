@@ -1691,6 +1691,6 @@ class AnthropicAgent:
         
         # Format as JSON inside custom content block
         files_json = json.dumps({"files": metadata}, indent=2)
-        meta_tag = f'<content-block-meta_files>\n{files_json}\n</content-block-meta_files>'
+        meta_tag = f'<content-block-meta_files><![CDATA[{files_json}]]></content-block-meta_files>'
         
         await queue.put(meta_tag)
