@@ -6,7 +6,7 @@ from typing import Any
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from agent import router as agent_router
+from agent_router import router as agent_router
 from db import db
 
 
