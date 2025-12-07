@@ -113,114 +113,77 @@ export async function streamAgent(
       for (const line of lines) {
         if (line.startsWith('data: ')) {
           const dataStr = line.slice(6);
-          if (dataStr === '[DONE]') continue;
-
-          try {
-            const eventData = JSON.parse(dataStr);
-            
-            if (eventData.event === 'metadata') {
+          if (dataStr === '[DONE]') {
+            // Stream complete - mark as complete if not already
+            if (currentState.status === 'streaming') {
               currentState = {
                 ...currentState,
-                metadata: {
-                  agent_uuid: eventData.agent_uuid,
-                  model: eventData.model,
-                },
+                status: 'complete',
               };
-            } else if (eventData.event === 'chunk') {
-              let content = eventData.content as string;
+              callbacks.onUpdate(currentState);
+            }
+            continue;
+          }
+
+          // Check for meta_init on first data chunk
+          if (!metaInitProcessed) {
+            const metaInit = parseMetaInit(dataStr);
+            if (metaInit) {
+              streamFormat = metaInit.format;
+              currentState.streamFormat = streamFormat;
               
-              // Check for meta_init on first chunk
-              if (!metaInitProcessed) {
-                const metaInit = parseMetaInit(content);
-                if (metaInit) {
-                  streamFormat = metaInit.format;
-                  currentState.streamFormat = streamFormat;
-                  
-                  // Update metadata from meta_init
-                  currentState.metadata = {
-                    ...currentState.metadata,
-                    agent_uuid: metaInit.agent_uuid,
-                    model: metaInit.model,
-                    user_query: metaInit.user_query,
-                    message_history: metaInit.message_history,
-                  };
-                  
-                  // Initialize parser based on format
-                  if (streamFormat === 'raw') {
-                    parser = new AnthropicStreamParser();
-                  } else {
-                    parser = new XmlStreamParser();
-                  }
-                  
-                  // Strip meta_init from content before processing
-                  content = stripMetaInit(content);
-                  metaInitProcessed = true;
-                }
-              }
+              // Update metadata from meta_init
+              currentState.metadata = {
+                ...currentState.metadata,
+                agent_uuid: metaInit.agent_uuid,
+                model: metaInit.model,
+                user_query: metaInit.user_query,
+                message_history: metaInit.message_history,
+              };
               
-              // Fallback: if no meta_init received, default to raw parser
-              if (!parser) {
-                console.warn('No meta_init received, defaulting to raw parser');
+              // Initialize parser based on format
+              if (streamFormat === 'raw') {
                 parser = new AnthropicStreamParser();
-                streamFormat = 'raw';
-                currentState.streamFormat = streamFormat;
-                metaInitProcessed = true;
+              } else {
+                parser = new XmlStreamParser();
               }
               
-              // Skip empty content after stripping meta_init
-              if (!content.trim()) {
+              metaInitProcessed = true;
+              
+              // Strip meta_init and continue with remaining content
+              const remaining = stripMetaInit(dataStr);
+              if (!remaining.trim()) {
                 callbacks.onUpdate(currentState);
                 continue;
               }
               
-              // Accumulate raw content for debugging
-              currentState.rawContent += content;
-
-              // Process content based on format
-              if (streamFormat === 'raw') {
-                // Raw format: content is JSON-encoded Anthropic events
-                try {
-                  const anthropicEvent = JSON.parse(content) as AnthropicEvent;
-                  (parser as AnthropicStreamParser).processEvent(anthropicEvent);
-                } catch (e) {
-                  console.warn('Failed to parse Anthropic event JSON:', e);
-                }
-              } else {
-                // XML format: content is plain XML text
-                (parser as XmlStreamParser).appendChunk(content);
-              }
-              
-              // Update nodes from parser state (aggressive real-time updates)
-              currentState.nodes = parser.getNodes();
-              currentState = { ...currentState }; // Trigger update
-              
-            } else if (eventData.event === 'complete') {
-              currentState = {
-                ...currentState,
-                status: 'complete',
-                completion: {
-                  total_steps: eventData.total_steps,
-                  stop_reason: eventData.stop_reason,
-                  usage: eventData.usage,
-                  container_id: eventData.container_id,
-                },
-              };
-            } else if (eventData.event === 'error') {
-               currentState = {
-                ...currentState,
-                status: 'error',
-                error: eventData.error,
-              };
-              if (callbacks.onError) callbacks.onError(eventData.error);
+              // Process remaining content after meta_init
+              processContent(remaining);
+              continue;
             }
             
-            callbacks.onUpdate(currentState);
-
-          } catch (e) {
-            console.warn('Failed to parse SSE event:', dataStr, e);
+            // No meta_init found - detect format from content
+            // If it starts with '{', assume raw JSON; otherwise XML
+            if (dataStr.trim().startsWith('{')) {
+              parser = new AnthropicStreamParser();
+              streamFormat = 'raw';
+            } else {
+              parser = new XmlStreamParser();
+              streamFormat = 'xml';
+            }
+            currentState.streamFormat = streamFormat;
+            metaInitProcessed = true;
           }
+          
+          processContent(dataStr);
         }
       }
+    }
+    
+    // Ensure complete state is set
+    if (currentState.status === 'streaming') {
+      currentState = { ...currentState, status: 'complete' };
+      callbacks.onUpdate(currentState);
     }
     
     if (callbacks.onComplete) {
@@ -235,5 +198,35 @@ export async function streamAgent(
     };
     callbacks.onUpdate(currentState);
     if (callbacks.onError) callbacks.onError(error.message);
+  }
+
+  /**
+   * Process content based on detected stream format.
+   */
+  function processContent(content: string) {
+    if (!parser || !content.trim()) return;
+    
+    // Accumulate raw content for debugging
+    currentState.rawContent += content;
+
+    // Process content based on format
+    if (streamFormat === 'raw') {
+      // Raw format: content is JSON-encoded Anthropic events
+      try {
+        const anthropicEvent = JSON.parse(content) as AnthropicEvent;
+        (parser as AnthropicStreamParser).processEvent(anthropicEvent);
+      } catch (e) {
+        // Not valid JSON - might be an error message or other text
+        console.warn('Failed to parse Anthropic event JSON:', content.slice(0, 100), e);
+      }
+    } else {
+      // XML format: content is plain XML text
+      (parser as XmlStreamParser).appendChunk(content);
+    }
+    
+    // Update nodes from parser state (aggressive real-time updates)
+    currentState.nodes = parser.getNodes();
+    currentState = { ...currentState }; // Trigger update
+    callbacks.onUpdate(currentState);
   }
 }

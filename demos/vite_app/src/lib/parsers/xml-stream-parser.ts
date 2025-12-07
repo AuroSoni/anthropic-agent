@@ -10,16 +10,44 @@ const TAG_NAME_MAP: Record<string, string> = {
   'content-block-thinking': 'thinking',
   'content-block-tool_call': 'tool_call',
   'content-block-tool_result': 'tool_result',
+  'content-block-server_tool_call': 'server_tool_call',
+  'content-block-server_tool_result': 'server_tool_result',
   'content-block-error': 'error',
   'content-block-meta_files': 'meta_files',
   'meta_init': 'meta_init',
 };
 
 /**
+ * Check if a tag name represents a tool result (handles dynamic types like *_tool_result).
+ */
+function isToolResultTag(tagName: string): boolean {
+  return tagName === 'content-block-tool_result' || 
+         tagName.endsWith('_tool_result') ||
+         tagName === 'tool_result' ||
+         tagName === 'server_tool_result';
+}
+
+/**
  * Escape special regex characters in a string.
  */
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Decode common HTML entities in a string.
+ */
+function decodeHtmlEntities(str: string): string {
+  return str
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/&#x27;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(parseInt(dec, 10)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
 }
 
 /**
@@ -66,17 +94,24 @@ function normalizeNodes(nodes: AgentNode[], cdataMap: Map<string, string>): Agen
     }
     
     if (node.type === 'element' && node.tagName) {
-      // Normalize tag name
-      const normalizedTag = TAG_NAME_MAP[node.tagName] || node.tagName;
+      // Normalize tag name - handle dynamic tool result types
+      let normalizedTag = TAG_NAME_MAP[node.tagName] || node.tagName;
+      
+      // Handle dynamic *_tool_result tags (e.g., bash_code_execution_tool_result)
+      if (isToolResultTag(node.tagName)) {
+        normalizedTag = 'tool_result';
+      }
       
       // Handle tool_call: parse arguments attribute if present
-      if (normalizedTag === 'tool_call' && node.attributes?.arguments) {
+      if ((normalizedTag === 'tool_call' || normalizedTag === 'server_tool_call') && node.attributes?.arguments) {
         try {
-          const parsedArgs = JSON.parse(node.attributes.arguments);
+          // Decode HTML entities before parsing JSON
+          const decodedArgs = decodeHtmlEntities(node.attributes.arguments);
+          const parsedArgs = JSON.parse(decodedArgs);
           // Replace arguments string with formatted JSON as child content
           return {
             type: 'element',
-            tagName: normalizedTag,
+            tagName: 'tool_call', // Normalize server_tool_call to tool_call for UI
             attributes: {
               id: node.attributes.id || '',
               name: node.attributes.name || '',
@@ -86,6 +121,20 @@ function normalizeNodes(nodes: AgentNode[], cdataMap: Map<string, string>): Agen
         } catch {
           // Keep as-is if parsing fails
         }
+      }
+      
+      // Handle tool_result: preserve name attribute for display
+      if (normalizedTag === 'tool_result') {
+        const resultName = node.attributes?.name || 'tool_result';
+        return {
+          type: 'element',
+          tagName: 'tool_result',
+          attributes: {
+            id: node.attributes?.id || '',
+            name: resultName,
+          },
+          children: node.children ? normalizeNodes(node.children, cdataMap) : undefined
+        };
       }
       
       return {

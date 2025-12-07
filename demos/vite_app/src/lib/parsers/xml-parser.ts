@@ -10,7 +10,8 @@ export function parseMixedContent(text: string): AgentNode[] {
   
   // Regex to match tags: <tag attr="val"> or </tag>
   // Captures: 1. full tag, 2. slash (if closing), 3. tag name, 4. attributes
-  const tagRegex = /<(\/?)([a-zA-Z][a-zA-Z0-9:-]*)([^>]*)>/g;
+  // Note: Tag names can include letters, digits, hyphens, underscores, and colons
+  const tagRegex = /<(\/?)([a-zA-Z][a-zA-Z0-9_:-]*)([^>]*)>/g;
   
   let lastIndex = 0;
   let match;
