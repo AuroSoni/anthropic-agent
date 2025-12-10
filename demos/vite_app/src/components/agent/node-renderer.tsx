@@ -3,6 +3,7 @@ import { TextBlock } from './text-block';
 import { ThinkingBlock } from './thinking-block';
 import { ToolCallBlock } from './tool-call-block';
 import { ToolResultBlock } from './tool-result-block';
+import { FilesBlock } from './files-block';
 
 interface NodeRendererProps {
   node: AgentNode;
@@ -59,9 +60,13 @@ export function NodeRenderer({ node }: NodeRendererProps) {
       return <span className="whitespace-pre-wrap">{children}</span>;
 
     case 'meta_init':
-    case 'meta_files':
-      // Skip rendering meta tags
+      // Skip rendering meta_init
       return null;
+
+    case 'meta_files':
+      // Render generated files block
+      const filesContent = node.children?.[0]?.content || '';
+      return <FilesBlock content={filesContent} />;
 
     case 'root':
       // Root node - just render children
