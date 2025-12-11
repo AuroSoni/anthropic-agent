@@ -6,7 +6,40 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card } from '@/components/ui/card';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { Send } from 'lucide-react';
+import { Send, Copy, Check } from 'lucide-react';
+import type { AgentNode } from '@/lib/parsers';
+
+/**
+ * Extract text content from AgentNode tree, only from text blocks.
+ * Excludes thinking, tool_call, tool_result, and other non-text blocks.
+ */
+function extractTextContent(nodes: AgentNode[]): string {
+  const textParts: string[] = [];
+  
+  function traverse(node: AgentNode) {
+    if (node.type === 'text' && node.content) {
+      textParts.push(node.content);
+      return;
+    }
+    
+    if (node.type === 'element' && node.tagName) {
+      if (['thinking', 'tool_call', 'tool_result', 'meta_init', 'meta_files', 'error'].includes(node.tagName)) {
+        return;
+      }
+      if (node.children) {
+        for (const child of node.children) {
+          traverse(child);
+        }
+      }
+    }
+  }
+  
+  for (const node of nodes) {
+    traverse(node);
+  }
+  
+  return textParts.join('');
+}
 
 /**
  * AgentViewer is the main container for viewing agent output.
@@ -15,6 +48,7 @@ import { Send } from 'lucide-react';
 export function AgentViewer() {
   const { state, runAgent, isStreaming } = useAgent();
   const [prompt, setPrompt] = useState('');
+  const [copied, setCopied] = useState(false);
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
@@ -22,6 +56,19 @@ export function AgentViewer() {
     
     runAgent(prompt.trim());
     setPrompt('');
+  };
+
+  const handleCopy = async () => {
+    const textContent = extractTextContent(state.nodes);
+    if (!textContent.trim()) return;
+    
+    try {
+      await navigator.clipboard.writeText(textContent);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      console.error('Failed to copy:', err);
+    }
   };
 
   return (
@@ -65,6 +112,25 @@ export function AgentViewer() {
             <div className="mt-4 border-t border-zinc-200 pt-3 text-xs text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
               Completed in {state.completion.total_steps} step(s) | 
               Tokens: {state.completion.usage.input_tokens} in / {state.completion.usage.output_tokens} out
+            </div>
+          )}
+
+          {/* Copy button - shown when complete and has content */}
+          {state.status === 'complete' && state.nodes.length > 0 && (
+            <div className="mt-3 flex justify-end">
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={handleCopy}
+                className="h-7 w-7 text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
+                title="Copy response"
+              >
+                {copied ? (
+                  <Check className="h-4 w-4 text-emerald-500" />
+                ) : (
+                  <Copy className="h-4 w-4" />
+                )}
+              </Button>
             </div>
           )}
         </Card>

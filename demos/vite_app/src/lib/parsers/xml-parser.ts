@@ -1,8 +1,50 @@
 import type { AgentNode } from './types';
 
 /**
+ * Whitelist of tag names that should be parsed as XML elements.
+ * All other HTML-like tags are treated as plain text (passed to GFM renderer).
+ * 
+ * Includes:
+ * - Agent structural tags: content-block-*, meta_init, etc.
+ * - Custom rendering tags: chart, table (for special UI rendering)
+ */
+const RECOGNIZED_TAGS = new Set([
+  // Agent structural tags
+  'content-block-text',
+  'content-block-thinking',
+  'content-block-tool_call',
+  'content-block-tool_result',
+  'content-block-server_tool_call',
+  'content-block-server_tool_result',
+  'content-block-error',
+  'content-block-meta_files',
+  'meta_init',
+  // Custom rendering tags within text blocks
+  'chart',
+  'table',
+]);
+
+/**
+ * Check if a tag name should be parsed as an XML element.
+ * Handles dynamic tool result tags (e.g., bash_code_execution_tool_result).
+ */
+function isRecognizedTag(tagName: string): boolean {
+  if (RECOGNIZED_TAGS.has(tagName)) {
+    return true;
+  }
+  // Handle dynamic *_tool_result tags
+  if (tagName.endsWith('_tool_result')) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * Parses a string containing mixed text and XML-like tags into a tree structure.
  * Tolerant of unclosed tags (streaming context).
+ * 
+ * Only recognizes whitelisted tags as XML elements. Other HTML-like tags
+ * (e.g., <details>, <kbd>, <div>) are preserved as plain text for GFM rendering.
  */
 export function parseMixedContent(text: string): AgentNode[] {
   const root: AgentNode = { type: 'element', tagName: 'root', children: [] };
@@ -19,6 +61,12 @@ export function parseMixedContent(text: string): AgentNode[] {
   while ((match = tagRegex.exec(text)) !== null) {
     const [fullTag, slash, tagName, attributesStr] = match;
     const index = match.index;
+
+    // Check if this is a recognized tag that should be parsed as XML
+    if (!isRecognizedTag(tagName)) {
+      // Unrecognized tag - skip it (will be included in text content)
+      continue;
+    }
 
     // Add preceding text as a text node
     if (index > lastIndex) {
