@@ -50,6 +50,7 @@ async def stream_agent_response(
             file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
             db_backend=SQLBackend(connection_string=os.getenv("DATABASE_URL")),
             agent_uuid=agent_uuid,
+            formatter="raw",
         )
         
         # Create queue for streaming
