@@ -50,7 +50,7 @@ async def stream_agent_response(
             file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
             db_backend=SQLBackend(connection_string=os.getenv("DATABASE_URL")),
             agent_uuid=agent_uuid,
-            formatter="raw",
+            formatter="xml",
         )
         
         # Create queue for streaming
@@ -70,7 +70,7 @@ async def stream_agent_response(
                 chunk = await queue.get()
                 if chunk is None:
                     break
-                yield f"data: {chunk}\n\n"
+                yield f"data: {chunk.replace(chr(10), '\\n')}\n\n"
                 queue.task_done()
         except asyncio.CancelledError:
             agent_task.cancel()
