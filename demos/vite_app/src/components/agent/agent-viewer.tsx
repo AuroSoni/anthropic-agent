@@ -95,7 +95,7 @@ export function AgentViewer() {
           )}
 
           {state.nodes.length > 0 && (
-            <div className="prose prose-zinc dark:prose-invert max-w-none">
+            <div>
               <NodeListRenderer nodes={state.nodes} />
             </div>
           )}

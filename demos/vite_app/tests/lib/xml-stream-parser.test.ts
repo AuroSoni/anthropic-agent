@@ -196,10 +196,11 @@ describe('XmlStreamParser', () => {
 
     it('handles multiple CDATA sections', () => {
       parser.appendChunk(
-        '<root><![CDATA[first]]> and <![CDATA[second]]></root>'
+        '<content-block-tool_result id="r1" name="test"><![CDATA[first]]> and <![CDATA[second]]></content-block-tool_result>'
       );
       const nodes = parser.getNodes();
       expect(nodes.length).toBe(1);
+      expect(nodes[0].tagName).toBe('tool_result');
       // Content should have both CDATA sections restored
       const childContent = nodes[0].children?.map(c => c.content).join('') || '';
       expect(childContent).toContain('first');
@@ -287,13 +288,14 @@ describe('XmlStreamParser', () => {
       expect(nodes[0].tagName).toBe('meta_init');
     });
 
-    it('handles nested elements', () => {
+    it('treats unrecognized tags as plain text', () => {
+      // Unrecognized tags like <outer>, <inner> are not parsed as XML elements
+      // They are preserved as plain text (for GFM/markdown rendering)
       parser.appendChunk('<outer><inner>nested content</inner></outer>');
       const nodes = parser.getNodes();
       expect(nodes.length).toBe(1);
-      expect(nodes[0].tagName).toBe('outer');
-      expect(nodes[0].children?.[0].tagName).toBe('inner');
-      expect(nodes[0].children?.[0].children?.[0].content).toBe('nested content');
+      expect(nodes[0].type).toBe('text');
+      expect(nodes[0].content).toBe('<outer><inner>nested content</inner></outer>');
     });
 
     it('handles unclosed tags gracefully', () => {

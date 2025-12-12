@@ -198,22 +198,22 @@ describe('AnthropicStreamParser', () => {
   });
 
   describe('text with embedded XML', () => {
-    it('parses text containing artifact tags', () => {
+    it('parses text containing recognized tags like chart', () => {
       parser.processEvent(createMessageStart());
       parser.processEvent(createBlockStart(0, 'text', { text: '' }));
       parser.processEvent(
-        createBlockDelta(0, 'text_delta', 'Here is code: <artifact type="code">console.log("hi")</artifact>')
+        createBlockDelta(0, 'text_delta', 'Here is a chart: <chart type="bar">data here</chart>')
       );
       parser.processEvent(createBlockStop(0));
 
       const nodes = parser.getNodes();
-      // parseMixedContent should extract the artifact as an element
+      // parseMixedContent should extract the chart as an element (chart is whitelisted)
       expect(nodes.length).toBe(2);
       expect(nodes[0].type).toBe('text');
-      expect(nodes[0].content).toBe('Here is code: ');
+      expect(nodes[0].content).toBe('Here is a chart: ');
       expect(nodes[1].type).toBe('element');
-      expect(nodes[1].tagName).toBe('artifact');
-      expect(nodes[1].attributes?.type).toBe('code');
+      expect(nodes[1].tagName).toBe('chart');
+      expect(nodes[1].attributes?.type).toBe('bar');
     });
 
     it('handles unclosed tags in streaming context', () => {
@@ -227,7 +227,7 @@ describe('AnthropicStreamParser', () => {
       expect(nodes.length).toBeGreaterThan(0);
     });
 
-    it('handles nested XML tags', () => {
+    it('treats unrecognized XML tags as plain text', () => {
       parser.processEvent(createMessageStart());
       parser.processEvent(createBlockStart(0, 'text', { text: '' }));
       parser.processEvent(
@@ -235,11 +235,11 @@ describe('AnthropicStreamParser', () => {
       );
       parser.processEvent(createBlockStop(0));
 
+      // Unrecognized tags are preserved as plain text (for GFM/markdown rendering)
       const nodes = parser.getNodes();
       expect(nodes.length).toBe(1);
-      expect(nodes[0].tagName).toBe('outer');
-      expect(nodes[0].children?.[0].tagName).toBe('inner');
-      expect(nodes[0].children?.[0].children?.[0].content).toBe('nested');
+      expect(nodes[0].type).toBe('text');
+      expect(nodes[0].content).toBe('<outer><inner>nested</inner></outer>');
     });
   });
 

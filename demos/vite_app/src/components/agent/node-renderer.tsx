@@ -56,8 +56,8 @@ export function NodeRenderer({ node }: NodeRendererProps) {
       );
 
     case 'text':
-      // Text element wrapper (from raw format)
-      return <span className="whitespace-pre-wrap">{children}</span>;
+      // Text element wrapper - use div to properly contain block-level markdown elements
+      return <div>{children}</div>;
 
     case 'meta_init':
       // Skip rendering meta_init
