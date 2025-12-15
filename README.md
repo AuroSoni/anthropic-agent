@@ -1,6 +1,6 @@
 # anthropic-agent
 
-A small Python library for building **Claude-powered agents** with:
+A small Python library for building **Anthropic-powered agents** with:
 - **streaming** responses
 - **tool calling** (client tools)
 - **optional server tools** (passed through to Anthropic)
