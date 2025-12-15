@@ -1,10 +1,14 @@
 """Agent endpoint for streaming responses via SSE."""
 import asyncio
 import logging
+import mimetypes
 import os
 from typing import Optional, AsyncGenerator
+from urllib.parse import urlparse
 
-from fastapi import APIRouter
+import anthropic
+import httpx
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -22,6 +26,21 @@ class AgentRunRequest(BaseModel):
     """Request to run an agent with a user prompt."""
     agent_uuid: Optional[str] = None
     user_prompt: str | list[dict] | dict
+
+
+class FileMetadata(BaseModel):
+    """Metadata for an uploaded file from Anthropic Files API."""
+    id: str
+    filename: str
+    mime_type: str
+    size_bytes: int
+    created_at: str
+    downloadable: bool
+
+
+class UploadResponse(BaseModel):
+    """Response containing metadata for all uploaded files."""
+    files: list[FileMetadata]
 
 
 async def stream_agent_response(
@@ -121,3 +140,116 @@ async def run_agent(request: AgentRunRequest) -> StreamingResponse:
             "X-Accel-Buffering": "no",  # Disable buffering in nginx
         },
     )
+
+
+@router.post("/upload")
+async def upload_files(
+    files: list[UploadFile] = File(default=[]),
+    urls: list[str] = Form(default=[]),
+) -> UploadResponse:
+    """Upload files to Anthropic Files API.
+    
+    Accepts files via form data (direct uploads or URLs). For URLs, the server
+    downloads the file first and then uploads to Anthropic.
+    
+    Args:
+        files: List of files to upload directly
+        urls: List of URLs to download and upload
+        
+    Returns:
+        UploadResponse containing metadata for all uploaded files
+        
+    Example:
+        ```
+        POST /agent/upload
+        Content-Type: multipart/form-data
+        
+        files: <file1>, <file2>
+        urls: https://example.com/image.png
+        ```
+    """
+    if not files and not urls:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one file or URL must be provided",
+        )
+    
+    client = anthropic.Anthropic()
+    uploaded_files: list[FileMetadata] = []
+    
+    # Upload direct files
+    for upload_file in files:
+        if upload_file.filename:
+            try:
+                content = await upload_file.read()
+                mime_type = upload_file.content_type or "application/octet-stream"
+                
+                result = client.beta.files.upload(
+                    file=(upload_file.filename, content, mime_type),
+                )
+                
+                uploaded_files.append(FileMetadata(
+                    id=result.id,
+                    filename=result.filename,
+                    mime_type=result.mime_type,
+                    size_bytes=result.size_bytes,
+                    created_at=result.created_at.isoformat(),
+                    downloadable=result.downloadable,
+                ))
+            except Exception as e:
+                logger.error(f"Failed to upload file {upload_file.filename}: {e}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to upload file {upload_file.filename}: {str(e)}",
+                )
+    
+    # Download and upload from URLs
+    async with httpx.AsyncClient() as http_client:
+        for url in urls:
+            try:
+                # Download file from URL
+                response = await http_client.get(url, follow_redirects=True)
+                response.raise_for_status()
+                
+                # Extract filename from URL or Content-Disposition header
+                content_disposition = response.headers.get("content-disposition")
+                if content_disposition and "filename=" in content_disposition:
+                    filename = content_disposition.split("filename=")[-1].strip('"\'')
+                else:
+                    parsed_url = urlparse(url)
+                    filename = os.path.basename(parsed_url.path) or "downloaded_file"
+                
+                # Determine MIME type
+                content_type = response.headers.get("content-type", "").split(";")[0]
+                if not content_type:
+                    content_type, _ = mimetypes.guess_type(filename)
+                    content_type = content_type or "application/octet-stream"
+                
+                content = response.content
+                
+                result = client.beta.files.upload(
+                    file=(filename, content, content_type),
+                )
+                
+                uploaded_files.append(FileMetadata(
+                    id=result.id,
+                    filename=result.filename,
+                    mime_type=result.mime_type,
+                    size_bytes=result.size_bytes,
+                    created_at=result.created_at.isoformat(),
+                    downloadable=result.downloadable,
+                ))
+            except httpx.HTTPError as e:
+                logger.error(f"Failed to download from URL {url}: {e}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Failed to download from URL {url}: {str(e)}",
+                )
+            except Exception as e:
+                logger.error(f"Failed to upload file from URL {url}: {e}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to upload file from URL {url}: {str(e)}",
+                )
+    
+    return UploadResponse(files=uploaded_files)

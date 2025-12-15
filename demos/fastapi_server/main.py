@@ -1,10 +1,24 @@
 """FastAPI server with health check and database integration."""
 
+import logging
+import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+logger = logging.getLogger(__name__)
+
+# Try importing anthropic_agent from the workspace (installed via uv).
+# If not installed, fall back to the local package by adding repo root to path.
+try:
+    import anthropic_agent  # noqa: F401
+except ImportError:
+    logger.info("Anthropic agent not found in workspace, falling back to local package.")
+    repo_root = Path(__file__).parent.parent.parent
+    sys.path.insert(0, str(repo_root))
 
 from agent_router import router as agent_router
 from db import db
