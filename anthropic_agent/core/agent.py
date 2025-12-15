@@ -52,7 +52,7 @@ class AnthropicAgent:
         formatter: FormatterType | None = None,
         compactor: CompactorType | Compactor | None = None,
         memory_store: MemoryStoreType | MemoryStore | None = None,
-        final_answer_check: Optional[Callable[[dict], tuple[bool, str]]] = None,
+        final_answer_check: Optional[Callable[[str], tuple[bool, str]]] = None,
         agent_uuid: str | None = None,
         db_backend: DBBackendType | DatabaseBackend = "filesystem",
         file_backend: FileBackendType | FileStorageBackend | None = None,
@@ -81,8 +81,8 @@ class AnthropicAgent:
             memory_store: Either a memory store name ("placeholder", "none") or a pre-configured
                 MemoryStore instance. Memory stores retrieve relevant context for injection and
                 integrate with the compaction lifecycle to preserve important information.
-            final_answer_check: Optional callable that validates the final assistant message format.
-                Signature: check(assistant_message: dict) -> (success: bool, error_message: str)
+            final_answer_check: Optional callable that validates the extracted final answer text.
+                Signature: check(final_answer: str) -> (success: bool, error_message: str)
                 If validation fails, the error message is injected as a user message and the agent
                 continues until validation passes or max_steps is reached.
             agent_uuid: Optional agent session UUID for resuming previous sessions. If provided,
@@ -554,7 +554,8 @@ class AnthropicAgent:
             if accumulated_message.stop_reason != "tool_use":
                 # Validate final answer format if checker is configured
                 if self.final_answer_check:
-                    success, error_message = self.final_answer_check(assistant_message)
+                    extracted_final_answer = self._extract_final_answer(accumulated_message)
+                    success, error_message = self.final_answer_check(extracted_final_answer)
                     if not success:
                         # Log validation failure
                         self.agent_logs.append({
