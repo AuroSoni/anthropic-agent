@@ -6,6 +6,8 @@ A small Python library for building **Anthropic-powered agents** with:
 - **optional server tools** (passed through to Anthropic)
 - **persistence** (filesystem or Postgres) and **file storage** (local or S3)
 
+> **For sample agent configurations examples hanve a look at agent_test.ipynb**
+
 The primary package is `anthropic_agent` (install name: `anthropic-agent`).
 
 ## AnthropicAgent features
