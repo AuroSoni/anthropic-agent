@@ -7,7 +7,9 @@ requires-python = ">=3.12"
 dependencies = [
     "anthropic-agent",
     "fastapi>=0.122.0",
+    "httpx>=0.28.1",
     "python-dotenv>=1.0.0",
+    "python-multipart>=0.0.20",
     "uvicorn>=0.38.0",
 ]
 

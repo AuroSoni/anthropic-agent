@@ -1,0 +1,551 @@
+[
+    {
+        "message": {
+            "id": "msg_019MsYyzbycDUrGQpbtaFaqA",
+            "container": null,
+            "content": [],
+            "context_management": null,
+            "model": "claude-sonnet-4-5-20250929",
+            "role": "assistant",
+            "stop_reason": null,
+            "stop_sequence": null,
+            "type": "message",
+            "usage": {
+                "cache_creation": {
+                    "ephemeral_1h_input_tokens": 0,
+                    "ephemeral_5m_input_tokens": 0
+                },
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "input_tokens": 984,
+                "output_tokens": 2,
+                "server_tool_use": null,
+                "service_tier": "standard"
+            }
+        },
+        "type": "message_start"
+    },
+    {
+        "content_block": {
+            "citations": null,
+            "text": "",
+            "type": "text"
+        },
+        "index": 0,
+        "type": "content_block_start"
+    },
+    {
+        "delta": {
+            "text": "I nee",
+            "type": "text_delta"
+        },
+        "index": 0,
+        "type": "content_block_delta"
+    },
+    {
+        "delta": {
+            "text": "d to calculate 5 + (10",
+            "type": "text_delta"
+        },
+        "index": 0,
+        "type": "content_block_delta"
+    },
+    {
+        "delta": {
+            "text": " * 2) following",
+            "type": "text_delta"
+        },
+        "index": 0,
+        "type": "content_block_delta"
+    },
+    {
+        "delta": {
+            "text": " the order of operations (multiplication first,",
+            "type": "text_delta"
+        },
+        "index": 0,
+        "type": "content_block_delta"
+    },
+    {
+        "delta": {
+            "text": " then addition).\n\nLet",
+            "type": "text_delta"
+        },
+        "index": 0,
+        "type": "content_block_delta"
+    },
+    {
+        "delta": {
+            "text": " me break",
+            "type": "text_delta"
+        },
+        "index": 0,
+        "type": "content_block_delta"
+    },
+    {
+        "delta": {
+            "text": " this down:\n1",
+            "type": "text_delta"
+        },
+        "index": 0,
+        "type": "content_block_delta"
+    },
+    {
+        "delta": {
+            "text": ". First, calculate",
+            "type": "text_delta"
+        },
+        "index": 0,
+        "type": "content_block_delta"
+    },
+    {
+        "delta": {
+            "text": " 10 * 2",
+            "type": "text_delta"
+        },
+        "index": 0,
+        "type": "content_block_delta"
+    },
+    {
+        "delta": {
+            "text": "\n2. Then ad",
+            "type": "text_delta"
+        },
+        "index": 0,
+        "type": "content_block_delta"
+    },
+    {
+        "delta": {
+            "text": "d 5 to that result",
+            "type": "text_delta"
+        },
+        "index": 0,
+        "type": "content_block_delta"
+    },
+    {
+        "index": 0,
+        "type": "content_block_stop",
+        "content_block": {
+            "citations": null,
+            "text": "I need to calculate 5 + (10 * 2) following the order of operations (multiplication first, then addition).\n\nLet me break this down:\n1. First, calculate 10 * 2\n2. Then add 5 to that result",
+            "type": "text"
+        }
+    },
+    {
+        "content_block": {
+            "id": "toolu_01PAbMt8F1JtkABwsuyCLWQV",
+            "input": {},
+            "name": "multiply",
+            "type": "tool_use"
+        },
+        "index": 1,
+        "type": "content_block_start"
+    },
+    {
+        "delta": {
+            "partial_json": "",
+            "type": "input_json_delta"
+        },
+        "index": 1,
+        "type": "content_block_delta"
+    },
+    {
+        "delta": {
+            "partial_json": "{\"a\": 10",
+            "type": "input_json_delta"
+        },
+        "index": 1,
+        "type": "content_block_delta"
+    },
+    {
+        "delta": {
+            "partial_json": ", \"b",
+            "type": "input_json_delta"
+        },
+        "index": 1,
+        "type": "content_block_delta"
+    },
+    {
+        "delta": {
+            "partial_json": "\": 2}",
+            "type": "input_json_delta"
+        },
+        "index": 1,
+        "type": "content_block_delta"
+    },
+    {
+        "index": 1,
+        "type": "content_block_stop",
+        "content_block": {
+            "id": "toolu_01PAbMt8F1JtkABwsuyCLWQV",
+            "input": {
+                "a": 10,
+                "b": 2
+            },
+            "name": "multiply",
+            "type": "tool_use"
+        }
+    },
+    {
+        "context_management": null,
+        "delta": {
+            "container": null,
+            "stop_reason": "tool_use",
+            "stop_sequence": null
+        },
+        "type": "message_delta",
+        "usage": {
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "input_tokens": 984,
+            "output_tokens": 126,
+            "server_tool_use": null
+        }
+    },
+    {
+        "type": "message_stop",
+        "message": {
+            "id": "msg_019MsYyzbycDUrGQpbtaFaqA",
+            "container": null,
+            "content": [
+                {
+                    "citations": null,
+                    "text": "I need to calculate 5 + (10 * 2) following the order of operations (multiplication first, then addition).\n\nLet me break this down:\n1. First, calculate 10 * 2\n2. Then add 5 to that result",
+                    "type": "text"
+                },
+                {
+                    "id": "toolu_01PAbMt8F1JtkABwsuyCLWQV",
+                    "input": {
+                        "a": 10,
+                        "b": 2
+                    },
+                    "name": "multiply",
+                    "type": "tool_use"
+                }
+            ],
+            "context_management": null,
+            "model": "claude-sonnet-4-5-20250929",
+            "role": "assistant",
+            "stop_reason": "tool_use",
+            "stop_sequence": null,
+            "type": "message",
+            "usage": {
+                "cache_creation": {
+                    "ephemeral_1h_input_tokens": 0,
+                    "ephemeral_5m_input_tokens": 0
+                },
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "input_tokens": 984,
+                "output_tokens": 126,
+                "server_tool_use": null,
+                "service_tier": "standard"
+            }
+        }
+    },
+    {
+        "message": {
+            "id": "msg_01UPsy1QCMB4cMCV9SjtfJky",
+            "container": null,
+            "content": [],
+            "context_management": null,
+            "model": "claude-sonnet-4-5-20250929",
+            "role": "assistant",
+            "stop_reason": null,
+            "stop_sequence": null,
+            "type": "message",
+            "usage": {
+                "cache_creation": {
+                    "ephemeral_1h_input_tokens": 0,
+                    "ephemeral_5m_input_tokens": 0
+                },
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "input_tokens": 1123,
+                "output_tokens": 25,
+                "server_tool_use": null,
+                "service_tier": "standard"
+            }
+        },
+        "type": "message_start"
+    },
+    {
+        "content_block": {
+            "id": "toolu_01MtzZKcDqSqrZmoEYyWrPZg",
+            "input": {},
+            "name": "add",
+            "type": "tool_use"
+        },
+        "index": 0,
+        "type": "content_block_start"
+    },
+    {
+        "delta": {
+            "partial_json": "",
+            "type": "input_json_delta"
+        },
+        "index": 0,
+        "type": "content_block_delta"
+    },
+    {
+        "delta": {
+            "partial_json": "{\"a\": 5",
+            "type": "input_json_delta"
+        },
+        "index": 0,
+        "type": "content_block_delta"
+    },
+    {
+        "delta": {
+            "partial_json": ", \"b\": ",
+            "type": "input_json_delta"
+        },
+        "index": 0,
+        "type": "content_block_delta"
+    },
+    {
+        "delta": {
+            "partial_json": "20}",
+            "type": "input_json_delta"
+        },
+        "index": 0,
+        "type": "content_block_delta"
+    },
+    {
+        "index": 0,
+        "type": "content_block_stop",
+        "content_block": {
+            "id": "toolu_01MtzZKcDqSqrZmoEYyWrPZg",
+            "input": {
+                "a": 5,
+                "b": 20
+            },
+            "name": "add",
+            "type": "tool_use"
+        }
+    },
+    {
+        "context_management": null,
+        "delta": {
+            "container": null,
+            "stop_reason": "tool_use",
+            "stop_sequence": null
+        },
+        "type": "message_delta",
+        "usage": {
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "input_tokens": 1123,
+            "output_tokens": 68,
+            "server_tool_use": null
+        }
+    },
+    {
+        "type": "message_stop",
+        "message": {
+            "id": "msg_01UPsy1QCMB4cMCV9SjtfJky",
+            "container": null,
+            "content": [
+                {
+                    "id": "toolu_01MtzZKcDqSqrZmoEYyWrPZg",
+                    "input": {
+                        "a": 5,
+                        "b": 20
+                    },
+                    "name": "add",
+                    "type": "tool_use"
+                }
+            ],
+            "context_management": null,
+            "model": "claude-sonnet-4-5-20250929",
+            "role": "assistant",
+            "stop_reason": "tool_use",
+            "stop_sequence": null,
+            "type": "message",
+            "usage": {
+                "cache_creation": {
+                    "ephemeral_1h_input_tokens": 0,
+                    "ephemeral_5m_input_tokens": 0
+                },
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "input_tokens": 1123,
+                "output_tokens": 68,
+                "server_tool_use": null,
+                "service_tier": "standard"
+            }
+        }
+    },
+    {
+        "message": {
+            "id": "msg_01M7xkNZ6v9NBoUaFBG8cXK7",
+            "container": null,
+            "content": [],
+            "context_management": null,
+            "model": "claude-sonnet-4-5-20250929",
+            "role": "assistant",
+            "stop_reason": null,
+            "stop_sequence": null,
+            "type": "message",
+            "usage": {
+                "cache_creation": {
+                    "ephemeral_1h_input_tokens": 0,
+                    "ephemeral_5m_input_tokens": 0
+                },
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "input_tokens": 1204,
+                "output_tokens": 1,
+                "server_tool_use": null,
+                "service_tier": "standard"
+            }
+        },
+        "type": "message_start"
+    },
+    {
+        "content_block": {
+            "citations": null,
+            "text": "",
+            "type": "text"
+        },
+        "index": 0,
+        "type": "content_block_start"
+    },
+    {
+        "delta": {
+            "text": "The",
+            "type": "text_delta"
+        },
+        "index": 0,
+        "type": "content_block_delta"
+    },
+    {
+        "delta": {
+            "text": " answer",
+            "type": "text_delta"
+        },
+        "index": 0,
+        "type": "content_block_delta"
+    },
+    {
+        "delta": {
+            "text": " is **",
+            "type": "text_delta"
+        },
+        "index": 0,
+        "type": "content_block_delta"
+    },
+    {
+        "delta": {
+            "text": "25**.",
+            "type": "text_delta"
+        },
+        "index": 0,
+        "type": "content_block_delta"
+    },
+    {
+        "delta": {
+            "text": "\n\nTo break",
+            "type": "text_delta"
+        },
+        "index": 0,
+        "type": "content_block_delta"
+    },
+    {
+        "delta": {
+            "text": " it",
+            "type": "text_delta"
+        },
+        "index": 0,
+        "type": "content_block_delta"
+    },
+    {
+        "delta": {
+            "text": " down:\n- 10 *",
+            "type": "text_delta"
+        },
+        "index": 0,
+        "type": "content_block_delta"
+    },
+    {
+        "delta": {
+            "text": " 2 = 20\n-",
+            "type": "text_delta"
+        },
+        "index": 0,
+        "type": "content_block_delta"
+    },
+    {
+        "delta": {
+            "text": " 5 + 20 =",
+            "type": "text_delta"
+        },
+        "index": 0,
+        "type": "content_block_delta"
+    },
+    {
+        "delta": {
+            "text": " 25",
+            "type": "text_delta"
+        },
+        "index": 0,
+        "type": "content_block_delta"
+    },
+    {
+        "index": 0,
+        "type": "content_block_stop",
+        "content_block": {
+            "citations": null,
+            "text": "The answer is **25**.\n\nTo break it down:\n- 10 * 2 = 20\n- 5 + 20 = 25",
+            "type": "text"
+        }
+    },
+    {
+        "context_management": null,
+        "delta": {
+            "container": null,
+            "stop_reason": "end_turn",
+            "stop_sequence": null
+        },
+        "type": "message_delta",
+        "usage": {
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "input_tokens": 1204,
+            "output_tokens": 39,
+            "server_tool_use": null
+        }
+    },
+    {
+        "type": "message_stop",
+        "message": {
+            "id": "msg_01M7xkNZ6v9NBoUaFBG8cXK7",
+            "container": null,
+            "content": [
+                {
+                    "citations": null,
+                    "text": "The answer is **25**.\n\nTo break it down:\n- 10 * 2 = 20\n- 5 + 20 = 25",
+                    "type": "text"
+                }
+            ],
+            "context_management": null,
+            "model": "claude-sonnet-4-5-20250929",
+            "role": "assistant",
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "type": "message",
+            "usage": {
+                "cache_creation": {
+                    "ephemeral_1h_input_tokens": 0,
+                    "ephemeral_5m_input_tokens": 0
+                },
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "input_tokens": 1204,
+                "output_tokens": 39,
+                "server_tool_use": null,
+                "service_tier": "standard"
+            }
+        }
+    }
+]

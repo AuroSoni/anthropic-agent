@@ -27,11 +27,13 @@ class AgentResult:
     total_steps: int = 1
     agent_logs: Optional[list[dict]] = None
     generated_files: Optional[list[dict]] = None
+    final_answer: str = ""
 
     def __str__(self) -> str:
         """Return a JSON-formatted representation with all fields."""
         payload = {
             "final_message": self.final_message,
+            "final_answer": self.final_answer,
             "conversation_history": self.conversation_history,
             "stop_reason": self.stop_reason,
             "model": self.model,

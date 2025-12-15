@@ -1,11 +1,26 @@
 import asyncio
 from typing import Any, Literal, Callable, Awaitable
 import json
+import html
 from anthropic.lib.streaming._beta_messages import BetaAsyncMessageStream
 from anthropic.types.beta import BetaMessage
 
 # Type alias for formatter names
 FormatterType = Literal["xml", "raw"]
+
+
+def escape_xml_attr(value: str) -> str:
+    """Escape a string for safe use as an XML attribute value.
+    
+    Uses html.escape to convert special characters to XML entities.
+    
+    Args:
+        value: The string to escape
+        
+    Returns:
+        The escaped string safe for use in XML attributes
+    """
+    return html.escape(str(value), quote=True)
 
 
 async def stream_to_aqueue(chunk: Any, queue: asyncio.Queue) -> None:
@@ -25,12 +40,11 @@ async def xml_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) ->
     """Format Anthropic streaming response with custom XML tags.
     
     This formatter wraps different content types in custom XML tags:
-    - Thinking content wrapped in <content-block:thinking>...</content-block:thinking> tags
-    - Text content wrapped in <content-block:text>...</content-block:text> tags
-    - Tool calls formatted as <content-block:tool_call>...</content-block:tool_call> with complete JSON
-    - Server tool calls formatted as <content-block:server_tool_call>...</content-block:server_tool_call>
-    - Server tool results formatted as <content-block:server_tool_result>...</content-block:server_tool_result>
-    - File IDs (from code execution) wrapped in <content-block:meta_files>...</content-block:meta_files> at end
+    - Thinking: <content-block-thinking>...</content-block-thinking>
+    - Text: <content-block-text>...</content-block-text>
+    - Tool calls: <content-block-tool_call id="..." name="..." arguments="..."></content-block-tool_call>
+    - Tool results: <content-block-tool_result id="..." name="..."><![CDATA[...]]></content-block-tool_result>
+    - Errors: <content-block-error><![CDATA[...]]></content-block-error>
     
     Supported event types (per Anthropic spec):
     - message_start, message_delta, message_stop (handled gracefully)
@@ -41,16 +55,15 @@ async def xml_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) ->
     Supported delta types:
     - text_delta (streamed as received)
     - thinking_delta (streamed as received)
-    - signature_delta (captured but not streamed separately)
+    - signature_delta (captured but not streamed)
     - input_json_delta (buffered until complete)
     
     Supported content block types:
     - text
     - thinking
     - tool_use (client tools)
-    - server_tool_use (server-side tools like web_search)
-    - web_search_tool_result
-    - bash_code_execution_tool_result (file IDs extracted)
+    - server_tool_use (server-side tools)
+    - *_tool_result (any server tool result type)
     
     Args:
         stream: Anthropic streaming context manager
@@ -61,11 +74,9 @@ async def xml_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) ->
         
     Note:
         - Content blocks are tracked by index to properly open/close tags
-        - Tool calls are buffered and only streamed when complete
-        - We process raw delta events, not simplified helper events (text, thinking, etc.)
-          to avoid duplication
-        - If the agent creates files during code execution, their file IDs are extracted
-          and streamed as a final meta tag with JSON format: {"file_ids": ["id1", "id2", ...]}
+        - Tool calls are buffered and streamed as attribute-based XML when complete
+        - Tool results use CDATA sections for safe content wrapping
+        - We process raw delta events, not simplified helper events to avoid duplication
     """
     # Track content blocks by index
     content_blocks = {}  # index -> {"type": str, "is_open": bool, "tool_data": dict, "signature": str}
@@ -93,10 +104,11 @@ async def xml_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) ->
             continue
         
         elif event_type == "error":
-            # Error event - propagate to user
+            # Error event - propagate to user with CDATA wrapping
             error_data = getattr(event, 'error', event)
+            error_content = json.dumps(error_data, default=str)
             await stream_to_aqueue(
-                f'\n<content-block:error>{json.dumps(error_data, default=str)}</content-block:error>\n',
+                f'<content-block-error><![CDATA[{error_content}]]></content-block-error>',
                 queue
             )
             continue
@@ -114,37 +126,36 @@ async def xml_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) ->
             
             # Open appropriate tag based on content type
             if block_type == "thinking":
-                await stream_to_aqueue("<content-block:thinking>", queue)
+                await stream_to_aqueue("<content-block-thinking>", queue)
                 content_blocks[idx]["is_open"] = True
             
             elif block_type == "text":
-                await stream_to_aqueue("<content-block:text>", queue)
+                await stream_to_aqueue("<content-block-text>", queue)
                 content_blocks[idx]["is_open"] = True
             
             elif block_type == "tool_use":
                 # Start buffering client tool call data
                 content_blocks[idx]["tool_data"] = {
-                    "type": "tool_use",
                     "id": getattr(event.content_block, "id", ""),
                     "name": getattr(event.content_block, "name", ""),
                     "input": {}
                 }
             
             elif block_type == "server_tool_use":
-                # Start buffering server tool call data (e.g., web_search)
+                # Start buffering server tool call data (e.g., web_search, code_execution)
                 content_blocks[idx]["tool_data"] = {
-                    "type": "server_tool_use",
                     "id": getattr(event.content_block, "id", ""),
                     "name": getattr(event.content_block, "name", ""),
                     "input": {}
                 }
             
-            elif block_type == "web_search_tool_result":
-                # Server tool result - buffer the content
+            elif block_type.endswith("_tool_result"):
+                # Handle all server tool result types (*_tool_result)
+                # e.g., web_search_tool_result, bash_code_execution_tool_result, 
+                # text_editor_code_execution_tool_result, etc.
                 content_blocks[idx]["tool_data"] = {
-                    "type": "web_search_tool_result",
                     "tool_use_id": getattr(event.content_block, "tool_use_id", ""),
-                    "content": getattr(event.content_block, "content", [])
+                    "content": getattr(event.content_block, "content", None)
                 }
         
         # Content block deltas
@@ -199,13 +210,10 @@ async def xml_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) ->
             
             # Close text/thinking blocks
             if block_info["is_open"]:
-                if block_type in ("thinking", "text"):
-                    await stream_to_aqueue("\n", queue)
-                
                 if block_type == "thinking":
-                    await stream_to_aqueue("</content-block:thinking>", queue)
+                    await stream_to_aqueue("</content-block-thinking>", queue)
                 elif block_type == "text":
-                    await stream_to_aqueue("</content-block:text>", queue)
+                    await stream_to_aqueue("</content-block-text>", queue)
                 block_info["is_open"] = False
             
             # Stream complete tool call (client tools)
@@ -216,21 +224,22 @@ async def xml_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) ->
                     if "input_json" in tool_data:
                         tool_data["input"] = json.loads(tool_data["input_json"])
                         del tool_data["input_json"]
-                except json.JSONDecodeError as e:
+                except json.JSONDecodeError:
                     # If parsing fails, keep as string
                     if "input_json" in tool_data:
                         tool_data["input"] = tool_data["input_json"]
                         del tool_data["input_json"]
-                        tool_data["parse_error"] = str(e)
                 
-                # Format and stream
-                tool_json = json.dumps(tool_data, indent=2)
+                # Format as attribute-based XML
+                tool_id = escape_xml_attr(tool_data["id"])
+                tool_name = escape_xml_attr(tool_data["name"])
+                arguments = escape_xml_attr(json.dumps(tool_data["input"]))
                 await stream_to_aqueue(
-                    f'<content-block:tool_call>\n{tool_json}\n</content-block:tool_call>',
+                    f'<content-block-tool_call id="{tool_id}" name="{tool_name}" arguments="{arguments}"></content-block-tool_call>',
                     queue
                 )
             
-            # Stream complete server tool call (e.g., web_search)
+            # Stream complete server tool call (e.g., web_search, code_execution)
             elif block_type == "server_tool_use" and block_info["tool_data"]:
                 tool_data = block_info["tool_data"]
                 try:
@@ -238,24 +247,37 @@ async def xml_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) ->
                     if "input_json" in tool_data:
                         tool_data["input"] = json.loads(tool_data["input_json"])
                         del tool_data["input_json"]
-                except json.JSONDecodeError as e:
+                except json.JSONDecodeError:
                     if "input_json" in tool_data:
                         tool_data["input"] = tool_data["input_json"]
                         del tool_data["input_json"]
-                        tool_data["parse_error"] = str(e)
                 
-                # Format and stream as server tool
-                tool_json = json.dumps(tool_data, indent=2)
+                # Format as attribute-based XML (same tag as client tools)
+                tool_id = escape_xml_attr(tool_data["id"])
+                tool_name = escape_xml_attr(tool_data["name"])
+                arguments = escape_xml_attr(json.dumps(tool_data["input"]))
                 await stream_to_aqueue(
-                    f'<content-block:server_tool_call>\n{tool_json}\n</content-block:server_tool_call>',
+                    f'<content-block-tool_call id="{tool_id}" name="{tool_name}" arguments="{arguments}"></content-block-tool_call>',
                     queue
                 )
             
-            # Stream server tool result
-            elif block_type == "web_search_tool_result" and block_info["tool_data"]:
-                result_json = json.dumps(block_info["tool_data"], indent=2, default=str)
+            # Stream server tool result (handles all *_tool_result types)
+            elif block_type.endswith("_tool_result") and block_info["tool_data"]:
+                tool_data = block_info["tool_data"]
+                tool_use_id = escape_xml_attr(tool_data["tool_use_id"])
+                result_name = escape_xml_attr(block_type)  # Use block type as name
+                
+                # Serialize content to string for CDATA
+                content = tool_data.get("content")
+                if content is None:
+                    content_str = ""
+                elif isinstance(content, str):
+                    content_str = content
+                else:
+                    content_str = json.dumps(content, default=str)
+                
                 await stream_to_aqueue(
-                    f'<content-block:server_tool_result>\n{result_json}\n</content-block:server_tool_result>',
+                    f'<content-block-tool_result id="{tool_use_id}" name="{result_name}"><![CDATA[{content_str}]]></content-block-tool_result>',
                     queue
                 )
         
@@ -267,44 +289,14 @@ async def xml_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) ->
     # Safety: close any open blocks at the end
     for idx, block_info in content_blocks.items():
         if block_info.get("is_open"):
-            # Add newline before closing tag
-            await stream_to_aqueue("\n", queue)
-            
             if block_info["type"] == "thinking":
-                await stream_to_aqueue("</content-block:thinking>", queue)
+                await stream_to_aqueue("</content-block-thinking>", queue)
             elif block_info["type"] == "text":
-                await stream_to_aqueue("</content-block:text>", queue)
+                await stream_to_aqueue("</content-block-text>", queue)
             block_info["is_open"] = False
     
     # Get and return the final accumulated message (async method)
-    final_message = await stream.get_final_message()
-    
-    # Extract file IDs from bash_code_execution_tool_result blocks
-    file_ids = []
-    for item in final_message.content:
-        # Check if this is a bash code execution tool result
-        if hasattr(item, 'type') and item.type == 'bash_code_execution_tool_result':
-            # Access the content attribute
-            if hasattr(item, 'content'):
-                content_item = item.content
-                # Check if it's a bash_code_execution_result
-                if hasattr(content_item, 'type') and content_item.type == 'bash_code_execution_result':
-                    # Access the content array
-                    if hasattr(content_item, 'content') and isinstance(content_item.content, list):
-                        for file_obj in content_item.content:
-                            # Extract file_id if present
-                            if hasattr(file_obj, 'file_id'):
-                                file_ids.append(file_obj.file_id)
-    
-    # Stream file IDs meta tag if any files were created
-    if file_ids:
-        file_meta = json.dumps({"file_ids": file_ids}, indent=2)
-        await stream_to_aqueue(
-            f'\n<content-block:meta_files>\n{file_meta}\n</content-block:meta_files>',
-            queue
-        )
-    
-    return final_message
+    return await stream.get_final_message()
 
 
 async def raw_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) -> BetaMessage:
@@ -324,7 +316,7 @@ async def raw_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) ->
     async for event in stream:
         # event_str = json.dumps(event, default=str)
         if event.type in ['message_start', 'message_delta', 'message_stop', 'content_block_start', 'content_block_delta', 'content_block_stop']:
-            event_str = event.model_dump_json()
+            event_str = event.model_dump_json(warnings=False)
             await stream_to_aqueue(event_str, queue)
 
     # Return final message
