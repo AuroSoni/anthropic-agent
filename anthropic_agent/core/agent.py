@@ -629,7 +629,7 @@ class AnthropicAgent:
             self._save_run_data_async(result, all_files_metadata)
             
             return result
-        
+
         # Max steps reached - generate final summary
         logger.warning(f"Max steps ({self.max_steps}) reached, generating final summary")
         return await self._generate_final_summary(queue=queue, formatter=formatter)

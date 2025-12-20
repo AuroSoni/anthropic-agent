@@ -2,9 +2,9 @@
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │ AnthropicAgent.__init__(...)                                                 │
 ├──────────────────────────────────────────────────────────────────────────────┤
-│ - db_backend: filesystem/sql (always present)                                 │
-│ - optional: tool_registry, compactor, memory_store, file_backend              │
-│ - optional: server_tools (Anthropic-executed), beta_headers, api_kwargs       │
+│ - db_backend: filesystem/sql (always present)                                │
+│ - optional: tool_registry, compactor, memory_store, file_backend             │
+│ - optional: server_tools (Anthropic-executed), beta_headers, api_kwargs      │
 └──────────────────────────────────────────────────────────────────────────────┘
                        │
                        ▼
@@ -15,11 +15,11 @@
             yes │            │ no
                 ▼            ▼
 ┌──────────────────────────┐   ┌──────────────────────────┐
-│ load_agent_config from DB│   │ new session state         │
-│ - messages               │   │ - messages = []           │
-│ - container_id           │   │ - container_id optional   │
-│ - file_registry          │   │ - file_registry = {}      │
-│ - token counters         │   │ - token counters = 0      │
+│ load_agent_config from DB│   │ new session state        │
+│ - messages               │   │ - messages = []          │
+│ - container_id           │   │ - container_id optional  │
+│ - file_registry          │   │ - file_registry = {}     │
+│ - token counters         │   │ - token counters = 0     │
 └──────────────────────────┘   └──────────────────────────┘
                 \            /
                  \          /
@@ -31,8 +31,8 @@
                        ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │ Build user_message                                                           │
-│ - prompt is str  -> {role:user, content:[{type:text, text:...}]}              │
-│ - prompt is list -> {role:user, content:[...blocks...]}                       │
+│ - prompt is str  -> {role:user, content:[{type:text, text:...}]}             │
+│ - prompt is list -> {role:user, content:[...blocks...]}                      │
 └──────────────────────────────────────────────────────────────────────────────┘
                        │
                        ▼
@@ -49,20 +49,20 @@
                        │
                        ▼
         ┌───────────────────────────────┐
-        │ memory_store configured?       │
+        │ memory_store configured?      │
         └───────────────────────────────┘
                  │               │
              yes │               │ no
                  ▼               ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │ memory_store.retrieve(...)                                                   │
-│ - injects context into self.messages ONLY (not conversation_history)          │
+│ - injects context into self.messages ONLY (not conversation_history)         │
 └──────────────────────────────────────────────────────────────────────────────┘
                  │
                  ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │ Token baseline: _count_tokens_api(...)                                       │
-│ (best-effort; updates _last_known_input_tokens)                               │
+│ (best-effort; updates _last_known_input_tokens)                              │
 └──────────────────────────────────────────────────────────────────────────────┘
                        │
                        ▼
@@ -72,14 +72,14 @@
                        │
                        ▼
         ┌───────────────────────────────┐
-        │ compactor configured?          │
+        │ compactor configured?         │
         └───────────────────────────────┘
                  │               │
              yes │               │ no
                  ▼               ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │ _apply_compaction(step)                                                      │
-│ (memory before/after hooks + logs)                                            │
+│ (memory before/after hooks + logs)                                           │
 └──────────────────────────────────────────────────────────────────────────────┘
                        │
                        ▼
@@ -95,13 +95,13 @@
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │ anthropic_stream_with_backoff(...)                                           │
 │ - retries transient API errors                                               │
-│ - if queue: render_stream(stream, queue, formatter=xml/raw)                   │
+│ - if queue: render_stream(stream, queue, formatter=xml/raw)                  │
 │ - returns accumulated_message (BetaMessage)                                  │
 └──────────────────────────────────────────────────────────────────────────────┘
                        │
                        ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│ Append assistant message; update tokens + container_id                         │
+│ Append assistant message; update tokens + container_id                       │
 │ - self.messages += [assistant_message]                                       │
 │ - self.conversation_history += [assistant_message]                           │
 └──────────────────────────────────────────────────────────────────────────────┘
@@ -116,7 +116,7 @@
                 ▼            ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │ Local tool execution (client tools only)                                     │
-│ - ToolRegistry.execute(...) -> append tool_result message -> continue loop    │
+│ - ToolRegistry.execute(...) -> append tool_result message -> continue loop   │
 └──────────────────────────────────────────────────────────────────────────────┘
                 │
                 └─────────────────────────────── back to Loop ─────────────────┘
@@ -137,27 +137,27 @@
                                   │
                                   ▼
         ┌───────────────────────────────┐
-        │ memory_store configured?       │
+        │ memory_store configured?      │
         └───────────────────────────────┘
                  │               │
              yes │               │ no
                  ▼               ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│ memory_store.update(messages, conversation_history, tools, model)             │
+│ memory_store.update(messages, conversation_history, tools, model)            │
 │ (logs memory_update)                                                         │
 └──────────────────────────────────────────────────────────────────────────────┘
                        │
                        ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │ Build AgentResult                                                            │
-│ - final_message, final_answer, conversation_history, usage, container_id      │
+│ - final_message, final_answer, conversation_history, usage, container_id     │
 │ - agent_logs                                                                 │
 └──────────────────────────────────────────────────────────────────────────────┘
                        │
                        ▼
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │ _finalize_file_processing(queue)                                             │
-│ (discover file_ids; optional download+store; optional stream meta_files)      │
+│ (discover file_ids; optional download+store; optional stream meta_files)     │
 └──────────────────────────────────────────────────────────────────────────────┘
                        │
                        ▼
@@ -174,8 +174,8 @@
 └──────────────────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│ If max_steps reached: _generate_final_summary()                               │
-│ (tools disabled) -> then same tail: memory/update -> files -> persist         │
+│ If max_steps reached: _generate_final_summary()                              │
+│ (tools disabled) -> then same tail: memory/update -> files -> persist        │
 └──────────────────────────────────────────────────────────────────────────────┘
 
 Notes:
