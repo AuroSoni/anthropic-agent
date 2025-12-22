@@ -1,3 +1,10 @@
+"""Retry utilities for async operations.
+
+This module provides retry decorators and functions for handling transient
+failures with exponential backoff. It includes both provider-agnostic utilities
+and Anthropic-specific retry logic.
+"""
+
 import asyncio
 import anthropic
 import random
@@ -9,6 +16,115 @@ from ..streaming import render_stream, get_formatter, FormatterType
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+
+# =============================================================================
+# Provider-Agnostic Retry Utilities
+# =============================================================================
+
+def async_retry(
+    max_retries: int = 5,
+    base_delay: float = 1.0,
+    retryable_exceptions: tuple[type[Exception], ...] = (Exception,),
+    non_retryable_exceptions: tuple[type[Exception], ...] = (),
+    jitter: bool = True,
+) -> Callable[[Callable[..., Awaitable[T]]], Callable[..., Awaitable[T]]]:
+    """Generic async retry decorator with exponential backoff.
+    
+    A configurable decorator for retrying async functions with exponential
+    backoff. Allows fine-grained control over which exceptions trigger retries.
+    
+    Args:
+        max_retries: Maximum number of attempts (including the first). Default: 5
+        base_delay: Base delay in seconds for exponential backoff. Default: 1.0
+        retryable_exceptions: Tuple of exception types that should trigger retries.
+            Default: (Exception,) - retries on any exception.
+        non_retryable_exceptions: Tuple of exception types that should NOT be retried,
+            even if they match retryable_exceptions. These take precedence.
+            Default: () - no exceptions are explicitly non-retryable.
+        jitter: Whether to add random jitter (0-1 seconds) to delay. Default: True
+    
+    Behavior:
+        - Exceptions matching non_retryable_exceptions are raised immediately.
+        - Exceptions matching retryable_exceptions trigger a retry (up to max_retries).
+        - Other exceptions are raised immediately.
+        - Delay follows: delay = base_delay * (2 ** attempt) [+ random(0,1) if jitter]
+        - Logs warnings for retries, errors when exhausted.
+    
+    Example:
+        >>> # Retry on any exception
+        >>> @async_retry(max_retries=3, base_delay=1.0)
+        >>> async def fetch_data():
+        >>>     ...
+        
+        >>> # Retry only on specific exceptions
+        >>> @async_retry(
+        ...     max_retries=5,
+        ...     retryable_exceptions=(TimeoutError, ConnectionError),
+        ...     non_retryable_exceptions=(ValueError, KeyError),
+        ... )
+        >>> async def api_call():
+        >>>     ...
+    
+    Returns:
+        Decorator function that wraps async functions with retry logic.
+    """
+    
+    def decorator(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
+        async def wrapper(*args: Any, **kwargs: Any) -> T:
+            last_exc: Exception | None = None
+            
+            for attempt in range(max_retries):
+                try:
+                    return await func(*args, **kwargs)
+                except non_retryable_exceptions as e:
+                    # Non-retryable exceptions are raised immediately
+                    logger.error(
+                        f"Non-retryable error in {func.__name__}: {type(e).__name__}: {e}"
+                    )
+                    raise
+                except retryable_exceptions as e:
+                    last_exc = e
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)
+                        if jitter:
+                            delay += random.uniform(0, 1)
+                        logger.warning(
+                            f"Retryable error in {func.__name__} "
+                            f"(attempt {attempt + 1}/{max_retries}): "
+                            f"{type(e).__name__}: {e}. "
+                            f"Retrying in {delay:.2f} seconds..."
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.error(
+                            f"{func.__name__} failed after {max_retries} attempts: {e}",
+                            exc_info=True,
+                        )
+                        raise last_exc
+                except Exception as e:
+                    # Unknown exceptions are not retried by default
+                    logger.error(
+                        f"Unexpected error in {func.__name__}: {type(e).__name__}: {e}"
+                    )
+                    raise
+            
+            # This line should be unreachable
+            raise RuntimeError(
+                f"async_retry: exhausted retries for {func.__name__}"
+            )  # pragma: no cover
+        
+        # Preserve function metadata
+        wrapper.__name__ = func.__name__
+        wrapper.__doc__ = func.__doc__
+        return wrapper
+    
+    return decorator
+
+
+# =============================================================================
+# Anthropic-Specific Retry Utilities
+# =============================================================================
 
 async def anthropic_stream_with_backoff(
     client: anthropic.AsyncAnthropic,
