@@ -3,7 +3,7 @@ name = "fastapi-server"
 version = "0.1.0"
 description = "Demo FastAPI server with Anthropic Agent integration"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 dependencies = [
     "anthropic-agent",
     "fastapi>=0.122.0",
