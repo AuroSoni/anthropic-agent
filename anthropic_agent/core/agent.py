@@ -5,6 +5,7 @@ import html
 import anthropic
 import logging
 import uuid
+import warnings
 from datetime import datetime
 from typing import Optional, Callable, Any, Awaitable
 from collections.abc import Mapping, Sequence
@@ -33,6 +34,11 @@ DEFAULT_FORMATTER: FormatterType = "xml"
 DEFAULT_MAX_RETRIES = 5
 DEFAULT_BASE_DELAY = 1.0
 
+# Cache control configuration (Anthropic limits)
+MAX_CACHE_BLOCKS = 4
+MIN_CACHE_TOKENS_SONNET = 1024  # Claude Sonnet/Opus minimum
+MIN_CACHE_TOKENS_HAIKU = 2048   # Claude Haiku minimum
+
 class AnthropicAgent:
     def __init__(
         self,
@@ -50,6 +56,7 @@ class AnthropicAgent:
         max_retries: Optional[int] = None,
         base_delay: Optional[float] = None,
         formatter: FormatterType | None = None,
+        enable_cache_control: Optional[bool] = None,
         compactor: CompactorType | Compactor | None = None,
         memory_store: MemoryStoreType | MemoryStore | None = None,
         final_answer_check: Optional[Callable[[str], tuple[bool, str]]] = None,
@@ -74,6 +81,9 @@ class AnthropicAgent:
             max_retries: Maximum retry attempts for API calls (default: 5)
             base_delay: Base delay in seconds for exponential backoff (default: 5.0)
             formatter: Default formatter for stream output ("xml" or "raw", default: "xml")
+            enable_cache_control: Enable cache_control injection for message content blocks
+                (default: True). When enabled, adds cache_control to supported content block
+                types (text, image, document) in both user and assistant messages.
             compactor: Either a compactor name ("tool_result_removal", "none") or a pre-configured
                 Compactor instance. If a string is provided, a compactor is created with default
                 settings (no threshold). For custom threshold, create and pass a Compactor instance.
@@ -238,6 +248,11 @@ class AnthropicAgent:
             if base_delay is not None
             else db_config.get("base_delay", DEFAULT_BASE_DELAY)
         )
+        self.enable_cache_control = (
+            enable_cache_control
+            if enable_cache_control is not None
+            else db_config.get("enable_cache_control", True)
+        )
         # Arbitrary API kwargs (e.g., temperature, top_p, stop_sequences)
         self.api_kwargs: dict[str, Any] = (
             api_kwargs
@@ -375,14 +390,14 @@ class AnthropicAgent:
             )
             # Note: Memory-injected messages are NOT added to conversation_history
         
-        # Initialize token estimate for current context using API-based counting.
+        # Initialize token estimate for current context using heuristic estimation.
         # Combine client tools (tool_schemas) and server tools for token counting.
         combined_tools: list[dict[str, Any]] = []
         if self.tool_schemas:
             combined_tools.extend(self.tool_schemas)
         if self.server_tools:
             combined_tools.extend(self.server_tools)
-        api_token_count: Optional[int] = await self._count_tokens_api(
+        estimated_tokens: int = await self._estimate_tokens(
             messages=self.messages,
             system=self.system_prompt,
             tools=combined_tools or None,
@@ -394,8 +409,7 @@ class AnthropicAgent:
             betas=self.beta_headers or None,
             container=self.container_id,
         )
-        if api_token_count is not None:
-            self._last_known_input_tokens = api_token_count
+        self._last_known_input_tokens = estimated_tokens
         
         step = 0
         while step < self.max_steps:
@@ -634,17 +648,177 @@ class AnthropicAgent:
         logger.warning(f"Max steps ({self.max_steps}) reached, generating final summary")
         return await self._generate_final_summary(queue=queue, formatter=formatter)
     
+    def _apply_cache_control(
+        self,
+        messages: list[dict[str, Any]],
+        system: str | None = None
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | str | None]:
+        """Apply cache_control to message content blocks with prioritized slot allocation.
+        
+        Anthropic limits cache_control to 4 blocks maximum. This method applies
+        caching in priority order:
+        1. System prompt (if large enough)
+        2. Document/image blocks (high value, typically large)
+        3. Large text blocks (sorted by size)
+        4. Recent message blocks (fallback)
+        
+        Args:
+            messages: List of message dicts to process
+            system: Optional system prompt string
+            
+        Returns:
+            Tuple of (processed_messages, processed_system) where:
+            - processed_messages: Messages with cache_control applied to priority blocks
+            - processed_system: Either block-format list with cache_control, or original string
+        """
+        if not self.enable_cache_control:
+            return messages, system
+        
+        # Determine minimum token threshold based on model
+        min_tokens = (
+            MIN_CACHE_TOKENS_HAIKU 
+            if "haiku" in self.model.lower() 
+            else MIN_CACHE_TOKENS_SONNET
+        )
+        remaining_slots = MAX_CACHE_BLOCKS
+        
+        # Block types that support cache_control
+        supported_types = {"text", "image", "document"}
+        
+        # Track which blocks to cache: list of (msg_idx, block_idx) tuples
+        blocks_to_cache: list[tuple[int, int]] = []
+        
+        # ----------------------------------------------------------------
+        # Priority 1: System prompt
+        # ----------------------------------------------------------------
+        processed_system: list[dict[str, Any]] | str | None = system
+        if system and remaining_slots > 0:
+            system_tokens = len(system) // 4  # Reuse existing heuristic
+            if system_tokens >= min_tokens:
+                # Convert to block format with cache_control
+                processed_system = [{
+                    "type": "text",
+                    "text": system,
+                    "cache_control": {"type": "ephemeral"}
+                }]
+                remaining_slots -= 1
+        
+        # ----------------------------------------------------------------
+        # Priority 2: Document/Image blocks (scan all messages)
+        # ----------------------------------------------------------------
+        doc_image_blocks: list[tuple[int, int]] = []
+        for msg_idx, msg in enumerate(messages):
+            content = msg.get("content", [])
+            if not isinstance(content, list):
+                continue
+            for block_idx, block in enumerate(content):
+                if not isinstance(block, dict):
+                    continue
+                block_type = block.get("type")
+                if block_type in ("document", "image"):
+                    doc_image_blocks.append((msg_idx, block_idx))
+        
+        # Add document/image blocks up to remaining slots
+        for loc in doc_image_blocks:
+            if remaining_slots <= 0:
+                break
+            blocks_to_cache.append(loc)
+            remaining_slots -= 1
+        
+        # ----------------------------------------------------------------
+        # Priority 3: Large text blocks (sorted by size descending)
+        # ----------------------------------------------------------------
+        if remaining_slots > 0:
+            large_text_blocks: list[tuple[int, int, int]] = []  # (msg_idx, block_idx, size)
+            for msg_idx, msg in enumerate(messages):
+                content = msg.get("content", [])
+                if not isinstance(content, list):
+                    continue
+                for block_idx, block in enumerate(content):
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "text" and "text" in block:
+                        text_len = len(block["text"])
+                        text_tokens = text_len // 4
+                        if text_tokens >= min_tokens:
+                            # Skip if already marked for caching (shouldn't happen but safe)
+                            if (msg_idx, block_idx) not in blocks_to_cache:
+                                large_text_blocks.append((msg_idx, block_idx, text_len))
+            
+            # Sort by size descending and add up to remaining slots
+            large_text_blocks.sort(key=lambda x: x[2], reverse=True)
+            for msg_idx, block_idx, _ in large_text_blocks:
+                if remaining_slots <= 0:
+                    break
+                blocks_to_cache.append((msg_idx, block_idx))
+                remaining_slots -= 1
+        
+        # ----------------------------------------------------------------
+        # Priority 4: Recent message blocks (fallback)
+        # ----------------------------------------------------------------
+        if remaining_slots > 0:
+            # Iterate messages in reverse, then blocks in reverse
+            for msg_idx in range(len(messages) - 1, -1, -1):
+                if remaining_slots <= 0:
+                    break
+                msg = messages[msg_idx]
+                role = msg.get("role")
+                content = msg.get("content", [])
+                
+                # Only process user/assistant messages with list content
+                if role not in ("user", "assistant") or not isinstance(content, list):
+                    continue
+                
+                for block_idx in range(len(content) - 1, -1, -1):
+                    if remaining_slots <= 0:
+                        break
+                    block = content[block_idx]
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") in supported_types:
+                        # Skip if already marked for caching
+                        if (msg_idx, block_idx) not in blocks_to_cache:
+                            blocks_to_cache.append((msg_idx, block_idx))
+                            remaining_slots -= 1
+        
+        # ----------------------------------------------------------------
+        # Build result messages with cache_control applied to selected blocks
+        # ----------------------------------------------------------------
+        blocks_to_cache_set = set(blocks_to_cache)
+        result: list[dict[str, Any]] = []
+        
+        for msg_idx, msg in enumerate(messages):
+            role = msg.get("role")
+            content = msg.get("content", [])
+            
+            # Pass through messages without list content unchanged
+            if not isinstance(content, list):
+                result.append(msg)
+                continue
+            
+            # Deep copy message and inject cache_control into selected blocks
+            new_msg = {"role": role, "content": []}
+            for block_idx, block in enumerate(content):
+                new_block = dict(block) if isinstance(block, dict) else block
+                if (msg_idx, block_idx) in blocks_to_cache_set:
+                    new_block["cache_control"] = {"type": "ephemeral"}
+                new_msg["content"].append(new_block)
+            result.append(new_msg)
+        
+        return result, processed_system
+    
     def _prepare_request_params(self) -> dict:
-        # Prepare request parameters
+        # Prepare request parameters with prioritized cache_control applied
+        messages, system = self._apply_cache_control(self.messages, self.system_prompt)
         request_params = {
             "model": self.model,
             "max_tokens": self.max_tokens,
-            "messages": self.messages,
+            "messages": messages,
         }
         
-        # Add optional parameters
-        if self.system_prompt:
-            request_params["system"] = self.system_prompt
+        # Add system prompt (may be block format with cache_control or original string)
+        if system:
+            request_params["system"] = system
         
         if self.thinking_tokens > 0:
             request_params["thinking"] = {
@@ -802,12 +976,13 @@ class AnthropicAgent:
             "Please provide a final summary or response based on the work completed so far."
         )
         
-        # Prepare request parameters (tools disabled)
+        # Prepare request parameters (tools disabled) with prioritized cache_control applied
+        messages, system = self._apply_cache_control(self.messages, summary_system_prompt)
         request_params = {
             "model": self.model,
             "max_tokens": self.max_tokens,
-            "messages": self.messages,
-            "system": summary_system_prompt,
+            "messages": messages,
+            "system": system or summary_system_prompt,  # Fallback if caching returned None
         }
         
         # Add thinking tokens if configured
@@ -972,6 +1147,53 @@ class AnthropicAgent:
         """
         return self._last_known_input_tokens
     
+    def _filter_messages_for_token_count(
+        self,
+        messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Filter messages to remove content types unsupported by token counting API.
+        
+        The count_tokens endpoint doesn't support URL-based document sources
+        (especially PDFs). This method removes such blocks to prevent 400 errors.
+        
+        Args:
+            messages: List of message dicts to filter
+            
+        Returns:
+            Filtered messages list with unsupported content removed
+        """
+        filtered: list[dict[str, Any]] = []
+        
+        for msg in messages:
+            content = msg.get("content")
+            
+            # Pass through messages without list content unchanged
+            if not isinstance(content, list):
+                filtered.append(msg)
+                continue
+            
+            # Filter content blocks
+            filtered_content: list[dict[str, Any]] = []
+            for block in content:
+                if not isinstance(block, dict):
+                    filtered_content.append(block)
+                    continue
+                
+                # Check for document blocks with URL sources
+                if block.get("type") == "document":
+                    source = block.get("source", {})
+                    if isinstance(source, dict) and source.get("type") == "url":
+                        # Skip URL-based documents (not supported by count_tokens)
+                        continue
+                
+                filtered_content.append(block)
+            
+            # Only include message if it still has content
+            if filtered_content:
+                filtered.append({"role": msg.get("role"), "content": filtered_content})
+        
+        return filtered
+    
     async def _count_tokens_api(
         self,
         *,
@@ -984,9 +1206,19 @@ class AnthropicAgent:
     ) -> Optional[int]:
         """Best-effort token counting via Anthropic count_tokens API.
         
+        .. deprecated::
+            This method is deprecated and will be removed in a future version.
+            Use :meth:`_estimate_tokens` instead.
+        
         Returns:
             input_tokens from the API response, or None if the call fails.
         """
+        warnings.warn(
+            "_count_tokens_api is deprecated and will be removed in a future version. "
+            "Use _estimate_tokens instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
         # Filter tools to only those supported by the count_tokens API.
         # The endpoint currently only accepts a limited set of server tool
         # types; passing unsupported types like "code_execution_20250825"
@@ -1009,9 +1241,12 @@ class AnthropicAgent:
                 if tool_type is None or tool_type in allowed_server_tool_types:
                     filtered_tools.append(tool)
 
+        # Filter messages to remove unsupported content types (e.g., URL PDF sources)
+        filtered_messages = self._filter_messages_for_token_count(messages)
+
         params: dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
+            "messages": filtered_messages,
         }
         if system:
             params["system"] = system

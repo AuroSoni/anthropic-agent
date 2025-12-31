@@ -24,15 +24,17 @@ def escape_xml_attr(value: str) -> str:
 
 
 async def stream_to_aqueue(chunk: Any, queue: asyncio.Queue) -> None:
-    """Send a chunk to an async queue.
+    """Send a chunk to an async queue with SSE-safe escaping.
     
-    Simple helper function to put items onto an async queue,
-    used for streaming output to consumers.
+    Helper function to put items onto an async queue for SSE streaming.
+    Escapes newlines in string chunks to ensure SSE compatibility.
     
     Args:
         chunk: The data chunk to send (can be any type)
         queue: The async queue to put the chunk into
     """
+    if isinstance(chunk, str):
+        chunk = chunk.replace('\n', '\\n')
     await queue.put(chunk)
 
 
@@ -42,8 +44,9 @@ async def xml_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) ->
     This formatter wraps different content types in custom XML tags:
     - Thinking: <content-block-thinking>...</content-block-thinking>
     - Text: <content-block-text>...</content-block-text>
-    - Tool calls: <content-block-tool_call id="..." name="..." arguments="..."></content-block-tool_call>
-    - Tool results: <content-block-tool_result id="..." name="..."><![CDATA[...]]></content-block-tool_result>
+    - Client tool calls: <content-block-tool_call id="..." name="..." arguments="..."></content-block-tool_call>
+    - Server tool calls: <content-block-server_tool_call id="..." name="..." arguments="..."></content-block-server_tool_call>
+    - Server tool results: <content-block-server_tool_result id="..." name="..."><![CDATA[...]]></content-block-server_tool_result>
     - Errors: <content-block-error><![CDATA[...]]></content-block-error>
     
     Supported event types (per Anthropic spec):
@@ -214,6 +217,34 @@ async def xml_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) ->
                     await stream_to_aqueue("</content-block-thinking>", queue)
                 elif block_type == "text":
                     await stream_to_aqueue("</content-block-text>", queue)
+                    # Emit citations from content_block if present
+                    content_block = getattr(event, 'content_block', None)
+                    citations = getattr(content_block, 'citations', None) if content_block else None
+                    if citations:
+                        citations_xml = '<citations>'
+                        for cit in citations:
+                            cit_dict = cit.model_dump() if hasattr(cit, 'model_dump') else cit
+                            cit_type = escape_xml_attr(cit_dict.get("type", "unknown"))
+                            doc_idx = escape_xml_attr(str(cit_dict.get("document_index", "")))
+                            doc_title = escape_xml_attr(cit_dict.get("document_title") or "")
+                            cited_text = cit_dict.get("cited_text", "")
+                            # Build attributes based on citation type
+                            if cit_dict.get("type") == "char_location":
+                                start = escape_xml_attr(str(cit_dict.get("start_char_index", "")))
+                                end = escape_xml_attr(str(cit_dict.get("end_char_index", "")))
+                                citations_xml += f'<citation type="{cit_type}" document_index="{doc_idx}" document_title="{doc_title}" start_char_index="{start}" end_char_index="{end}"><![CDATA[{cited_text}]]></citation>'
+                            elif cit_dict.get("type") == "page_location":
+                                start_page = escape_xml_attr(str(cit_dict.get("start_page_number", "")))
+                                end_page = escape_xml_attr(str(cit_dict.get("end_page_number", "")))
+                                citations_xml += f'<citation type="{cit_type}" document_index="{doc_idx}" document_title="{doc_title}" start_page_number="{start_page}" end_page_number="{end_page}"><![CDATA[{cited_text}]]></citation>'
+                            elif cit_dict.get("type") == "web_search_result_location":
+                                url = escape_xml_attr(cit_dict.get("url") or "")
+                                title = escape_xml_attr(cit_dict.get("title") or "")
+                                citations_xml += f'<citation type="{cit_type}" url="{url}" title="{title}"><![CDATA[{cited_text}]]></citation>'
+                            else:
+                                citations_xml += f'<citation type="{cit_type}" document_index="{doc_idx}"><![CDATA[{cited_text}]]></citation>'
+                        citations_xml += '</citations>'
+                        await stream_to_aqueue(citations_xml, queue)
                 block_info["is_open"] = False
             
             # Stream complete tool call (client tools)
@@ -252,12 +283,12 @@ async def xml_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) ->
                         tool_data["input"] = tool_data["input_json"]
                         del tool_data["input_json"]
                 
-                # Format as attribute-based XML (same tag as client tools)
+                # Format as attribute-based XML (distinct from client tools)
                 tool_id = escape_xml_attr(tool_data["id"])
                 tool_name = escape_xml_attr(tool_data["name"])
                 arguments = escape_xml_attr(json.dumps(tool_data["input"]))
                 await stream_to_aqueue(
-                    f'<content-block-tool_call id="{tool_id}" name="{tool_name}" arguments="{arguments}"></content-block-tool_call>',
+                    f'<content-block-server_tool_call id="{tool_id}" name="{tool_name}" arguments="{arguments}"></content-block-server_tool_call>',
                     queue
                 )
             
@@ -277,7 +308,7 @@ async def xml_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) ->
                     content_str = json.dumps(content, default=str)
                 
                 await stream_to_aqueue(
-                    f'<content-block-tool_result id="{tool_use_id}" name="{result_name}"><![CDATA[{content_str}]]></content-block-tool_result>',
+                    f'<content-block-server_tool_result id="{tool_use_id}" name="{result_name}"><![CDATA[{content_str}]]></content-block-server_tool_result>',
                     queue
                 )
         

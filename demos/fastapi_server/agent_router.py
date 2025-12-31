@@ -226,7 +226,7 @@ async def stream_agent_response(
         
         # Create the agent with config
         agent = AnthropicAgent(
-            **config.model_dump(),
+            **config.model_dump(exclude_none=True),
             agent_uuid=agent_uuid,
         )
         
@@ -247,7 +247,7 @@ async def stream_agent_response(
                 chunk = await queue.get()
                 if chunk is None:
                     break
-                yield f"data: {chunk.replace(chr(10), '\\n')}\n\n"
+                yield f"data: {chunk}\n\n"
                 queue.task_done()
         except asyncio.CancelledError:
             agent_task.cancel()
