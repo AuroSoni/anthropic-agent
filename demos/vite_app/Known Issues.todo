@@ -1,0 +1,8 @@
+Main TODOS:
+    ☐ Truly Inline the Citations
+    The approach would probably be to merge the citations and text blocks into a 
+    single block at parsing time, then render that block as a sigle text block with 
+    custom markdown support for citations.
+    This may need to be done to extend embedded tags like <chart> and <table> also.
+        ☐ Regenerate the parser integration test.
+        ☐ Regenerate the necessary unit tests.
