@@ -24,17 +24,41 @@ def escape_xml_attr(value: str) -> str:
 
 
 async def stream_to_aqueue(chunk: Any, queue: asyncio.Queue) -> None:
-    """Send a chunk to an async queue with SSE-safe escaping.
+    """Send a chunk to an async queue with simple SSE-safe escaping.
     
     Helper function to put items onto an async queue for SSE streaming.
-    Escapes newlines in string chunks to ensure SSE compatibility.
+    Only escapes actual newlines to prevent breaking SSE framing.
+    
+    Used by raw_formatter where JSON already has its own escaping.
     
     Args:
         chunk: The data chunk to send (can be any type)
         queue: The async queue to put the chunk into
     """
     if isinstance(chunk, str):
-        chunk = chunk.replace('\n', '\\n')
+        chunk = chunk.replace('\n', '\\n')  # Only escape actual newlines
+    await queue.put(chunk)
+
+
+async def stream_xml_to_aqueue(chunk: Any, queue: asyncio.Queue) -> None:
+    """Send a chunk to an async queue with double-escaping for XML format.
+    
+    Helper function for XML formatter that uses double-escaping to preserve
+    literal backslashes in content:
+    1. First escapes backslashes: \\ → \\\\
+    2. Then escapes newlines: newline → \\n
+    
+    This ensures the frontend can distinguish:
+    - \\n (two chars) → actual newline
+    - \\\\n (three chars) → literal backslash-n
+    
+    Args:
+        chunk: The data chunk to send (can be any type)
+        queue: The async queue to put the chunk into
+    """
+    if isinstance(chunk, str):
+        chunk = chunk.replace('\\', '\\\\')  # First: escape backslashes
+        chunk = chunk.replace('\n', '\\n')   # Then: escape newlines
     await queue.put(chunk)
 
 
@@ -110,7 +134,7 @@ async def xml_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) ->
             # Error event - propagate to user with CDATA wrapping
             error_data = getattr(event, 'error', event)
             error_content = json.dumps(error_data, default=str)
-            await stream_to_aqueue(
+            await stream_xml_to_aqueue(
                 f'<content-block-error><![CDATA[{error_content}]]></content-block-error>',
                 queue
             )
@@ -129,11 +153,11 @@ async def xml_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) ->
             
             # Open appropriate tag based on content type
             if block_type == "thinking":
-                await stream_to_aqueue("<content-block-thinking>", queue)
+                await stream_xml_to_aqueue("<content-block-thinking>", queue)
                 content_blocks[idx]["is_open"] = True
             
             elif block_type == "text":
-                await stream_to_aqueue("<content-block-text>", queue)
+                await stream_xml_to_aqueue("<content-block-text>", queue)
                 content_blocks[idx]["is_open"] = True
             
             elif block_type == "tool_use":
@@ -176,13 +200,13 @@ async def xml_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) ->
             if delta_type == "text_delta":
                 text_content = getattr(delta, 'text', '')
                 if text_content:
-                    await stream_to_aqueue(text_content, queue)
+                    await stream_xml_to_aqueue(text_content, queue)
             
             # Thinking delta - stream immediately
             elif delta_type == "thinking_delta":
                 thinking_content = getattr(delta, 'thinking', '')
                 if thinking_content:
-                    await stream_to_aqueue(thinking_content, queue)
+                    await stream_xml_to_aqueue(thinking_content, queue)
             
             # Signature delta - buffer (sent before content_block_stop for thinking)
             elif delta_type == "signature_delta":
@@ -214,9 +238,9 @@ async def xml_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) ->
             # Close text/thinking blocks
             if block_info["is_open"]:
                 if block_type == "thinking":
-                    await stream_to_aqueue("</content-block-thinking>", queue)
+                    await stream_xml_to_aqueue("</content-block-thinking>", queue)
                 elif block_type == "text":
-                    await stream_to_aqueue("</content-block-text>", queue)
+                    await stream_xml_to_aqueue("</content-block-text>", queue)
                     # Emit citations from content_block if present
                     content_block = getattr(event, 'content_block', None)
                     citations = getattr(content_block, 'citations', None) if content_block else None
@@ -244,7 +268,7 @@ async def xml_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) ->
                             else:
                                 citations_xml += f'<citation type="{cit_type}" document_index="{doc_idx}"><![CDATA[{cited_text}]]></citation>'
                         citations_xml += '</citations>'
-                        await stream_to_aqueue(citations_xml, queue)
+                        await stream_xml_to_aqueue(citations_xml, queue)
                 block_info["is_open"] = False
             
             # Stream complete tool call (client tools)
@@ -265,7 +289,7 @@ async def xml_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) ->
                 tool_id = escape_xml_attr(tool_data["id"])
                 tool_name = escape_xml_attr(tool_data["name"])
                 arguments = escape_xml_attr(json.dumps(tool_data["input"]))
-                await stream_to_aqueue(
+                await stream_xml_to_aqueue(
                     f'<content-block-tool_call id="{tool_id}" name="{tool_name}" arguments="{arguments}"></content-block-tool_call>',
                     queue
                 )
@@ -287,7 +311,7 @@ async def xml_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) ->
                 tool_id = escape_xml_attr(tool_data["id"])
                 tool_name = escape_xml_attr(tool_data["name"])
                 arguments = escape_xml_attr(json.dumps(tool_data["input"]))
-                await stream_to_aqueue(
+                await stream_xml_to_aqueue(
                     f'<content-block-server_tool_call id="{tool_id}" name="{tool_name}" arguments="{arguments}"></content-block-server_tool_call>',
                     queue
                 )
@@ -307,7 +331,7 @@ async def xml_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) ->
                 else:
                     content_str = json.dumps(content, default=str)
                 
-                await stream_to_aqueue(
+                await stream_xml_to_aqueue(
                     f'<content-block-server_tool_result id="{tool_use_id}" name="{result_name}"><![CDATA[{content_str}]]></content-block-server_tool_result>',
                     queue
                 )
@@ -321,9 +345,9 @@ async def xml_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) ->
     for idx, block_info in content_blocks.items():
         if block_info.get("is_open"):
             if block_info["type"] == "thinking":
-                await stream_to_aqueue("</content-block-thinking>", queue)
+                await stream_xml_to_aqueue("</content-block-thinking>", queue)
             elif block_info["type"] == "text":
-                await stream_to_aqueue("</content-block-text>", queue)
+                await stream_xml_to_aqueue("</content-block-text>", queue)
             block_info["is_open"] = False
     
     # Get and return the final accumulated message (async method)

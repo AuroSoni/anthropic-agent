@@ -6,8 +6,16 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card } from '@/components/ui/card';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import { Send, Copy, Check } from 'lucide-react';
 import type { AgentNode } from '@/lib/parsers';
+import { AGENT_TYPES, type AgentType } from '@/lib/agent-stream';
 
 /**
  * Extract text content from AgentNode tree, only from text blocks.
@@ -48,13 +56,14 @@ function extractTextContent(nodes: AgentNode[]): string {
 export function AgentViewer() {
   const { state, runAgent, isStreaming } = useAgent();
   const [prompt, setPrompt] = useState('');
+  const [agentType, setAgentType] = useState<AgentType>('agent_all_raw');
   const [copied, setCopied] = useState(false);
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
     if (!prompt.trim() || isStreaming) return;
     
-    runAgent(prompt.trim());
+    runAgent(prompt.trim(), { agent_type: agentType });
     setPrompt('');
   };
 
@@ -139,6 +148,22 @@ export function AgentViewer() {
       {/* Input Form */}
       <footer className="border-t border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-950">
         <form onSubmit={handleSubmit} className="mx-auto flex max-w-3xl gap-2">
+          <Select
+            value={agentType}
+            onValueChange={(value) => setAgentType(value as AgentType)}
+            disabled={isStreaming}
+          >
+            <SelectTrigger className="w-[180px]">
+              <SelectValue placeholder="Select agent" />
+            </SelectTrigger>
+            <SelectContent>
+              {AGENT_TYPES.map((type) => (
+                <SelectItem key={type.value} value={type.value}>
+                  {type.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
           <Input
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}

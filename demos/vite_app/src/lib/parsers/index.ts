@@ -1,4 +1,8 @@
 /**
+ * Public barrel exports for the parser library (types + parsers + meta-init helpers).
+ * Import from here rather than deep paths to keep usage consistent.
+ */
+/**
  * Agent Stream Parser Library
  * 
  * A collection of parsers for processing Anthropic agent streaming output.
@@ -49,4 +53,7 @@ export { parseMixedContent } from './xml-parser';
 
 // Meta-init utilities
 export { parseMetaInit, stripMetaInit, hasMetaInit } from './meta-init';
+
+// Shared utilities
+export { decodeHtmlEntities, unescapeSseNewlines } from './utils';
 

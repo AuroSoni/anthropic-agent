@@ -36,11 +36,24 @@ export interface AgentCompletion {
   container_id?: string;
 }
 
+/**
+ * Available agent types matching the backend configuration.
+ */
+export type AgentType = 'agent_no_tools' | 'agent_client_tools' | 'agent_all_raw' | 'agent_all_xml';
+
+export const AGENT_TYPES: { value: AgentType; label: string; description: string }[] = [
+  { value: 'agent_no_tools', label: 'No Tools', description: 'Basic assistant without tools' },
+  { value: 'agent_client_tools', label: 'Client Tools', description: 'With client-side tools only' },
+  { value: 'agent_all_raw', label: 'All Tools (Raw)', description: 'All tools with raw JSON streaming' },
+  { value: 'agent_all_xml', label: 'All Tools (XML)', description: 'All tools with XML streaming' },
+];
+
 export interface AgentConfig {
   system_prompt?: string;
   model?: string;
   max_steps?: number;
   formatter?: StreamFormat;
+  agent_type?: AgentType;
   // Add other config options as needed
 }
 
@@ -88,15 +101,17 @@ export async function streamAgent(
     // Process content based on format
     if (streamFormat === 'raw') {
       // Raw format: content is JSON-encoded Anthropic events
+      // Backend escapes backslashes for SSE transport, so unescape before parsing
+      const unescaped = content.replace(/\\\\/g, '\\');
       try {
-        const anthropicEvent = JSON.parse(content) as AnthropicEvent;
+        const anthropicEvent = JSON.parse(unescaped) as AnthropicEvent;
         (parser as AnthropicStreamParser).processEvent(anthropicEvent);
       } catch (e) {
         // Not valid JSON - might be an error message or other text
-        console.warn('Failed to parse Anthropic event JSON:', content.slice(0, 100), e);
+        console.warn('Failed to parse Anthropic event JSON:', unescaped.slice(0, 100), e);
       }
     } else {
-      // XML format: content is plain XML text
+      // XML format: content is plain XML text (unescaping happens in normalizeNodes)
       (parser as XmlStreamParser).appendChunk(content);
     }
     
@@ -112,7 +127,7 @@ export async function streamAgent(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         user_prompt: userPrompt,
-        agent_config: config,
+        agent_type: config?.agent_type,
       }),
 
       onopen: async (response) => {
@@ -122,8 +137,10 @@ export async function streamAgent(
       },
 
       onmessage: (ev) => {
-        // Unescape newlines that were escaped for SSE transport
-        const dataStr = ev.data.replace(/\\n/g, '\n');
+        // DO NOT blanket unescape here - parsers handle escaping at the right level:
+        // - XML parser: unescapes \n in text nodes (not attributes, so JSON.parse works)
+        // - Raw parser: JSON.parse handles \n natively
+        const dataStr = ev.data;
         
         if (dataStr === '[DONE]') {
           // Stream complete - mark as complete if not already
@@ -136,6 +153,8 @@ export async function streamAgent(
 
         // Check for meta_init on first data chunk
         if (!metaInitProcessed) {
+          // Don't unescape before parseMetaInit - the JSON uses standard escaping
+          // that JSON.parse() handles correctly. Unescaping would break newlines in strings.
           const metaInit = parseMetaInit(dataStr);
           if (metaInit) {
             streamFormat = metaInit.format;
@@ -159,7 +178,7 @@ export async function streamAgent(
             
             metaInitProcessed = true;
             
-            // Strip meta_init and continue with remaining content
+            // Strip meta_init and continue with remaining content (use raw dataStr)
             const remaining = stripMetaInit(dataStr);
             if (!remaining.trim()) {
               callbacks.onUpdate(currentState);

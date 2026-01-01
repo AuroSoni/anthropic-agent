@@ -1,3 +1,7 @@
+/**
+ * Utilities for the backend `<meta_init ...>` header: detect/parse/strip initialization metadata
+ * (e.g., chosen stream format) before routing the stream to the correct parser.
+ */
 import type { MetaInit } from './types';
 
 /**

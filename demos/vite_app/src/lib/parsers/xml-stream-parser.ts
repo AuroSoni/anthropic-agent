@@ -1,5 +1,11 @@
+/**
+ * Streaming XML-format parser (backend `<content-block-*>` style): buffers chunks, handles CDATA safely,
+ * and normalizes tags/attributes into the same AgentNode[] shape used by the raw (Anthropic event) parser.
+ * This is the main entrypoint when consuming the "xml" stream format.
+ */
 import type { AgentNode } from './types';
 import { parseMixedContent } from './xml-parser';
+import { decodeHtmlEntities, unescapeSseNewlines } from './utils';
 
 /**
  * Tag name mapping from XML format (content-block-*) to normalized names.
@@ -18,13 +24,23 @@ const TAG_NAME_MAP: Record<string, string> = {
 };
 
 /**
- * Check if a tag name represents a tool result (handles dynamic types like *_tool_result).
+ * Check if a tag name represents a SERVER-side tool result.
+ * Matches server_tool_result and dynamic types like bash_code_execution_tool_result.
+ * Excludes client-side tool_result and content-block-tool_result.
  */
-function isToolResultTag(tagName: string): boolean {
-  return tagName === 'content-block-tool_result' || 
-         tagName.endsWith('_tool_result') ||
-         tagName === 'tool_result' ||
-         tagName === 'server_tool_result';
+function isServerToolResultTag(tagName: string): boolean {
+  return (tagName === 'server_tool_result' || 
+          tagName === 'content-block-server_tool_result' ||
+          (tagName.endsWith('_tool_result') && 
+           tagName !== 'tool_result' && 
+           tagName !== 'content-block-tool_result'));
+}
+
+/**
+ * Check if a tag name represents a CLIENT-side tool result.
+ */
+function isClientToolResultTag(tagName: string): boolean {
+  return tagName === 'tool_result' || tagName === 'content-block-tool_result';
 }
 
 /**
@@ -35,37 +51,33 @@ function escapeRegex(str: string): string {
 }
 
 /**
- * Decode common HTML entities in a string.
- */
-function decodeHtmlEntities(str: string): string {
-  return str
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&amp;/g, '&')
-    .replace(/&#x27;/g, "'")
-    .replace(/&#39;/g, "'")
-    .replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(parseInt(dec, 10)))
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
-}
-
-/**
  * Pre-process CDATA sections by extracting their content.
  * CDATA content is preserved as-is (not escaped).
+ * Detects incomplete CDATA at buffer end for streaming scenarios.
  */
-function preprocessCDATA(text: string): { processed: string; cdataMap: Map<string, string> } {
+function preprocessCDATA(text: string): { 
+  processed: string; 
+  cdataMap: Map<string, string>;
+  incompleteStart: number;
+} {
   const cdataMap = new Map<string, string>();
   let counter = 0;
   
-  // Match CDATA sections: <![CDATA[...]]>
-  const processed = text.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, (_, content) => {
+  // Check for incomplete CDATA: <![CDATA[... without ]]>
+  const incompleteMatch = text.match(/<!\[CDATA\[(?:(?!\]\]>)[\s\S])*$/);
+  const incompleteStart = incompleteMatch ? incompleteMatch.index! : -1;
+  
+  // Only process complete portion (exclude incomplete CDATA at end)
+  const textToProcess = incompleteStart >= 0 ? text.slice(0, incompleteStart) : text;
+  
+  // Match complete CDATA sections: <![CDATA[...]]>
+  const processed = textToProcess.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, (_, content) => {
     const placeholder = `__CDATA_PLACEHOLDER_${counter++}__`;
     cdataMap.set(placeholder, content);
     return placeholder;
   });
   
-  return { processed, cdataMap };
+  return { processed, cdataMap, incompleteStart };
 }
 
 /**
@@ -82,36 +94,33 @@ function restoreCDATA(text: string, cdataMap: Map<string, string>): string {
 /**
  * Normalize tag names in an AgentNode tree.
  * Converts content-block-* tags to standard names and handles nested structures.
+ * Also unescapes SSE newlines in text content for display.
  */
 function normalizeNodes(nodes: AgentNode[], cdataMap: Map<string, string>): AgentNode[] {
   return nodes.map(node => {
     if (node.type === 'text') {
-      // Restore CDATA content in text nodes
+      // Restore CDATA content AND unescape SSE newlines for display
+      const restored = node.content ? restoreCDATA(node.content, cdataMap) : '';
       return {
         ...node,
-        content: node.content ? restoreCDATA(node.content, cdataMap) : node.content
+        content: unescapeSseNewlines(restored)
       };
     }
     
     if (node.type === 'element' && node.tagName) {
-      // Normalize tag name - handle dynamic tool result types
-      let normalizedTag = TAG_NAME_MAP[node.tagName] || node.tagName;
+      // Normalize tag name via mapping
+      const normalizedTag = TAG_NAME_MAP[node.tagName] || node.tagName;
       
-      // Handle dynamic *_tool_result tags (e.g., bash_code_execution_tool_result)
-      if (isToolResultTag(node.tagName)) {
-        normalizedTag = 'tool_result';
-      }
-      
-      // Handle tool_call: parse arguments attribute if present
+      // Handle tool_call/server_tool_call: parse arguments attribute if present
       if ((normalizedTag === 'tool_call' || normalizedTag === 'server_tool_call') && node.attributes?.arguments) {
         try {
-          // Decode HTML entities before parsing JSON
+          // Decode HTML entities before parsing JSON (JSON handles \n natively)
           const decodedArgs = decodeHtmlEntities(node.attributes.arguments);
           const parsedArgs = JSON.parse(decodedArgs);
           // Replace arguments string with formatted JSON as child content
           return {
             type: 'element',
-            tagName: 'tool_call', // Normalize server_tool_call to tool_call for UI
+            tagName: normalizedTag, // Preserve: 'tool_call' or 'server_tool_call'
             attributes: {
               id: node.attributes.id || '',
               name: node.attributes.name || '',
@@ -123,15 +132,35 @@ function normalizeNodes(nodes: AgentNode[], cdataMap: Map<string, string>): Agen
         }
       }
       
-      // Handle tool_result: preserve name attribute for display
-      if (normalizedTag === 'tool_result') {
-        const resultName = node.attributes?.name || 'tool_result';
+      // Handle server tool results: normalize to server_tool_result with toolType
+      if (isServerToolResultTag(node.tagName)) {
+        // Extract tool type from dynamic names like "bash_code_execution_tool_result"
+        let toolType = node.attributes?.name || '';
+        if (!toolType && node.tagName.endsWith('_tool_result')) {
+          toolType = node.tagName
+            .replace(/_tool_result$/, '')
+            .replace(/^content-block-/, '');
+        }
+        return {
+          type: 'element',
+          tagName: 'server_tool_result',
+          attributes: {
+            id: node.attributes?.id || '',
+            name: node.attributes?.name || 'server_tool_result',
+            toolType: toolType,
+          },
+          children: node.children ? normalizeNodes(node.children, cdataMap) : undefined
+        };
+      }
+      
+      // Handle client tool_result
+      if (isClientToolResultTag(node.tagName)) {
         return {
           type: 'element',
           tagName: 'tool_result',
           attributes: {
             id: node.attributes?.id || '',
-            name: resultName,
+            name: node.attributes?.name || 'tool_result',
           },
           children: node.children ? normalizeNodes(node.children, cdataMap) : undefined
         };
@@ -171,17 +200,25 @@ export class XmlStreamParser {
    * Get the current node tree.
    * Can be called at any time for real-time updates.
    * Tolerant of unclosed tags (uses parseMixedContent which handles streaming).
+   * Defers parsing of incomplete CDATA sections at buffer end.
    */
   getNodes(): AgentNode[] {
     if (!this.buffer) {
       return [];
     }
     
-    // Pre-process CDATA sections
-    const { processed, cdataMap } = preprocessCDATA(this.buffer);
+    // Pre-process CDATA sections (excludes incomplete CDATA at end)
+    const { processed, cdataMap, incompleteStart } = preprocessCDATA(this.buffer);
     
-    // Parse the XML structure
-    const rawNodes = parseMixedContent(processed);
+    // Parse only the complete portion of XML structure
+    // If there's incomplete CDATA, append it as unparsed text to maintain streaming display
+    let textToParse = processed;
+    if (incompleteStart >= 0) {
+      // Append the incomplete portion as-is for display (will be properly parsed when complete)
+      textToParse = processed + this.buffer.slice(incompleteStart);
+    }
+    
+    const rawNodes = parseMixedContent(textToParse);
     
     // Normalize tag names and restore CDATA content
     return normalizeNodes(rawNodes, cdataMap);

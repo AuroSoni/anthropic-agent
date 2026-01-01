@@ -1,4 +1,8 @@
 /**
+ * Shared type definitions for parser inputs/outputs (AgentNode tree + Anthropic streaming event shapes).
+ * Parsers in this folder normalize different stream formats into AgentNode[] for rendering.
+ */
+/**
  * Core types for the agent stream parser library.
  * These types are used across all parsers and can be exported for use in other projects.
  */
@@ -15,6 +19,19 @@ export interface AgentNode {
   tagName?: string; // For element nodes
   attributes?: Record<string, string>; // For element nodes
   children?: AgentNode[]; // For element nodes
+}
+
+/**
+ * Citation data from Anthropic API (used in content_block_stop events).
+ */
+export interface Citation {
+  cited_text?: string;
+  type?: string;
+  url?: string;
+  title?: string;
+  document_index?: string;
+  start_page_number?: string;
+  end_page_number?: string;
 }
 
 // ============================================================================
@@ -104,6 +121,10 @@ export interface ContentBlockDeltaEvent {
 export interface ContentBlockStopEvent {
   type: 'content_block_stop';
   index: number;
+  content_block?: {
+    citations?: Citation[];
+    [key: string]: any;
+  };
 }
 
 export type AnthropicEvent = 
