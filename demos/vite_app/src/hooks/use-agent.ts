@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef } from 'react';
-import { streamAgent, type AgentState, type AgentConfig } from '../lib/agent-stream';
+import { streamAgent, type AgentState, type AgentConfig, type UserPrompt } from '../lib/agent-stream';
 
 export function useAgent() {
   const [state, setState] = useState<AgentState>({
@@ -10,7 +10,7 @@ export function useAgent() {
 
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  const runAgent = useCallback(async (prompt: string, config?: AgentConfig) => {
+  const runAgent = useCallback(async (prompt: UserPrompt, config?: AgentConfig) => {
     // Abort previous run if any
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();

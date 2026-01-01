@@ -41,6 +41,12 @@ export interface AgentCompletion {
  */
 export type AgentType = 'agent_no_tools' | 'agent_client_tools' | 'agent_all_raw' | 'agent_all_xml';
 
+/**
+ * User prompt can be a simple string or a complex JSON structure (array or object)
+ * matching the shapes used in the FastAPI backend (see agent_api_test.ipynb).
+ */
+export type UserPrompt = string | unknown[] | Record<string, unknown>;
+
 export const AGENT_TYPES: { value: AgentType; label: string; description: string }[] = [
   { value: 'agent_no_tools', label: 'No Tools', description: 'Basic assistant without tools' },
   { value: 'agent_client_tools', label: 'Client Tools', description: 'With client-side tools only' },
@@ -69,7 +75,7 @@ export type AgentStreamCallbacks = {
 type StreamParser = AnthropicStreamParser | XmlStreamParser;
 
 export async function streamAgent(
-  userPrompt: string,
+  userPrompt: UserPrompt,
   config: AgentConfig | undefined,
   callbacks: AgentStreamCallbacks
 ) {

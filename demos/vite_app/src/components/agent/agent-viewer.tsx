@@ -1,9 +1,8 @@
-import { useState, type FormEvent } from 'react';
+import { useState, type FormEvent, type KeyboardEvent } from 'react';
 import { useAgent } from '@/hooks/use-agent';
 import { NodeListRenderer } from './node-renderer';
 import { StreamingIndicator } from './streaming-indicator';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
 import { Card } from '@/components/ui/card';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import {
@@ -14,7 +13,9 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { Send, Copy, Check } from 'lucide-react';
-import { AGENT_TYPES, type AgentType } from '@/lib/agent-stream';
+import { AGENT_TYPES, type AgentType, type UserPrompt } from '@/lib/agent-stream';
+
+type PromptFormat = 'text' | 'json';
 
 /**
  * AgentViewer is the main container for viewing agent output.
@@ -24,14 +25,55 @@ export function AgentViewer() {
   const { state, runAgent, isStreaming } = useAgent();
   const [prompt, setPrompt] = useState('');
   const [agentType, setAgentType] = useState<AgentType>('agent_all_raw');
+  const [promptFormat, setPromptFormat] = useState<PromptFormat>('text');
+  const [promptError, setPromptError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+
+  const parsePrompt = (): UserPrompt | null => {
+    const trimmed = prompt.trim();
+    if (!trimmed) return null;
+
+    if (promptFormat === 'text') {
+      return trimmed;
+    }
+
+    // JSON mode: parse and validate
+    try {
+      const parsed = JSON.parse(trimmed);
+      // Must be array or object (not null, not primitive)
+      if (Array.isArray(parsed) || (typeof parsed === 'object' && parsed !== null)) {
+        return parsed as UserPrompt;
+      }
+      // Allow string too (valid JSON string)
+      if (typeof parsed === 'string') {
+        return parsed;
+      }
+      setPromptError('JSON must be an object, array, or string');
+      return null;
+    } catch (e) {
+      setPromptError(`Invalid JSON: ${(e as Error).message}`);
+      return null;
+    }
+  };
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
     if (!prompt.trim() || isStreaming) return;
-    
-    runAgent(prompt.trim(), { agent_type: agentType });
+
+    setPromptError(null);
+    const parsedPrompt = parsePrompt();
+    if (parsedPrompt === null) return;
+
+    runAgent(parsedPrompt, { agent_type: agentType });
     setPrompt('');
+  };
+
+  const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    // Submit on Cmd/Ctrl+Enter
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      handleSubmit(e as unknown as FormEvent);
+    }
   };
 
   const handleCopy = async () => {
@@ -114,34 +156,82 @@ export function AgentViewer() {
 
       {/* Input Form */}
       <footer className="border-t border-zinc-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-950">
-        <form onSubmit={handleSubmit} className="mx-auto flex max-w-3xl gap-2">
-          <Select
-            value={agentType}
-            onValueChange={(value) => setAgentType(value as AgentType)}
-            disabled={isStreaming}
-          >
-            <SelectTrigger className="w-[180px]">
-              <SelectValue placeholder="Select agent" />
-            </SelectTrigger>
-            <SelectContent>
-              {AGENT_TYPES.map((type) => (
-                <SelectItem key={type.value} value={type.value}>
-                  {type.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <Input
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            placeholder="Enter your prompt..."
-            disabled={isStreaming}
-            className="flex-1"
-          />
-          <Button type="submit" disabled={isStreaming || !prompt.trim()}>
-            <Send className="h-4 w-4" />
-            <span className="ml-2">Send</span>
-          </Button>
+        <form onSubmit={handleSubmit} className="mx-auto max-w-3xl space-y-2">
+          {/* Controls row */}
+          <div className="flex gap-2">
+            <Select
+              value={agentType}
+              onValueChange={(value) => setAgentType(value as AgentType)}
+              disabled={isStreaming}
+            >
+              <SelectTrigger className="w-[180px]">
+                <SelectValue placeholder="Select agent" />
+              </SelectTrigger>
+              <SelectContent>
+                {AGENT_TYPES.map((type) => (
+                  <SelectItem key={type.value} value={type.value}>
+                    {type.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select
+              value={promptFormat}
+              onValueChange={(value) => {
+                setPromptFormat(value as PromptFormat);
+                setPromptError(null);
+              }}
+              disabled={isStreaming}
+            >
+              <SelectTrigger className="w-[100px]">
+                <SelectValue placeholder="Format" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="text">Text</SelectItem>
+                <SelectItem value="json">JSON</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          {/* Textarea + submit row */}
+          <div className="flex gap-2">
+            <textarea
+              value={prompt}
+              onChange={(e) => {
+                setPrompt(e.target.value);
+                setPromptError(null);
+              }}
+              onKeyDown={handleKeyDown}
+              placeholder={
+                promptFormat === 'text'
+                  ? 'Enter your prompt...'
+                  : 'Enter JSON array or object...'
+              }
+              disabled={isStreaming}
+              rows={3}
+              className="flex-1 resize-none rounded-md border border-zinc-200 bg-white px-3 py-2 text-sm shadow-xs outline-none transition-colors placeholder:text-zinc-400 focus:border-zinc-400 focus:ring-1 focus:ring-zinc-400 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:placeholder:text-zinc-500 dark:focus:border-zinc-500 dark:focus:ring-zinc-500"
+            />
+            <Button
+              type="submit"
+              disabled={isStreaming || !prompt.trim()}
+              className="self-end"
+            >
+              <Send className="h-4 w-4" />
+              <span className="ml-2">Send</span>
+            </Button>
+          </div>
+
+          {/* Error message */}
+          {promptError && (
+            <p className="text-sm text-red-600 dark:text-red-400">{promptError}</p>
+          )}
+
+          {/* Hint */}
+          <p className="text-xs text-zinc-400 dark:text-zinc-500">
+            {promptFormat === 'json'
+              ? 'Paste a JSON object or array. Press Cmd/Ctrl+Enter to send.'
+              : 'Press Cmd/Ctrl+Enter to send.'}
+          </p>
         </form>
       </footer>
     </div>
