@@ -1,0 +1,15 @@
+Main Issues to Address:
+    ✔ Truly Inline the Citations @done(26-01-01 19:22)
+    The approach would probably be to merge the citations and text blocks into a 
+    single block at parsing time, then render that block as a sigle text block with 
+    custom markdown support for citations.
+    This may need to be done to extend embedded tags like <chart> and <table> also.
+        ✘ Regenerate the parser integration test. @cancelled(26-01-01 19:22)
+        ✘ Regenerate the necessary unit tests. @cancelled(26-01-01 19:22)
+
+Future Improvements:
+    ☐ Allow PDF/Image/Container uploads.
+    ☐ Allow complex content block prompts.
+    ☐ Allow custom rendering of embedded tags like <chart> and <table>.
+    ☐ Allow Creation of Threads.
+    ☐ Explore general UI improvements.
