@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import type { AgentNode } from '@/lib/parsers';
 import { TextBlock } from './text-block';
 import { ThinkingBlock } from './thinking-block';
@@ -8,6 +9,118 @@ import { CitationBlock } from './citation-block';
 
 interface NodeRendererProps {
   node: AgentNode;
+}
+
+/**
+ * Check if a node is an inline node that should be merged with adjacent inline nodes.
+ * Inline nodes: text nodes, text elements, and citations.
+ */
+function isInlineNode(node: AgentNode): boolean {
+  if (node.type === 'text') return true;
+  if (node.type === 'element') {
+    return node.tagName === 'text' || node.tagName === 'citations';
+  }
+  return false;
+}
+
+/**
+ * Escape HTML special characters in text content.
+ */
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/** Counter object passed through merge functions to track citation indices */
+interface CitationCounter {
+  value: number;
+}
+
+/**
+ * Convert a single citation element to an HTML <cite> tag with index.
+ */
+function citationToHtml(citation: AgentNode, counter: CitationCounter): string {
+  counter.value += 1;
+  const attrs: string[] = [`data-index="${counter.value}"`];
+  
+  if (citation.attributes?.type) {
+    attrs.push(`type="${escapeHtml(citation.attributes.type)}"`);
+  }
+  if (citation.attributes?.document_index) {
+    attrs.push(`doc="${escapeHtml(citation.attributes.document_index)}"`);
+  }
+  if (citation.attributes?.start_page_number) {
+    attrs.push(`startPage="${escapeHtml(citation.attributes.start_page_number)}"`);
+  }
+  if (citation.attributes?.end_page_number) {
+    attrs.push(`endPage="${escapeHtml(citation.attributes.end_page_number)}"`);
+  }
+  if (citation.attributes?.url) {
+    attrs.push(`url="${escapeHtml(citation.attributes.url)}"`);
+  }
+  const title = citation.attributes?.document_title || citation.attributes?.title;
+  if (title) {
+    attrs.push(`title="${escapeHtml(title)}"`);
+  }
+  
+  const citedText = citation.children?.[0]?.content || '';
+  const attrStr = ' ' + attrs.join(' ');
+  
+  return `<cite${attrStr}>${escapeHtml(citedText)}</cite>`;
+}
+
+/**
+ * Convert a citations element (containing multiple citation children) to HTML.
+ */
+function citationsToHtml(node: AgentNode, counter: CitationCounter): string {
+  if (!node.children) return '';
+  
+  return node.children
+    .filter(child => child.type === 'element' && child.tagName === 'citation')
+    .map(child => citationToHtml(child, counter))
+    .join('');
+}
+
+/**
+ * Recursively extract text content from a node tree.
+ */
+function nodeToMarkdown(node: AgentNode, counter: CitationCounter): string {
+  if (node.type === 'text') {
+    return node.content || '';
+  }
+  
+  if (node.type === 'element') {
+    if (node.tagName === 'citations') {
+      return citationsToHtml(node, counter);
+    }
+    if (node.tagName === 'text' && node.children) {
+      return node.children.map(child => nodeToMarkdown(child, counter)).join('');
+    }
+  }
+  
+  return '';
+}
+
+/**
+ * Merge consecutive inline nodes starting from startIndex.
+ * Returns the merged markdown content and the number of nodes consumed.
+ */
+function mergeInlineNodes(nodes: AgentNode[], startIndex: number, counter: CitationCounter): { content: string; consumed: number } {
+  let content = '';
+  let consumed = 0;
+  
+  for (let i = startIndex; i < nodes.length; i++) {
+    const node = nodes[i];
+    if (!isInlineNode(node)) break;
+    
+    content += nodeToMarkdown(node, counter);
+    consumed++;
+  }
+  
+  return { content, consumed };
 }
 
 /**
@@ -158,14 +271,39 @@ interface NodeListRendererProps {
 }
 
 /**
- * Renders a list of AgentNodes.
+ * Renders a list of AgentNodes, merging adjacent inline nodes (text + citations)
+ * into single TextBlock components for proper inline flow.
+ * 
+ * Citation indices are assigned during the merge phase and embedded as data-index
+ * attributes in the HTML, ensuring stable numbering across re-renders.
  */
 export function NodeListRenderer({ nodes }: NodeListRendererProps) {
-  return (
-    <>
-      {nodes.map((node, index) => (
-        <NodeRenderer key={index} node={node} />
-      ))}
-    </>
-  );
+  // Memoize the element building to ensure stable citation indices
+  // Only rebuilds when nodes array changes
+  const elements = useMemo(() => {
+    const counter: CitationCounter = { value: 0 };
+    const result: React.ReactNode[] = [];
+    let i = 0;
+    
+    while (i < nodes.length) {
+      const node = nodes[i];
+      
+      // Check if this starts a sequence of inline nodes
+      if (isInlineNode(node)) {
+        const { content, consumed } = mergeInlineNodes(nodes, i, counter);
+        if (content) {
+          result.push(<TextBlock key={i} content={content} />);
+        }
+        i += consumed;
+      } else {
+        // Non-inline node - render normally
+        result.push(<NodeRenderer key={i} node={node} />);
+        i++;
+      }
+    }
+    
+    return result;
+  }, [nodes]);
+  
+  return <>{elements}</>;
 }
