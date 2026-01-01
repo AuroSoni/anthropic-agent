@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { XmlStreamParser } from '../../src/lib/parsers';
 import { xml_example_1_raw, cleanXmlStream } from '../../src/lib/xml_stream_examples';
+import { HELLO_XML, CLIENT_TOOLS_XML, SERVER_TOOLS_XML, CITATIONS_XML } from '../fixtures/scenarios';
+import { extractSseData, hasExpectedNodeTypes } from '../fixtures/helpers';
 
 describe('XmlStreamParser', () => {
   let parser: XmlStreamParser;
@@ -146,13 +148,16 @@ describe('XmlStreamParser', () => {
       expect(nodes[0].children?.[0].content).toBe('Let me think...');
     });
 
-    it('normalizes dynamic *_tool_result tags to tool_result', () => {
+    it('normalizes dynamic *_tool_result tags to server_tool_result', () => {
+      // Without name attribute: extracts toolType from tag name
       parser.appendChunk(
-        '<bash_code_execution_tool_result id="t1" name="bash_tool_result">result</bash_code_execution_tool_result>'
+        '<bash_code_execution_tool_result id="t1">result</bash_code_execution_tool_result>'
       );
       const nodes = parser.getNodes();
       expect(nodes.length).toBe(1);
-      expect(nodes[0].tagName).toBe('tool_result');
+      // Now normalized to server_tool_result with toolType extracted from tag
+      expect(nodes[0].tagName).toBe('server_tool_result');
+      expect(nodes[0].attributes?.toolType).toBe('bash_code_execution');
       expect(nodes[0].attributes?.id).toBe('t1');
     });
 
@@ -364,6 +369,176 @@ describe('XmlStreamParser', () => {
       expect(nodes[1].tagName).toBe('text');
       expect(nodes[1].children?.[0].content).toBe('Response text');
       expect(nodes[2].tagName).toBe('tool_call');
+    });
+  });
+
+  describe('fixture-based tests', () => {
+    /**
+     * Helper to process SSE stream data through the XML parser.
+     * Extracts XML content from SSE lines and feeds them to the parser.
+     */
+    function processFixtureStream(stream: string): void {
+      const dataLines = extractSseData(stream);
+      for (const data of dataLines) {
+        if (data === '[DONE]') continue;
+        // For XML format, append the data directly (skip meta_init for content parsing)
+        parser.appendChunk(data);
+      }
+    }
+
+    it('parses HELLO_XML fixture correctly', () => {
+      processFixtureStream(HELLO_XML.stream);
+      const nodes = parser.getNodes();
+      
+      expect(nodes.length).toBeGreaterThan(0);
+      expect(hasExpectedNodeTypes(nodes, HELLO_XML.expectedNodeTypes)).toBe(true);
+      
+      // Verify text content
+      const textNode = nodes.find(n => n.type === 'element' && n.tagName === 'text');
+      expect(textNode).toBeDefined();
+      expect(textNode?.children?.[0].content).toContain('Hello');
+    });
+
+    it('parses CLIENT_TOOLS_XML fixture correctly', () => {
+      processFixtureStream(CLIENT_TOOLS_XML.stream);
+      const nodes = parser.getNodes();
+      
+      expect(nodes.length).toBeGreaterThan(0);
+      expect(hasExpectedNodeTypes(nodes, CLIENT_TOOLS_XML.expectedNodeTypes)).toBe(true);
+      
+      // Verify tool_call node exists
+      const toolCallNode = nodes.find(n => n.type === 'element' && n.tagName === 'tool_call');
+      expect(toolCallNode).toBeDefined();
+      expect(toolCallNode?.attributes?.name).toBe('divide');
+    });
+
+    it('parses SERVER_TOOLS_XML fixture correctly', () => {
+      processFixtureStream(SERVER_TOOLS_XML.stream);
+      const nodes = parser.getNodes();
+      
+      expect(nodes.length).toBeGreaterThan(0);
+      expect(hasExpectedNodeTypes(nodes, SERVER_TOOLS_XML.expectedNodeTypes)).toBe(true);
+      
+      // Verify server_tool_call node exists
+      const serverToolCallNode = nodes.find(
+        n => n.type === 'element' && n.tagName === 'server_tool_call'
+      );
+      expect(serverToolCallNode).toBeDefined();
+      expect(serverToolCallNode?.attributes?.name).toBe('web_search');
+    });
+
+    it('parses CITATIONS_XML fixture correctly', () => {
+      processFixtureStream(CITATIONS_XML.stream);
+      const nodes = parser.getNodes();
+      
+      expect(nodes.length).toBeGreaterThan(0);
+      expect(hasExpectedNodeTypes(nodes, CITATIONS_XML.expectedNodeTypes)).toBe(true);
+      
+      // Verify citations node exists
+      const citationsNode = nodes.find(n => n.type === 'element' && n.tagName === 'citations');
+      expect(citationsNode).toBeDefined();
+    });
+  });
+
+  describe('server_tool_result normalization', () => {
+    it('normalizes server tool result tags to server_tool_result with toolType', () => {
+      // When no name attribute, extracts toolType from tag name
+      parser.appendChunk(
+        '<content-block-web_search_tool_result id="srvtoolu_123"><![CDATA[Search results]]></content-block-web_search_tool_result>'
+      );
+      const nodes = parser.getNodes();
+      
+      expect(nodes.length).toBe(1);
+      expect(nodes[0].tagName).toBe('server_tool_result');
+      expect(nodes[0].attributes?.toolType).toBe('web_search');
+    });
+
+    it('uses name attribute as toolType when present', () => {
+      parser.appendChunk(
+        '<content-block-web_search_tool_result id="srvtoolu_123" name="web_search_tool_result"><![CDATA[Search results]]></content-block-web_search_tool_result>'
+      );
+      const nodes = parser.getNodes();
+      
+      expect(nodes.length).toBe(1);
+      expect(nodes[0].tagName).toBe('server_tool_result');
+      // When name attribute is set, it's used directly as toolType
+      expect(nodes[0].attributes?.toolType).toBe('web_search_tool_result');
+    });
+
+    it('preserves server_tool_call tag name', () => {
+      parser.appendChunk(
+        '<content-block-server_tool_call id="srvtoolu_123" name="web_search" arguments=\'{"query": "test"}\'></content-block-server_tool_call>'
+      );
+      const nodes = parser.getNodes();
+      
+      expect(nodes.length).toBe(1);
+      expect(nodes[0].tagName).toBe('server_tool_call');
+      expect(nodes[0].attributes?.name).toBe('web_search');
+    });
+
+    it('does not normalize regular tool_result to server_tool_result', () => {
+      parser.appendChunk(
+        '<content-block-tool_result id="toolu_123" name="divide"><![CDATA[0.5]]></content-block-tool_result>'
+      );
+      const nodes = parser.getNodes();
+      
+      expect(nodes.length).toBe(1);
+      expect(nodes[0].tagName).toBe('tool_result');
+      // Should not have toolType attribute
+      expect(nodes[0].attributes?.toolType).toBeUndefined();
+    });
+  });
+
+  describe('partial CDATA handling', () => {
+    it('defers parsing when CDATA is incomplete', () => {
+      // Append partial CDATA
+      parser.appendChunk('<content-block-tool_result id="r1" name="test"><![CDATA[partial content');
+      
+      // Should not crash, may return empty or partial nodes
+      const partialNodes = parser.getNodes();
+      expect(partialNodes.length).toBeGreaterThanOrEqual(0);
+      
+      // Complete the CDATA
+      parser.appendChunk(' more content]]></content-block-tool_result>');
+      const finalNodes = parser.getNodes();
+      
+      expect(finalNodes.length).toBe(1);
+      expect(finalNodes[0].tagName).toBe('tool_result');
+      expect(finalNodes[0].children?.[0].content).toContain('partial content');
+      expect(finalNodes[0].children?.[0].content).toContain('more content');
+    });
+  });
+
+  describe('HTML entity decoding', () => {
+    it('decodes HTML entities in attribute values', () => {
+      parser.appendChunk(
+        '<content-block-tool_call id="tc1" name="test" arguments="{&quot;key&quot;: &quot;value&quot;}"></content-block-tool_call>'
+      );
+      const nodes = parser.getNodes();
+      
+      expect(nodes.length).toBe(1);
+      expect(nodes[0].tagName).toBe('tool_call');
+      
+      // Arguments should be decoded and parseable as JSON
+      const content = nodes[0].children?.[0].content || '';
+      const args = JSON.parse(content);
+      expect(args.key).toBe('value');
+    });
+
+    it('decodes &amp; in attributes', () => {
+      parser.appendChunk('<meta_init data="foo&amp;bar"></meta_init>');
+      const nodes = parser.getNodes();
+      
+      expect(nodes.length).toBe(1);
+      expect(nodes[0].attributes?.data).toBe('foo&bar');
+    });
+
+    it('decodes &lt; and &gt; in attributes', () => {
+      parser.appendChunk('<meta_init data="a &lt; b &gt; c"></meta_init>');
+      const nodes = parser.getNodes();
+      
+      expect(nodes.length).toBe(1);
+      expect(nodes[0].attributes?.data).toBe('a < b > c');
     });
   });
 });

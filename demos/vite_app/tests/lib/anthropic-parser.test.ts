@@ -8,6 +8,8 @@ import {
   type ContentBlockStopEvent,
 } from '../../src/lib/parsers';
 import { example_1 } from '../../src/lib/raw_stream_examples';
+import { NO_TOOLS_RAW, CLIENT_TOOLS_RAW, CITATIONS_RAW } from '../fixtures/scenarios';
+import { extractSseData, hasExpectedNodeTypes } from '../fixtures/helpers';
 
 // Helper to create events
 const createMessageStart = (): MessageStartEvent => ({
@@ -78,10 +80,13 @@ describe('AnthropicStreamParser', () => {
         'The user is asking me to generate a sample invoice image'
       );
 
-      // 2. Verify First Text Block (Index 1)
+      // 2. Verify First Text Block (Index 1) - now wrapped in element
       const textNode1 = nodes[1];
-      expect(textNode1.type).toBe('text');
-      expect(textNode1.content).toContain("I'll create a new sample restaurant invoice image");
+      expect(textNode1.type).toBe('element');
+      expect(textNode1.tagName).toBe('text');
+      // Content is in children due to parseMixedContent
+      const textContent1 = textNode1.children?.map(c => c.content || '').join('') || '';
+      expect(textContent1).toContain("I'll create a new sample restaurant invoice image");
 
       // 3. Verify Server Tool Use (Index 2 - text_editor)
       const toolNode1 = nodes[2];
@@ -96,10 +101,11 @@ describe('AnthropicStreamParser', () => {
       expect(tool1Input.path).toBe('/tmp/create_restaurant_invoice.py');
       expect(tool1Input.file_text).toContain('from PIL import Image');
 
-      // 4. Verify Tool Result (Index 3)
+      // 4. Verify Tool Result (Index 3) - now normalized to server_tool_result
       const resultNode1 = nodes[3];
       expect(resultNode1.type).toBe('element');
-      expect(resultNode1.tagName).toBe('text_editor_code_execution_tool_result');
+      expect(resultNode1.tagName).toBe('server_tool_result');
+      expect(resultNode1.attributes?.toolType).toBe('text_editor_code_execution');
 
       // 5. Verify Bash Tool Use (Index 4)
       const toolNode2 = nodes[4];
@@ -108,19 +114,22 @@ describe('AnthropicStreamParser', () => {
       const tool2Input = JSON.parse(toolNode2.children?.[0].content || '');
       expect(tool2Input.command).toBe('cd /tmp && python create_restaurant_invoice.py');
 
-      // 6. Verify Bash Result (Index 5)
+      // 6. Verify Bash Result (Index 5) - now normalized to server_tool_result
       const resultNode2 = nodes[5];
-      expect(resultNode2.tagName).toBe('bash_code_execution_tool_result');
+      expect(resultNode2.tagName).toBe('server_tool_result');
+      expect(resultNode2.attributes?.toolType).toBe('bash_code_execution');
       const result2Content = JSON.parse(resultNode2.children?.[0].content || '');
       expect(result2Content.stdout).toContain('Restaurant invoice created successfully');
 
-      // 7. Verify Final Text (Index 8)
+      // 7. Verify Final Text (Index 8) - now wrapped in element
       const finalTextNode = nodes[8];
-      expect(finalTextNode.type).toBe('text');
-      expect(finalTextNode.content).toContain(
+      expect(finalTextNode.type).toBe('element');
+      expect(finalTextNode.tagName).toBe('text');
+      const finalTextContent = finalTextNode.children?.map(c => c.content || '').join('') || '';
+      expect(finalTextContent).toContain(
         "Perfect! I've created a beautiful sample restaurant invoice"
       );
-      expect(finalTextNode.content).toContain('Total: $205.29');
+      expect(finalTextContent).toContain('Total: $205.29');
     });
   });
 
@@ -207,13 +216,18 @@ describe('AnthropicStreamParser', () => {
       parser.processEvent(createBlockStop(0));
 
       const nodes = parser.getNodes();
-      // parseMixedContent should extract the chart as an element (chart is whitelisted)
-      expect(nodes.length).toBe(2);
-      expect(nodes[0].type).toBe('text');
-      expect(nodes[0].content).toBe('Here is a chart: ');
-      expect(nodes[1].type).toBe('element');
-      expect(nodes[1].tagName).toBe('chart');
-      expect(nodes[1].attributes?.type).toBe('bar');
+      // Text block is now wrapped in element with parsed children from parseMixedContent
+      expect(nodes.length).toBe(1);
+      expect(nodes[0].type).toBe('element');
+      expect(nodes[0].tagName).toBe('text');
+      // Children should contain parsed mixed content
+      const children = nodes[0].children || [];
+      expect(children.length).toBe(2);
+      expect(children[0].type).toBe('text');
+      expect(children[0].content).toBe('Here is a chart: ');
+      expect(children[1].type).toBe('element');
+      expect(children[1].tagName).toBe('chart');
+      expect(children[1].attributes?.type).toBe('bar');
     });
 
     it('handles unclosed tags in streaming context', () => {
@@ -235,11 +249,14 @@ describe('AnthropicStreamParser', () => {
       );
       parser.processEvent(createBlockStop(0));
 
-      // Unrecognized tags are preserved as plain text (for GFM/markdown rendering)
+      // Text block is wrapped in element, unrecognized tags are preserved in children
       const nodes = parser.getNodes();
       expect(nodes.length).toBe(1);
-      expect(nodes[0].type).toBe('text');
-      expect(nodes[0].content).toBe('<outer><inner>nested</inner></outer>');
+      expect(nodes[0].type).toBe('element');
+      expect(nodes[0].tagName).toBe('text');
+      // Unrecognized tags are preserved as plain text in children
+      const textContent = nodes[0].children?.map(c => c.content || '').join('') || '';
+      expect(textContent).toBe('<outer><inner>nested</inner></outer>');
     });
   });
 
@@ -270,7 +287,10 @@ describe('AnthropicStreamParser', () => {
       parser.processEvent(createBlockStop(0));
 
       const nodes = parser.getNodes();
-      expect(nodes.length).toBe(0); // parseMixedContent of '' returns []
+      // Empty text block still creates an element wrapper with empty children
+      expect(nodes.length).toBe(1);
+      expect(nodes[0].type).toBe('element');
+      expect(nodes[0].tagName).toBe('text');
     });
 
     it('handles blocks without content_block_stop', () => {
@@ -281,7 +301,10 @@ describe('AnthropicStreamParser', () => {
 
       const nodes = parser.getNodes();
       expect(nodes.length).toBe(1);
-      expect(nodes[0].content).toBe('Incomplete');
+      expect(nodes[0].type).toBe('element');
+      expect(nodes[0].tagName).toBe('text');
+      const textContent = nodes[0].children?.[0]?.content || '';
+      expect(textContent).toBe('Incomplete');
     });
 
     it('handles multiple text blocks in order', () => {
@@ -297,8 +320,8 @@ describe('AnthropicStreamParser', () => {
 
       const nodes = parser.getNodes();
       expect(nodes.length).toBe(2);
-      expect(nodes[0].content).toBe('First');
-      expect(nodes[1].content).toBe('Second');
+      expect(nodes[0].children?.[0]?.content).toBe('First');
+      expect(nodes[1].children?.[0]?.content).toBe('Second');
     });
 
     it('preserves block order by index', () => {
@@ -315,9 +338,9 @@ describe('AnthropicStreamParser', () => {
       parser.processEvent(createBlockDelta(1, 'text_delta', 'Second'));
 
       const nodes = parser.getNodes();
-      expect(nodes[0].content).toBe('First');
-      expect(nodes[1].content).toBe('Second');
-      expect(nodes[2].content).toBe('Third');
+      expect(nodes[0].children?.[0]?.content).toBe('First');
+      expect(nodes[1].children?.[0]?.content).toBe('Second');
+      expect(nodes[2].children?.[0]?.content).toBe('Third');
     });
   });
 
@@ -334,8 +357,10 @@ describe('AnthropicStreamParser', () => {
 
       const nodes = parser.getNodes();
       expect(nodes.length).toBe(1);
-      expect(nodes[0].tagName).toBe('custom_tool_result');
-      expect(nodes[0].attributes?.tool_use_id).toBe('tool_abc');
+      // Now normalized to server_tool_result
+      expect(nodes[0].tagName).toBe('server_tool_result');
+      expect(nodes[0].attributes?.toolType).toBe('custom');
+      expect(nodes[0].attributes?.id).toBe('tool_abc');
       expect(nodes[0].children?.[0].content).toBe('Result string content');
     });
 
@@ -352,7 +377,9 @@ describe('AnthropicStreamParser', () => {
 
       const nodes = parser.getNodes();
       expect(nodes.length).toBe(1);
-      expect(nodes[0].tagName).toBe('web_search_tool_result');
+      // Now normalized to server_tool_result
+      expect(nodes[0].tagName).toBe('server_tool_result');
+      expect(nodes[0].attributes?.toolType).toBe('web_search');
 
       const parsedContent = JSON.parse(nodes[0].children?.[0].content || '');
       expect(parsedContent).toEqual(objContent);
@@ -367,6 +394,8 @@ describe('AnthropicStreamParser', () => {
 
       const nodes = parser.getNodes();
       expect(nodes.length).toBe(1);
+      // empty_tool_result -> server_tool_result
+      expect(nodes[0].tagName).toBe('server_tool_result');
       expect(nodes[0].children?.[0].content).toBe('');
     });
   });
@@ -395,6 +424,86 @@ describe('AnthropicStreamParser', () => {
 
       const nodes = parser.getNodes();
       expect(nodes[0].children?.[0].content).toBe('Initial thought and more');
+    });
+  });
+
+  describe('fixture-based tests', () => {
+    /**
+     * Helper to process SSE stream data through the parser.
+     * Extracts JSON events from SSE lines and feeds them to the parser.
+     */
+    function processFixtureStream(stream: string): void {
+      const dataLines = extractSseData(stream);
+      for (const data of dataLines) {
+        // Skip non-JSON data (meta_init, tool_result, [DONE])
+        if (data === '[DONE]' || data.startsWith('<')) continue;
+        
+        try {
+          const event = JSON.parse(data) as AnthropicEvent;
+          parser.processEvent(event);
+        } catch {
+          // Skip non-JSON lines
+        }
+      }
+    }
+
+    it('parses NO_TOOLS_RAW fixture correctly', () => {
+      processFixtureStream(NO_TOOLS_RAW.stream);
+      const nodes = parser.getNodes();
+      
+      expect(nodes.length).toBeGreaterThan(0);
+      expect(hasExpectedNodeTypes(nodes, NO_TOOLS_RAW.expectedNodeTypes)).toBe(true);
+    });
+
+    it('parses CLIENT_TOOLS_RAW fixture correctly', () => {
+      processFixtureStream(CLIENT_TOOLS_RAW.stream);
+      const nodes = parser.getNodes();
+      
+      expect(nodes.length).toBeGreaterThan(0);
+      expect(hasExpectedNodeTypes(nodes, CLIENT_TOOLS_RAW.expectedNodeTypes)).toBe(true);
+    });
+
+    it('parses CITATIONS_RAW fixture correctly', () => {
+      processFixtureStream(CITATIONS_RAW.stream);
+      const nodes = parser.getNodes();
+      
+      expect(nodes.length).toBeGreaterThan(0);
+      expect(hasExpectedNodeTypes(nodes, CITATIONS_RAW.expectedNodeTypes)).toBe(true);
+    });
+  });
+
+  describe('server_tool_result normalization', () => {
+    it('normalizes server tool results to have toolType attribute', () => {
+      parser.processEvent(createMessageStart());
+      parser.processEvent(
+        createBlockStart(0, 'web_search_tool_result', {
+          tool_use_id: 'ws_123',
+          content: { results: ['result1', 'result2'] },
+        })
+      );
+      parser.processEvent(createBlockStop(0));
+
+      const nodes = parser.getNodes();
+      expect(nodes.length).toBe(1);
+      expect(nodes[0].tagName).toBe('server_tool_result');
+      expect(nodes[0].attributes?.toolType).toBe('web_search');
+    });
+
+    it('distinguishes tool_result from server_tool_result', () => {
+      parser.processEvent(createMessageStart());
+      // Regular tool_result
+      parser.processEvent(
+        createBlockStart(0, 'tool_result', {
+          tool_use_id: 't1',
+          content: 'result',
+        })
+      );
+      parser.processEvent(createBlockStop(0));
+
+      const nodes = parser.getNodes();
+      expect(nodes.length).toBe(1);
+      // Regular tool_result should not be normalized to server_tool_result
+      expect(nodes[0].tagName).toBe('tool_result');
     });
   });
 });
