@@ -14,40 +14,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { Send, Copy, Check } from 'lucide-react';
-import type { AgentNode } from '@/lib/parsers';
 import { AGENT_TYPES, type AgentType } from '@/lib/agent-stream';
-
-/**
- * Extract text content from AgentNode tree, only from text blocks.
- * Excludes thinking, tool_call, tool_result, and other non-text blocks.
- */
-function extractTextContent(nodes: AgentNode[]): string {
-  const textParts: string[] = [];
-  
-  function traverse(node: AgentNode) {
-    if (node.type === 'text' && node.content) {
-      textParts.push(node.content);
-      return;
-    }
-    
-    if (node.type === 'element' && node.tagName) {
-      if (['thinking', 'tool_call', 'tool_result', 'meta_init', 'meta_files', 'error'].includes(node.tagName)) {
-        return;
-      }
-      if (node.children) {
-        for (const child of node.children) {
-          traverse(child);
-        }
-      }
-    }
-  }
-  
-  for (const node of nodes) {
-    traverse(node);
-  }
-  
-  return textParts.join('');
-}
 
 /**
  * AgentViewer is the main container for viewing agent output.
@@ -68,11 +35,11 @@ export function AgentViewer() {
   };
 
   const handleCopy = async () => {
-    const textContent = extractTextContent(state.nodes);
-    if (!textContent.trim()) return;
+    if (state.nodes.length === 0) return;
     
     try {
-      await navigator.clipboard.writeText(textContent);
+      const jsonContent = JSON.stringify(state.nodes, null, 2);
+      await navigator.clipboard.writeText(jsonContent);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch (err) {
