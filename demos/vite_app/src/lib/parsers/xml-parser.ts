@@ -25,6 +25,8 @@ const RECOGNIZED_TAGS = new Set([
   'content-block-error',
   'content-block-meta_files',
   'meta_init',
+  // Frontend tool relay tag
+  'awaiting_frontend_tools',
   // Citation tags
   'citations',
   'citation',

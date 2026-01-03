@@ -8,3 +8,4 @@ agent-files/
 temp/
 *.egg-info/
 temp_logs/
+agent_data/

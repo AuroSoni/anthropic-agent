@@ -156,3 +156,26 @@ export interface MetaInit {
   model: string;
 }
 
+// ============================================================================
+// Frontend Tool Types (for browser-executed tools)
+// ============================================================================
+
+/**
+ * Pending frontend tool waiting for browser execution.
+ * Received from the agent via the awaiting_frontend_tools tag.
+ */
+export interface PendingFrontendTool {
+  tool_use_id: string;
+  name: string;
+  input: Record<string, unknown>;
+}
+
+/**
+ * Result of frontend tool execution to send back to the agent.
+ */
+export interface FrontendToolResult {
+  tool_use_id: string;
+  content: string;
+  is_error?: boolean;
+}
+

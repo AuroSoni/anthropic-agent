@@ -50,6 +50,17 @@ CREATE TABLE agent_config (
     last_known_input_tokens INTEGER DEFAULT 0,
     last_known_output_tokens INTEGER DEFAULT 0,
     
+    -- Frontend tool relay state (for pause/resume with browser-executed tools)
+    pending_frontend_tools JSONB DEFAULT '[]',  -- [{tool_use_id, name, input}, ...]
+    pending_backend_results JSONB DEFAULT '[]',  -- Backend tool results waiting to combine
+    awaiting_frontend_tools BOOLEAN DEFAULT FALSE,  -- Is agent paused for frontend tools?
+    current_step INTEGER DEFAULT 0,  -- Step to resume from
+    -- NOTE: This conversation_history is the per-run history used to populate AgentResult.
+    -- When frontend tools cause a pause, this preserves the current run's history so it
+    -- can be returned in the AgentResult after continuation. This is distinct from the
+    -- conversation_history TABLE (Table 2) which stores completed runs across user turns.
+    conversation_history JSONB DEFAULT '[]',  -- Preserved for frontend tool resume only
+    
     -- Metadata
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW(),
@@ -131,6 +142,23 @@ CREATE INDEX idx_agent_config_last_run ON agent_config(last_run_at DESC);
   # Token tracking for last run
   "last_known_input_tokens": 12345,
   "last_known_output_tokens": 678,
+  
+  # Frontend tool relay state (for pause/resume with browser-executed tools)
+  "pending_frontend_tools": [
+    # Populated when agent pauses for frontend tools
+    # {"tool_use_id": "toolu_123", "name": "user_confirm", "input": {"message": "..."}}
+  ],
+  "pending_backend_results": [
+    # Backend tool results waiting to combine with frontend results
+    # {"type": "tool_result", "tool_use_id": "toolu_456", "content": "..."}
+  ],
+  "awaiting_frontend_tools": false,  # True when agent is paused for frontend tools
+  "current_step": 0,  # Step number to resume from
+  # NOTE: This conversation_history is the per-run history used to populate AgentResult.
+  # When frontend tools cause a pause, this preserves the current run's history so it
+  # can be returned in the AgentResult after continuation. This is distinct from the
+  # conversation_history TABLE (Table 2) which stores completed runs across user turns.
+  "conversation_history": [],  # Preserved only when awaiting_frontend_tools=true
   
   # Metadata
   "created_at": "2025-11-25T10:00:00Z",

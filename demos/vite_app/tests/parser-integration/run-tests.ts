@@ -85,6 +85,109 @@ async function* parseSSEStream(response: Response): AsyncGenerator<string> {
 type StreamParser = AnthropicStreamParser | XmlStreamParser;
 
 /**
+ * Pending frontend tool from awaiting_frontend_tools tag.
+ */
+interface PendingFrontendTool {
+  tool_use_id: string;
+  name: string;
+  input: Record<string, unknown>;
+}
+
+/**
+ * Find awaiting_frontend_tools node and extract pending tools.
+ */
+function findAwaitingFrontendTools(nodes: AgentNode[]): PendingFrontendTool[] | null {
+  for (const node of nodes) {
+    if (node.type === 'element' && node.tagName === 'awaiting_frontend_tools') {
+      const dataAttr = node.attributes?.data;
+      if (dataAttr) {
+        try {
+          return JSON.parse(dataAttr) as PendingFrontendTool[];
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Submit tool results and stream continuation response.
+ */
+async function streamToolResultsContinuation(
+  agentUuid: string,
+  tools: PendingFrontendTool[],
+  existingFormat: StreamFormat,
+): Promise<{ nodes: AgentNode[]; chunkCount: number }> {
+  // Create tool results (respond "yes" to all user_confirm tools)
+  const toolResults = tools.map(tool => ({
+    tool_use_id: tool.tool_use_id,
+    content: tool.name === 'user_confirm' ? 'yes' : 'ok',
+    is_error: false,
+  }));
+
+  const response = await fetch(`${BASE_URL}/agent/tool_results`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      agent_uuid: agentUuid,
+      tool_results: toolResults,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Tool results HTTP error: ${response.status} ${response.statusText}`);
+  }
+
+  // Parse continuation stream
+  let parser: StreamParser;
+  let xmlFallbackParser: XmlStreamParser | null = null;
+
+  if (existingFormat === 'raw') {
+    parser = new AnthropicStreamParser();
+    xmlFallbackParser = new XmlStreamParser();
+  } else {
+    parser = new XmlStreamParser();
+  }
+
+  let chunkCount = 0;
+
+  for await (const data of parseSSEStream(response)) {
+    chunkCount++;
+
+    if (data === '[DONE]') {
+      continue;
+    }
+
+    if (existingFormat === 'raw') {
+      const trimmed = data.trim();
+      if (trimmed.startsWith('<')) {
+        xmlFallbackParser?.appendChunk(data);
+      } else {
+        const unescaped = data.replace(/\\\\/g, '\\');
+        try {
+          const event = JSON.parse(unescaped) as AnthropicEvent;
+          (parser as AnthropicStreamParser).processEvent(event);
+        } catch {
+          // Ignore parse errors in continuation
+        }
+      }
+    } else {
+      (parser as XmlStreamParser).appendChunk(data);
+    }
+  }
+
+  const mainNodes = parser.getNodes();
+  const xmlNodes = xmlFallbackParser?.getNodes() || [];
+
+  return {
+    nodes: [...mainNodes, ...xmlNodes],
+    chunkCount,
+  };
+}
+
+/**
  * Run a single test case against the API.
  */
 async function runTest(testCase: TestCase): Promise<TestResult> {
@@ -95,6 +198,7 @@ async function runTest(testCase: TestCase): Promise<TestResult> {
   let chunkCount = 0;
   const startTime = Date.now();
   let error: string | undefined;
+  let agentUuid: string | null = null;
 
   /**
    * Process a chunk through the appropriate parser.
@@ -158,6 +262,7 @@ async function runTest(testCase: TestCase): Promise<TestResult> {
 
         if (metaInit) {
           streamFormat = metaInit.format;
+          agentUuid = metaInit.agent_uuid;
           if (streamFormat === 'raw') {
             parser = new AnthropicStreamParser();
             xmlFallbackParser = new XmlStreamParser(); // For XML tool results
@@ -196,13 +301,31 @@ async function runTest(testCase: TestCase): Promise<TestResult> {
   // Merge nodes from main parser and XML fallback parser (for tool results in raw mode)
   const mainNodes = parser?.getNodes() || [];
   const xmlNodes = xmlFallbackParser?.getNodes() || [];
+  let allNodes = [...mainNodes, ...xmlNodes];
+
+  // Check for awaiting_frontend_tools and continue if found
+  const pendingTools = findAwaitingFrontendTools(allNodes);
+  if (pendingTools && pendingTools.length > 0 && agentUuid && streamFormat) {
+    console.log(`  [INFO] Found ${pendingTools.length} frontend tool(s), submitting results...`);
+    
+    try {
+      const continuation = await streamToolResultsContinuation(agentUuid, pendingTools, streamFormat);
+      chunkCount += continuation.chunkCount;
+      allNodes = [...allNodes, ...continuation.nodes];
+      console.log(`  [INFO] Continuation complete, +${continuation.chunkCount} chunks, +${continuation.nodes.length} nodes`);
+    } catch (e) {
+      const contError = e instanceof Error ? e.message : String(e);
+      console.error(`  [ERROR] Continuation failed: ${contError}`);
+      error = error ? `${error}; Continuation: ${contError}` : contError;
+    }
+  }
 
   return {
     testCase: testCase.name,
     agentType: testCase.agentType,
     timestamp: new Date().toISOString(),
     streamFormat: streamFormat || 'unknown',
-    nodes: [...mainNodes, ...xmlNodes],
+    nodes: allNodes,
     rawChunksCount: chunkCount,
     parseTimeMs: Date.now() - startTime,
     ...(error && { error }),

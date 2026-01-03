@@ -10,7 +10,9 @@ export type AgentType =
   | 'agent_no_tools' 
   | 'agent_client_tools' 
   | 'agent_all_raw' 
-  | 'agent_all_xml';
+  | 'agent_all_xml'
+  | 'agent_frontend_tools'
+  | 'agent_frontend_tools_raw';
 
 /**
  * Test case definition.

@@ -57,6 +57,9 @@ const PROMPTS = {
     ],
   },
   
+  // Frontend tools prompt (triggers user_confirm)
+  frontendToolsConfirm: "Calculate 25 * 4 for me. Confirm with user before proceeding.",
+  
   // Chart embedded tags prompt
   chartEmbedded: `
 <chart_config>
@@ -271,6 +274,22 @@ export const TEST_CASES: TestCase[] = [
     prompt: PROMPTS.chartEmbedded,
     agentType: "agent_all_xml",
     description: "Embedded <chart> tags with XML format",
+  },
+  
+  // Frontend tools - XML format (pauses for user_confirm)
+  {
+    name: "frontend_tools_confirm_xml",
+    prompt: PROMPTS.frontendToolsConfirm,
+    agentType: "agent_frontend_tools",
+    description: "Frontend tools with user_confirm - XML format, pauses at awaiting_frontend_tools",
+  },
+  
+  // Frontend tools - Raw format (pauses for user_confirm)
+  {
+    name: "frontend_tools_confirm_raw",
+    prompt: PROMPTS.frontendToolsConfirm,
+    agentType: "agent_frontend_tools_raw",
+    description: "Frontend tools with user_confirm - raw format, pauses at awaiting_frontend_tools",
   },
 ];
 

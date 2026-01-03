@@ -2,6 +2,7 @@ import { useState, type FormEvent, type KeyboardEvent } from 'react';
 import { useAgent } from '@/hooks/use-agent';
 import { NodeListRenderer } from './node-renderer';
 import { StreamingIndicator } from './streaming-indicator';
+import { FrontendToolPrompt } from './frontend-tool-prompt';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -14,6 +15,8 @@ import {
 } from '@/components/ui/select';
 import { Send, Copy, Check } from 'lucide-react';
 import { AGENT_TYPES, type AgentType, type UserPrompt } from '@/lib/agent-stream';
+import { createToolResult } from '@/lib/frontend-tools';
+import type { PendingFrontendTool } from '@/lib/parsers/types';
 
 type PromptFormat = 'text' | 'json';
 
@@ -22,12 +25,34 @@ type PromptFormat = 'text' | 'json';
  * Includes an input form for prompts and renders the streamed node tree.
  */
 export function AgentViewer() {
-  const { state, runAgent, isStreaming } = useAgent();
+  const { state, runAgent, submitToolResults, isStreaming, isAwaitingTools } = useAgent();
   const [prompt, setPrompt] = useState('');
-  const [agentType, setAgentType] = useState<AgentType>('agent_all_raw');
+  const [agentType, setAgentType] = useState<AgentType>('agent_all_xml');
   const [promptFormat, setPromptFormat] = useState<PromptFormat>('text');
   const [promptError, setPromptError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+
+  /**
+   * Handle frontend tool response from user interaction.
+   * Creates tool results for all pending tools and submits them to continue the agent.
+   */
+  const handleToolResponse = (respondedTool: PendingFrontendTool, response: string) => {
+    // Create results for all pending tools
+    // For the responded tool, use the actual response; others get a placeholder
+    const results = state.pendingFrontendTools?.map(tool => 
+      tool.tool_use_id === respondedTool.tool_use_id 
+        ? createToolResult(tool, response)
+        : createToolResult(tool, 'skipped')
+    ) ?? [];
+    
+    // If there's only one pending tool, just submit that result
+    if (state.pendingFrontendTools?.length === 1) {
+      submitToolResults([createToolResult(respondedTool, response)]);
+    } else {
+      // Multiple tools: submit all results
+      submitToolResults(results);
+    }
+  };
 
   const parsePrompt = (): UserPrompt | null => {
     const trimmed = prompt.trim();
@@ -58,7 +83,7 @@ export function AgentViewer() {
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
-    if (!prompt.trim() || isStreaming) return;
+    if (!prompt.trim() || isStreaming || isAwaitingTools) return;
 
     setPromptError(null);
     const parsedPrompt = parsePrompt();
@@ -120,6 +145,19 @@ export function AgentViewer() {
 
           {isStreaming && <StreamingIndicator />}
 
+          {/* Frontend tool prompts - shown when agent is awaiting tool execution */}
+          {isAwaitingTools && state.pendingFrontendTools && state.pendingFrontendTools.length > 0 && (
+            <div className="mt-4">
+              {state.pendingFrontendTools.map(tool => (
+                <FrontendToolPrompt
+                  key={tool.tool_use_id}
+                  tool={tool}
+                  onSubmit={(response) => handleToolResponse(tool, response)}
+                />
+              ))}
+            </div>
+          )}
+
           {state.status === 'error' && state.error && (
             <div className="mt-4 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700 dark:border-red-800 dark:bg-red-950/50 dark:text-red-300">
               Error: {state.error}
@@ -162,7 +200,7 @@ export function AgentViewer() {
             <Select
               value={agentType}
               onValueChange={(value) => setAgentType(value as AgentType)}
-              disabled={isStreaming}
+              disabled={isStreaming || isAwaitingTools}
             >
               <SelectTrigger className="w-[180px]">
                 <SelectValue placeholder="Select agent" />
@@ -181,7 +219,7 @@ export function AgentViewer() {
                 setPromptFormat(value as PromptFormat);
                 setPromptError(null);
               }}
-              disabled={isStreaming}
+              disabled={isStreaming || isAwaitingTools}
             >
               <SelectTrigger className="w-[100px]">
                 <SelectValue placeholder="Format" />
@@ -207,13 +245,13 @@ export function AgentViewer() {
                   ? 'Enter your prompt...'
                   : 'Enter JSON array or object...'
               }
-              disabled={isStreaming}
+              disabled={isStreaming || isAwaitingTools}
               rows={3}
               className="flex-1 resize-none rounded-md border border-zinc-200 bg-white px-3 py-2 text-sm shadow-xs outline-none transition-colors placeholder:text-zinc-400 focus:border-zinc-400 focus:ring-1 focus:ring-zinc-400 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:placeholder:text-zinc-500 dark:focus:border-zinc-500 dark:focus:ring-zinc-500"
             />
             <Button
               type="submit"
-              disabled={isStreaming || !prompt.trim()}
+              disabled={isStreaming || isAwaitingTools || !prompt.trim()}
               className="self-end"
             >
               <Send className="h-4 w-4" />

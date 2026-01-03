@@ -13,11 +13,40 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from anthropic_agent.core import AnthropicAgent
-from anthropic_agent.database import SQLBackend
+from anthropic_agent.database import SQLBackend, FilesystemBackend
 from anthropic_agent.file_backends import S3Backend
-from anthropic_agent.tools import SAMPLE_TOOL_FUNCTIONS
+from anthropic_agent.tools import SAMPLE_TOOL_FUNCTIONS, tool
 
 logger = logging.getLogger(__name__)
+
+
+########################################################
+# FRONTEND TOOLS (executed by browser, schema only on server)
+########################################################
+
+@tool(executor="frontend")
+def user_confirm(message: str) -> str:
+    """Ask the user for yes/no confirmation before proceeding with an action.
+    
+    Use this tool when you need explicit user approval before taking an action
+    that could have significant consequences, such as:
+    - Deleting or modifying data
+    - Making purchases or transactions
+    - Sending communications
+    - Any irreversible operation
+    
+    Args:
+        message: The confirmation message to display to the user, explaining
+                what action requires their approval and any relevant details.
+    
+    Returns:
+        "yes" if the user confirms, "no" if the user declines
+    """
+    pass  # Never executed server-side - runs in browser
+
+
+# List of all frontend tools for easy registration
+FRONTEND_TOOL_FUNCTIONS = [user_confirm]
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 
@@ -31,6 +60,7 @@ class AgentConfig(BaseModel):
     thinking_tokens: int
     max_tokens: int
     tools: list = []
+    frontend_tools: list = []  # Frontend-executed tools (schema only on server)
     server_tools: list = []
     context_management: dict | None = None
     beta_headers: list[str] = []
@@ -40,7 +70,7 @@ class AgentConfig(BaseModel):
 
 
 # Agent type literal for request validation
-AgentType = Literal["agent_no_tools", "agent_client_tools", "agent_all_raw", "agent_all_xml"]
+AgentType = Literal["agent_no_tools", "agent_client_tools", "agent_all_raw", "agent_all_xml", "agent_frontend_tools", "agent_frontend_tools_raw"]
 
 
 class AgentRunRequest(BaseModel):
@@ -72,6 +102,20 @@ class FileMetadata(BaseModel):
 class UploadResponse(BaseModel):
     """Response containing metadata for all uploaded files."""
     files: list[FileMetadata]
+
+
+class ToolResult(BaseModel):
+    """A single frontend tool result."""
+    tool_use_id: str
+    content: str
+    is_error: bool = False
+
+
+class ToolResultsRequest(BaseModel):
+    """Request to submit frontend tool results and resume agent execution."""
+    agent_uuid: str
+    tool_results: list[ToolResult]
+
 
 ########################################################
 # AGENT CONFIGURATIONS
@@ -197,12 +241,46 @@ agent_all_xml = AgentConfig(
     formatter="xml",
 )
 
+# Agent with frontend tools (for browser-executed tools like user_confirm)
+# NOTE: Uses FilesystemBackend to avoid asyncpg event loop conflicts when re-hydrating
+# from the /agent/tool_results endpoint (asyncpg connections are bound to specific event loops)
+agent_frontend_tools = AgentConfig(
+    system_prompt="""You are a helpful assistant that should help the user with their questions.
+When performing calculations that result in significant values (over 50), or when taking 
+any action that could have consequences, ask for user confirmation using the user_confirm tool.""",
+    model="claude-sonnet-4-20250514",
+    thinking_tokens=1024,
+    max_tokens=64000,
+    tools=SAMPLE_TOOL_FUNCTIONS,
+    frontend_tools=FRONTEND_TOOL_FUNCTIONS,  # Include frontend tools
+    file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
+    db_backend=FilesystemBackend(base_path="./agent_data"),  # Use filesystem to avoid asyncpg issues
+    formatter="xml",  # XML formatter for proper tag streaming
+)
+
+# Agent with frontend tools - RAW format (for testing parser compatibility)
+agent_frontend_tools_raw = AgentConfig(
+    system_prompt="""You are a helpful assistant that should help the user with their questions.
+When performing calculations that result in significant values (over 50), or when taking 
+any action that could have consequences, ask for user confirmation using the user_confirm tool.""",
+    model="claude-sonnet-4-20250514",
+    thinking_tokens=1024,
+    max_tokens=64000,
+    tools=SAMPLE_TOOL_FUNCTIONS,
+    frontend_tools=FRONTEND_TOOL_FUNCTIONS,
+    file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
+    db_backend=FilesystemBackend(base_path="./agent_data"),
+    formatter="raw",  # Raw JSON format for testing
+)
+
 # Agent config registry
 AGENT_CONFIGS: dict[AgentType, AgentConfig] = {
     "agent_no_tools": agent_no_tools,
     "agent_client_tools": agent_client_tools,
     "agent_all_raw": agent_all_raw,
     "agent_all_xml": agent_all_xml,
+    "agent_frontend_tools": agent_frontend_tools,
+    "agent_frontend_tools_raw": agent_frontend_tools_raw,
 }
 
 async def stream_agent_response(
@@ -264,6 +342,67 @@ async def stream_agent_response(
         yield f"data: Error: {str(e)}\n\n"
 
 
+async def stream_tool_results_response(
+    request: ToolResultsRequest,
+) -> AsyncGenerator[str, None]:
+    """Generate SSE-formatted stream after frontend tools complete.
+    
+    Re-hydrates the agent from the database using agent_uuid, submits
+    the frontend tool results, and continues streaming the response.
+    
+    Args:
+        request: Tool results request containing agent_uuid and results
+        
+    Yields:
+        SSE-formatted strings containing agent output chunks
+    """
+    try:
+        # Re-hydrate agent from DB (state is loaded automatically via agent_uuid)
+        # Use agent_frontend_tools config since we know this agent has frontend tools
+        config = AGENT_CONFIGS["agent_frontend_tools"]
+        
+        agent = AnthropicAgent(
+            **config.model_dump(exclude_none=True),
+            agent_uuid=request.agent_uuid,
+        )
+        
+        # Create queue for streaming
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        
+        # Continue the agent with frontend tool results
+        async def run_continuation():
+            result = await agent.continue_with_tool_results(
+                [r.model_dump() for r in request.tool_results],
+                queue=queue,
+            )
+            await queue.put(None)  # Signal completion
+            return result
+        
+        agent_task = asyncio.create_task(run_continuation())
+        
+        # Yield chunks as they arrive
+        try:
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    break
+                yield f"data: {chunk}\n\n"
+                queue.task_done()
+        except asyncio.CancelledError:
+            agent_task.cancel()
+            raise
+        
+        # Wait for agent to complete
+        await agent_task
+        
+        # Send final SSE marker
+        yield "data: [DONE]\n\n"
+        
+    except Exception as e:
+        logger.error(f"Error in tool results stream: {e}", exc_info=True)
+        yield f"data: Error: {str(e)}\n\n"
+
+
 @router.post("/run")
 async def run_agent(request: AgentRunRequest) -> StreamingResponse:
     """Run an agent with the given prompt and stream responses via SSE.
@@ -295,6 +434,43 @@ async def run_agent(request: AgentRunRequest) -> StreamingResponse:
             agent_uuid=request.agent_uuid,
             agent_type=request.agent_type,
         ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable buffering in nginx
+        },
+    )
+
+
+@router.post("/tool_results")
+async def submit_tool_results(request: ToolResultsRequest) -> StreamingResponse:
+    """Resume agent execution after frontend tools have been executed.
+    
+    This endpoint is called by the browser after it executes frontend tools
+    (e.g., user_confirm). The agent state is re-hydrated from the database
+    using the agent_uuid, and execution continues with the tool results.
+    
+    Args:
+        request: Tool results request containing agent_uuid and tool results
+        
+    Returns:
+        StreamingResponse with text/event-stream content type
+        
+    Example:
+        ```
+        POST /agent/tool_results
+        {
+            "agent_uuid": "abc123...",
+            "tool_results": [
+                {"tool_use_id": "tool_001", "content": "yes"},
+                {"tool_use_id": "tool_002", "content": "confirmed"}
+            ]
+        }
+        ```
+    """
+    return StreamingResponse(
+        stream_tool_results_response(request),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

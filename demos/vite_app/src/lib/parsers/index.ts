@@ -44,6 +44,8 @@ export type {
   MessageStopEvent,
   MetaInit,
   StreamFormat,
+  PendingFrontendTool,
+  FrontendToolResult,
 } from './types';
 
 // Parsers

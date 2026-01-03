@@ -49,6 +49,7 @@ class AnthropicAgent:
         max_tokens: Optional[int] = None,
         stream_meta_history_and_tool_results: Optional[bool] = None,
         tools: list[Callable[..., Any]] | None = None,
+        frontend_tools: list[Callable[..., Any]] | None = None,
         server_tools: list[dict[str, Any]] | None = None,
         beta_headers: list[str] | None = None,
         container_id: str | None = None,
@@ -74,7 +75,11 @@ class AnthropicAgent:
             thinking_tokens: Budget for extended thinking tokens (default: 0 / disabled)
             max_tokens: Maximum tokens in response (default: 2048)
             stream_meta_history_and_tool_results: Include metadata in stream (default: False)
-            tools: List of functions decorated with @tool (default: None)
+            tools: List of functions decorated with @tool for backend execution (default: None)
+            frontend_tools: List of functions decorated with @tool(executor="frontend") for
+                browser-side execution. These tools are schema-only on the server; when Claude
+                calls them, the agent pauses and emits an awaiting_frontend_tools event. The
+                browser executes the tool and POSTs the result back via /agent/tool_results.
             beta_headers: Beta feature headers for Anthropic API (default: None)
             container_id: Container ID for multi-turn conversations (default: None)
             messages: Initial message history (default: None)
@@ -153,6 +158,20 @@ class AnthropicAgent:
             self.tool_registry = ToolRegistry()
             self.tool_registry.register_tools(tools)
             self.tool_schemas = self.tool_registry.get_schemas()
+        
+        # Frontend tools (executed in browser, schema-only on server)
+        self.frontend_tool_schemas: list[dict[str, Any]] = []
+        self.frontend_tool_names: set[str] = set()
+        if frontend_tools:
+            for fn in frontend_tools:
+                if hasattr(fn, "__tool_schema__"):
+                    schema = fn.__tool_schema__
+                    self.frontend_tool_schemas.append(schema)
+                    self.frontend_tool_names.add(schema["name"])
+                else:
+                    raise ValueError(
+                        f"Frontend tool '{fn.__name__}' must be decorated with @tool(executor='frontend')"
+                    )
 
         # Load persisted configuration if agent_uuid provided
         db_config: dict[str, Any] = {}
@@ -216,12 +235,33 @@ class AnthropicAgent:
             self.file_registry = db_config.get("file_registry", {})
             self._last_known_input_tokens = db_config.get("last_known_input_tokens", 0)
             self._last_known_output_tokens = db_config.get("last_known_output_tokens", 0)
+            # Frontend tool relay state (for resume after browser execution)
+            self._pending_frontend_tools = db_config.get("pending_frontend_tools", [])
+            self._pending_backend_results = db_config.get("pending_backend_results", [])
+            self._awaiting_frontend_tools = db_config.get("awaiting_frontend_tools", False)
+            self._current_step = db_config.get("current_step", 0)
+            # Conversation history - only load when resuming due to frontend tools
+            # Regular agent resumptions should start fresh with a new conversation_history.
+            # NOTE: This is the per-run history used to populate AgentResult, NOT the
+            # conversation_history TABLE which stores completed runs across user turns.
+            # When frontend tools pause the agent, we preserve this so AgentResult
+            # contains the complete run history after continuation.
+            if self._awaiting_frontend_tools:
+                self._loaded_conversation_history = db_config.get("conversation_history", [])
+            else:
+                self._loaded_conversation_history = []
         else:
             self.messages = messages or []
             self.container_id = container_id
             self.file_registry: dict[str, dict] = {}
             self._last_known_input_tokens = 0
             self._last_known_output_tokens = 0
+            # Initialize frontend tool relay state for new agents
+            self._pending_frontend_tools = []
+            self._pending_backend_results = []
+            self._awaiting_frontend_tools = False
+            self._current_step = 0
+            self._loaded_conversation_history = []
         
         # Runtime configuration that may be persisted but can always be overridden
         # by explicit (non-None) constructor arguments.
@@ -293,6 +333,10 @@ class AnthropicAgent:
         # messages: compacted messages for API (existing)
         # conversation_history: per-run uncompacted history (reset in run())
         # agent_logs: meta-information about compactions and actions (reset in run())
+        
+        # Note: Frontend tool relay state (_pending_frontend_tools, _pending_backend_results,
+        # _awaiting_frontend_tools, _current_step) is initialized in the agent_uuid block above
+        # to support loading from DB for resumed agents.
         
         # Initialize the Anthropic async client for proper async streaming
         self.client = anthropic.AsyncAnthropic()
@@ -479,10 +523,13 @@ class AnthropicAgent:
                 ]
                 
                 if tool_calls:
-                    # Build tool results message
-                    # TODO: Execute tool calls parallelly.
+                    # Separate tool calls into backend vs frontend
+                    backend_tool_calls = [t for t in tool_calls if t.name not in self.frontend_tool_names]
+                    frontend_tool_calls = [t for t in tool_calls if t.name in self.frontend_tool_names]
+                    
+                    # Execute ALL backend tools first
                     tool_results = []
-                    for tool_call in tool_calls:
+                    for tool_call in backend_tool_calls:
                         is_error = False
                         result_content = None
                         try:
@@ -530,7 +577,46 @@ class AnthropicAgent:
                             "success": not is_error,
                         }, step_number=step)
                     
-                    # Add tool results to live context and conversation history
+                    # If frontend tools exist, pause and wait for browser execution
+                    if frontend_tool_calls:
+                        # Store backend results for later (will be combined with frontend results)
+                        self._pending_backend_results = tool_results
+                        self._pending_frontend_tools = [
+                            {"tool_use_id": t.id, "name": t.name, "input": t.input}
+                            for t in frontend_tool_calls
+                        ]
+                        self._awaiting_frontend_tools = True
+                        self._current_step = step
+                        
+                        # Log: awaiting frontend tools
+                        self._log_action("awaiting_frontend_tools", {
+                            "frontend_tools": [t.name for t in frontend_tool_calls],
+                            "backend_results_count": len(tool_results),
+                        }, step_number=step)
+                        
+                        # Emit all pending frontend tools to client
+                        if queue is not None:
+                            tools_json = html.escape(json.dumps(self._pending_frontend_tools), quote=True)
+                            await queue.put(f'<awaiting_frontend_tools data="{tools_json}"></awaiting_frontend_tools>')
+                        
+                        # Persist state to DB before returning (required for re-hydration)
+                        await self._save_agent_config()
+                        
+                        # Return early with partial result (agent is paused)
+                        return AgentResult(
+                            final_message=accumulated_message,
+                            final_answer="",
+                            conversation_history=self.conversation_history.copy(),
+                            stop_reason="awaiting_frontend_tools",
+                            model=accumulated_message.model,
+                            usage=accumulated_message.usage,
+                            container_id=self.container_id,
+                            total_steps=step,
+                            agent_logs=self.agent_logs.copy(),
+                            generated_files=None
+                        )
+                    
+                    # No frontend tools - add all tool results and continue
                     tool_result_message = {
                         "role": "user",
                         "content": tool_results
@@ -826,10 +912,12 @@ class AnthropicAgent:
                 "budget_tokens": self.thinking_tokens
             }
         
-        # Merge client tools (tool_schemas) and Anthropic server tools for this call.
+        # Merge client tools (tool_schemas), frontend tools, and Anthropic server tools for this call.
         combined_tools: list[dict[str, Any]] = []
         if self.tool_schemas:
             combined_tools.extend(self.tool_schemas)
+        if self.frontend_tool_schemas:
+            combined_tools.extend(self.frontend_tool_schemas)
         if self.server_tools:
             combined_tools.extend(self.server_tools)
         if combined_tools:
@@ -861,6 +949,369 @@ class AnthropicAgent:
             return "No tools have been registered for this agent."
         
         return self.tool_registry.execute(tool_name, tool_input)
+    
+    async def continue_with_tool_results(
+        self,
+        frontend_results: list[dict],
+        queue: Optional[asyncio.Queue] = None,
+        formatter: Optional[FormatterType] = None,
+    ) -> AgentResult:
+        """Resume agent execution after frontend tools have been executed.
+        
+        This method is called after the browser executes frontend tools and POSTs
+        the results back. It combines backend results (already executed) with
+        frontend results, adds them to the conversation, and continues the agent loop.
+        
+        Args:
+            frontend_results: List of frontend tool results, each containing:
+                - tool_use_id: ID of the tool call being responded to
+                - content: String result from frontend execution
+                - is_error: Optional boolean indicating if execution failed
+            queue: Optional async queue to stream formatted output chunks
+            formatter: Formatter to use for stream output ("xml" or "raw")
+            
+        Returns:
+            AgentResult from continuing the agent run
+            
+        Raises:
+            ValueError: If agent is not awaiting frontend tools, or if tool_use_ids
+                don't match the pending frontend tools
+        """
+        if not self._awaiting_frontend_tools:
+            raise ValueError("Agent is not awaiting frontend tools")
+        
+        if not self._pending_frontend_tools:
+            raise ValueError("No pending frontend tools found - state may not have been loaded from DB")
+        
+        # Initialize run state if resuming from DB (these are normally set in run())
+        if not hasattr(self, 'conversation_history') or not self.conversation_history:
+            self.conversation_history = getattr(self, '_loaded_conversation_history', []).copy()
+        if not hasattr(self, 'agent_logs'):
+            self.agent_logs = []
+        if not hasattr(self, '_run_logs_buffer'):
+            self._run_logs_buffer = []
+        if not hasattr(self, '_run_id'):
+            self._run_id = str(uuid.uuid4())
+        if not hasattr(self, '_run_start_time'):
+            self._run_start_time = datetime.now()
+        
+        # Validate all tool_use_ids match pending tools
+        pending_ids = {t["tool_use_id"] for t in self._pending_frontend_tools}
+        result_ids = {r["tool_use_id"] for r in frontend_results}
+        if pending_ids != result_ids:
+            raise ValueError(
+                f"Tool result mismatch. Expected tool_use_ids: {pending_ids}, got: {result_ids}"
+            )
+        
+        # Combine backend + frontend results (backend results come first)
+        all_results = self._pending_backend_results + [
+            {
+                "type": "tool_result",
+                "tool_use_id": r["tool_use_id"],
+                "content": r["content"],
+                **({"is_error": True} if r.get("is_error") else {})
+            }
+            for r in frontend_results
+        ]
+        
+        # Stream frontend tool results to queue
+        if queue is not None:
+            for r in frontend_results:
+                tool_use_id = html.escape(str(r["tool_use_id"]), quote=True)
+                # Find the tool name from pending tools
+                tool_name = next(
+                    (t["name"] for t in self._pending_frontend_tools if t["tool_use_id"] == r["tool_use_id"]),
+                    "unknown"
+                )
+                tool_name = html.escape(tool_name, quote=True)
+                content_str = r["content"] if isinstance(r["content"], str) else json.dumps(r["content"], default=str)
+                await queue.put(
+                    f'<content-block-tool_result id="{tool_use_id}" name="{tool_name}"><![CDATA[{content_str}]]></content-block-tool_result>'
+                )
+        
+        # Add combined tool results to messages and conversation history
+        tool_result_message = {
+            "role": "user",
+            "content": all_results
+        }
+        self.messages.append(tool_result_message)
+        self.conversation_history.append(tool_result_message)
+        
+        # Log: frontend tools completed
+        self._log_action("frontend_tools_completed", {
+            "frontend_results_count": len(frontend_results),
+            "backend_results_count": len(self._pending_backend_results),
+            "total_results": len(all_results),
+        }, step_number=self._current_step)
+        
+        # Clear pending state
+        self._pending_frontend_tools = []
+        self._pending_backend_results = []
+        self._awaiting_frontend_tools = False
+        
+        # Update token estimate
+        delta_tokens: int = await self._estimate_tokens(
+            messages=[tool_result_message],
+            system=None,
+            tools=None,
+            thinking=None,
+            betas=None,
+            container=None,
+        )
+        self._last_known_input_tokens += delta_tokens
+        
+        # Resume agent loop from current step
+        return await self._resume_run(queue=queue, formatter=formatter)
+    
+    async def _resume_run(
+        self,
+        queue: Optional[asyncio.Queue] = None,
+        formatter: Optional[FormatterType] = None,
+    ) -> AgentResult:
+        """Internal method to resume the agent loop after frontend tool completion.
+        
+        This continues from the current step, streaming responses and handling
+        any subsequent tool calls.
+        """
+        step = self._current_step
+        
+        while step < self.max_steps:
+            step += 1
+            self._current_step = step
+            
+            # Always pass through compactor (it decides whether to compact)
+            if self.compactor:
+                self._apply_compaction(step_number=step)
+            
+            # Prepare request parameters
+            request_params = self._prepare_request_params()
+            
+            # Stream the response with retry logic
+            accumulated_message = await anthropic_stream_with_backoff(
+                client=self.client,
+                request_params=request_params,
+                queue=queue,
+                max_retries=self.max_retries,
+                base_delay=self.base_delay,
+                formatter=formatter if formatter is not None else self.formatter,
+            )
+            
+            # Track token usage from API response
+            input_tokens = accumulated_message.usage.input_tokens
+            output_tokens = accumulated_message.usage.output_tokens
+            self._last_known_input_tokens = input_tokens + output_tokens
+            self._last_known_output_tokens = output_tokens
+            self._token_usage_history.append({
+                "step": step,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cache_creation_input_tokens": accumulated_message.usage.cache_creation_input_tokens,
+                "cache_read_input_tokens": accumulated_message.usage.cache_read_input_tokens,
+            })
+            
+            # Log: API response received
+            self._log_action("api_response_received", {
+                "stop_reason": accumulated_message.stop_reason,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+            }, step_number=step)
+            
+            # Add assistant's response to messages and conversation history
+            assistant_message = accumulated_message.model_dump(
+                mode="json",
+                include=["role", "content"],
+                exclude_unset=True,
+                exclude=getattr(accumulated_message, "__api_exclude__", None),
+                warnings=False
+            )
+            self.messages.append(assistant_message)
+            self.conversation_history.append(assistant_message)
+            logger.debug("Assistant message: %s", assistant_message)
+            if accumulated_message.container is not None:
+                self.container_id = accumulated_message.container.id
+            
+            # Check if there are tool calls to execute
+            if accumulated_message.stop_reason == "tool_use":
+                tool_calls = [
+                    block for block in accumulated_message.content 
+                    if block.type == 'tool_use'
+                ]
+                
+                if tool_calls:
+                    # Separate backend vs frontend tools
+                    backend_tool_calls = [t for t in tool_calls if t.name not in self.frontend_tool_names]
+                    frontend_tool_calls = [t for t in tool_calls if t.name in self.frontend_tool_names]
+                    
+                    # Execute ALL backend tools first
+                    tool_results = []
+                    for tool_call in backend_tool_calls:
+                        is_error = False
+                        result_content = None
+                        try:
+                            result = self.execute_tool_call(tool_call.name, tool_call.input)
+                            if asyncio.iscoroutine(result):
+                                result = await result
+                            result_content = result
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": tool_call.id,
+                                "content": result
+                            })
+                        except Exception as e:
+                            is_error = True
+                            result_content = f"Error executing tool: {str(e)}"
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": tool_call.id,
+                                "content": result_content,
+                                "is_error": True
+                            })
+                        
+                        # Stream tool result to queue
+                        if queue is not None:
+                            tool_use_id = html.escape(str(tool_call.id), quote=True)
+                            tool_name = html.escape(str(tool_call.name), quote=True)
+                            if result_content is None:
+                                content_str = ""
+                            elif isinstance(result_content, str):
+                                content_str = result_content
+                            else:
+                                content_str = json.dumps(result_content, default=str)
+                            await queue.put(
+                                f'<content-block-tool_result id="{tool_use_id}" name="{tool_name}"><![CDATA[{content_str}]]></content-block-tool_result>'
+                            )
+                        
+                        self._log_action("tool_execution", {
+                            "tool_name": tool_call.name,
+                            "tool_use_id": tool_call.id,
+                            "success": not is_error,
+                        }, step_number=step)
+                    
+                    # If frontend tools exist, pause and wait
+                    if frontend_tool_calls:
+                        self._pending_backend_results = tool_results
+                        self._pending_frontend_tools = [
+                            {"tool_use_id": t.id, "name": t.name, "input": t.input}
+                            for t in frontend_tool_calls
+                        ]
+                        self._awaiting_frontend_tools = True
+                        self._current_step = step
+                        
+                        self._log_action("awaiting_frontend_tools", {
+                            "frontend_tools": [t.name for t in frontend_tool_calls],
+                            "backend_results_count": len(tool_results),
+                        }, step_number=step)
+                        
+                        if queue is not None:
+                            tools_json = html.escape(json.dumps(self._pending_frontend_tools), quote=True)
+                            await queue.put(f'<awaiting_frontend_tools data="{tools_json}"></awaiting_frontend_tools>')
+                        
+                        # Persist state to DB before returning (required for re-hydration)
+                        await self._save_agent_config()
+                        
+                        return AgentResult(
+                            final_message=accumulated_message,
+                            final_answer="",
+                            conversation_history=self.conversation_history.copy(),
+                            stop_reason="awaiting_frontend_tools",
+                            model=accumulated_message.model,
+                            usage=accumulated_message.usage,
+                            container_id=self.container_id,
+                            total_steps=step,
+                            agent_logs=self.agent_logs.copy(),
+                            generated_files=None
+                        )
+                    
+                    # No frontend tools - add results and continue
+                    tool_result_message = {
+                        "role": "user",
+                        "content": tool_results
+                    }
+                    self.messages.append(tool_result_message)
+                    self.conversation_history.append(tool_result_message)
+                    
+                    delta_tokens = await self._estimate_tokens(
+                        messages=[tool_result_message],
+                        system=None,
+                        tools=None,
+                        thinking=None,
+                        betas=None,
+                        container=None,
+                    )
+                    self._last_known_input_tokens += delta_tokens
+                    continue
+            
+            # If stop_reason is not "tool_use", validate final answer format
+            if accumulated_message.stop_reason != "tool_use":
+                if self.final_answer_check:
+                    extracted_final_answer = self._extract_final_answer(accumulated_message)
+                    success, error_message = self.final_answer_check(extracted_final_answer)
+                    if not success:
+                        self.agent_logs.append({
+                            "timestamp": datetime.now().isoformat(),
+                            "action": "final_answer_validation_failed",
+                            "details": {"error": error_message, "step": step}
+                        })
+                        logger.warning(f"Final answer validation failed at step {step}: {error_message}")
+                        
+                        error_user_message = {
+                            "role": "user",
+                            "content": [{
+                                "type": "text",
+                                "text": error_message
+                            }]
+                        }
+                        self.messages.append(error_user_message)
+                        self.conversation_history.append(error_user_message)
+                        continue
+                
+            # Update memory store
+            if self.memory_store:
+                memory_metadata = self.memory_store.update(
+                    messages=self.messages,
+                    conversation_history=self.conversation_history,
+                    tools=self.tool_schemas,
+                    model=self.model
+                )
+                self.agent_logs.append({
+                    "timestamp": datetime.now().isoformat(),
+                    "action": "memory_update",
+                    "details": memory_metadata
+                })
+                logger.info(f"Memory updated: {memory_metadata}")
+
+            # Build AgentResult
+            result = AgentResult(
+                final_message=accumulated_message,
+                final_answer=self._extract_final_answer(accumulated_message),
+                conversation_history=self.conversation_history.copy(),
+                stop_reason=accumulated_message.stop_reason,
+                model=accumulated_message.model,
+                usage=accumulated_message.usage,
+                container_id=self.container_id,
+                total_steps=step,
+                agent_logs=self.agent_logs.copy(),
+                generated_files=None
+            )
+            
+            self._log_action("run_completed", {
+                "stop_reason": accumulated_message.stop_reason,
+                "total_steps": step,
+                "total_input_tokens": accumulated_message.usage.input_tokens,
+                "total_output_tokens": accumulated_message.usage.output_tokens,
+            }, step_number=step)
+
+            # Finalize file processing
+            await self._finalize_file_processing(queue)
+            all_files_metadata: list[dict[str, Any]] = list(self.file_registry.values())
+            result.generated_files = all_files_metadata
+            self._save_run_data_async(result, all_files_metadata)
+            
+            return result
+
+        # Max steps reached
+        logger.warning(f"Max steps ({self.max_steps}) reached in _resume_run")
+        return await self._generate_final_summary(queue=queue, formatter=formatter)
     
     def _apply_compaction(self, step_number: int = 0) -> None:
         """Apply compaction to self.messages and log the event.
@@ -1382,13 +1833,31 @@ class AnthropicAgent:
         """Synchronously load agent configuration from database.
         
         Called during __init__ if agent_uuid is provided.
+        Handles both sync contexts and async contexts (when called from within an event loop).
         
         Returns:
             Configuration dict loaded from the backend, or {} if not found or on error.
         """
         try:
-            # Use asyncio.run since we're in __init__ (sync context)
-            config = asyncio.run(self.db_backend.load_agent_config(self.agent_uuid))
+            # Check if we're inside an existing event loop
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            
+            if loop is not None:
+                # We're inside an async context - create a task in the current loop
+                # Use a thread to run the async operation synchronously
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(
+                        asyncio.run,
+                        self.db_backend.load_agent_config(self.agent_uuid)
+                    )
+                    config = future.result()
+            else:
+                # We're in a sync context - use asyncio.run directly
+                config = asyncio.run(self.db_backend.load_agent_config(self.agent_uuid))
             
             if config is None:
                 # New agent - will be created on first run
@@ -1477,6 +1946,16 @@ class AnthropicAgent:
             "api_kwargs": self.api_kwargs,
             "last_known_input_tokens": self._last_known_input_tokens,
             "last_known_output_tokens": self._last_known_output_tokens,
+            # Frontend tool relay state (for resume after browser execution)
+            "pending_frontend_tools": self._pending_frontend_tools,
+            "pending_backend_results": self._pending_backend_results,
+            "awaiting_frontend_tools": self._awaiting_frontend_tools,
+            "current_step": self._current_step,
+            # NOTE: This conversation_history is the per-run history used to populate AgentResult.
+            # When frontend tools cause a pause, this preserves the current run's history so it
+            # can be returned in the AgentResult after continuation. This is distinct from the
+            # conversation_history TABLE which stores completed runs across multiple user turns.
+            "conversation_history": getattr(self, "conversation_history", []),
             # Preserve created_at from existing config, or set to now (as datetime)
             "created_at": (
                 datetime.fromisoformat(existing_config["created_at"].replace("Z", "+00:00"))
@@ -1484,7 +1963,7 @@ class AnthropicAgent:
                 else (existing_config.get("created_at") or datetime.now())
             ),
             "updated_at": datetime.now(),
-            "last_run_at": self._run_start_time if self._run_start_time else None,
+            "last_run_at": getattr(self, "_run_start_time", None),
             # Increment total_runs counter
             "total_runs": existing_config.get("total_runs", 0) + 1,
         }

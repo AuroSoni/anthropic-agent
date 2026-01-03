@@ -3,6 +3,8 @@ import {
   type AgentNode,
   type AnthropicEvent,
   type StreamFormat,
+  type PendingFrontendTool,
+  type FrontendToolResult,
   AnthropicStreamParser,
   XmlStreamParser,
   parseMetaInit,
@@ -10,20 +12,21 @@ import {
 } from './parsers';
 
 export interface AgentState {
-  status: 'idle' | 'streaming' | 'complete' | 'error';
+  status: 'idle' | 'streaming' | 'complete' | 'error' | 'awaiting_tools';
   nodes: AgentNode[];
   metadata?: AgentMetadata;
   completion?: AgentCompletion;
   error?: string;
   rawContent: string; // Kept for debugging/inspection
   streamFormat?: StreamFormat; // Format detected from meta_init
+  pendingFrontendTools?: PendingFrontendTool[]; // Frontend tools waiting for browser execution
 }
 
 export interface AgentMetadata {
   agent_uuid: string;
   model: string;
   user_query?: string;
-  message_history?: any[];
+  message_history?: unknown[];
 }
 
 export interface AgentCompletion {
@@ -39,7 +42,7 @@ export interface AgentCompletion {
 /**
  * Available agent types matching the backend configuration.
  */
-export type AgentType = 'agent_no_tools' | 'agent_client_tools' | 'agent_all_raw' | 'agent_all_xml';
+export type AgentType = 'agent_no_tools' | 'agent_client_tools' | 'agent_all_raw' | 'agent_all_xml' | 'agent_frontend_tools';
 
 /**
  * User prompt can be a simple string or a complex JSON structure (array or object)
@@ -52,6 +55,7 @@ export const AGENT_TYPES: { value: AgentType; label: string; description: string
   { value: 'agent_client_tools', label: 'Client Tools', description: 'With client-side tools only' },
   { value: 'agent_all_raw', label: 'All Tools (Raw)', description: 'All tools with raw JSON streaming' },
   { value: 'agent_all_xml', label: 'All Tools (XML)', description: 'All tools with XML streaming' },
+  { value: 'agent_frontend_tools', label: 'Frontend Tools', description: 'With browser-executed tools (user_confirm)' },
 ];
 
 export interface AgentConfig {
@@ -123,6 +127,21 @@ export async function streamAgent(
     
     // Update nodes from parser state (aggressive real-time updates)
     currentState.nodes = parser.getNodes();
+    
+    // Check for awaiting_frontend_tools tag (frontend tool relay)
+    const awaitingNode = currentState.nodes.find(
+      n => n.type === 'element' && n.tagName === 'awaiting_frontend_tools'
+    );
+    if (awaitingNode?.attributes?.data) {
+      try {
+        const toolsData = JSON.parse(awaitingNode.attributes.data) as PendingFrontendTool[];
+        currentState.status = 'awaiting_tools';
+        currentState.pendingFrontendTools = toolsData;
+      } catch (e) {
+        console.warn('Failed to parse awaiting_frontend_tools data:', e);
+      }
+    }
+    
     currentState = { ...currentState }; // Trigger update
     callbacks.onUpdate(currentState);
   }
@@ -229,13 +248,144 @@ export async function streamAgent(
       },
     });
 
-  } catch (error: any) {
+  } catch (error: unknown) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
     currentState = {
       ...currentState,
       status: 'error',
-      error: error.message,
+      error: errorMessage,
     };
     callbacks.onUpdate(currentState);
-    if (callbacks.onError) callbacks.onError(error.message);
+    if (callbacks.onError) callbacks.onError(errorMessage);
   }
 }
+
+/**
+ * Submit frontend tool results and continue streaming the agent response.
+ * Called after user interacts with frontend tools (e.g., confirms dialog).
+ */
+export async function streamToolResults(
+  agentUuid: string,
+  toolResults: FrontendToolResult[],
+  callbacks: AgentStreamCallbacks,
+  existingState: AgentState
+) {
+  // Continue from existing state, but switch back to streaming
+  let currentState: AgentState = {
+    ...existingState,
+    status: 'streaming',
+    pendingFrontendTools: undefined,
+  };
+  
+  callbacks.onUpdate(currentState);
+  
+  // Parser for continuation stream - reuse format from existing state
+  let parser: StreamParser | null = null;
+  const streamFormat = existingState.streamFormat || 'xml';
+  
+  if (streamFormat === 'raw') {
+    parser = new AnthropicStreamParser();
+  } else {
+    parser = new XmlStreamParser();
+  }
+
+  /**
+   * Process content for continuation stream.
+   */
+  function processContent(content: string) {
+    if (!parser || !content.trim()) return;
+    
+    currentState.rawContent += content;
+
+    if (streamFormat === 'raw') {
+      const unescaped = content.replace(/\\\\/g, '\\');
+      try {
+        const anthropicEvent = JSON.parse(unescaped) as AnthropicEvent;
+        (parser as AnthropicStreamParser).processEvent(anthropicEvent);
+      } catch (e) {
+        console.warn('Failed to parse Anthropic event JSON:', unescaped.slice(0, 100), e);
+      }
+    } else {
+      (parser as XmlStreamParser).appendChunk(content);
+    }
+    
+    // Merge new nodes with existing nodes
+    const newNodes = parser.getNodes();
+    currentState.nodes = [...existingState.nodes, ...newNodes];
+    
+    // Check for another awaiting_frontend_tools (nested tool calls)
+    const awaitingNode = newNodes.find(
+      n => n.type === 'element' && n.tagName === 'awaiting_frontend_tools'
+    );
+    if (awaitingNode?.attributes?.data) {
+      try {
+        const toolsData = JSON.parse(awaitingNode.attributes.data) as PendingFrontendTool[];
+        currentState.status = 'awaiting_tools';
+        currentState.pendingFrontendTools = toolsData;
+      } catch (e) {
+        console.warn('Failed to parse awaiting_frontend_tools data:', e);
+      }
+    }
+    
+    currentState = { ...currentState };
+    callbacks.onUpdate(currentState);
+  }
+
+  try {
+    await fetchEventSource('http://localhost:8000/agent/tool_results', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        agent_uuid: agentUuid,
+        tool_results: toolResults,
+      }),
+
+      onopen: async (response) => {
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+      },
+
+      onmessage: (ev) => {
+        const dataStr = ev.data;
+        
+        if (dataStr === '[DONE]') {
+          if (currentState.status === 'streaming') {
+            currentState = { ...currentState, status: 'complete' };
+            callbacks.onUpdate(currentState);
+          }
+          return;
+        }
+
+        processContent(dataStr);
+      },
+
+      onclose: () => {
+        if (currentState.status === 'streaming') {
+          currentState = { ...currentState, status: 'complete' };
+          callbacks.onUpdate(currentState);
+        }
+        if (callbacks.onComplete) {
+          callbacks.onComplete(currentState);
+        }
+      },
+
+      onerror: (err) => {
+        throw err;
+      },
+    });
+
+  } catch (error: unknown) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    currentState = {
+      ...currentState,
+      status: 'error',
+      error: errorMessage,
+    };
+    callbacks.onUpdate(currentState);
+    if (callbacks.onError) callbacks.onError(errorMessage);
+  }
+}
+
+// Re-export types for convenience
+export type { PendingFrontendTool, FrontendToolResult };
