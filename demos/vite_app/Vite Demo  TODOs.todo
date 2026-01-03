@@ -9,7 +9,7 @@ Main Issues to Address:
 
 Future Improvements:
     ☐ Allow PDF/Image/Container uploads.
-    ☐ Allow complex content block prompts.
+    ✔ Allow complex content block prompts. @done(26-01-01 19:35)
     ☐ Allow custom rendering of embedded tags like <chart> and <table>.
     ☐ Allow Creation of Threads.
     ☐ Explore general UI improvements.
