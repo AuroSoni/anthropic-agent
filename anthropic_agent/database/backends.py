@@ -404,11 +404,13 @@ class SQLBackend:
                 stream_meta_history_and_tool_results, compactor_type,
                 memory_store_type, file_registry, max_retries, base_delay,
                 last_known_input_tokens, last_known_output_tokens,
-                created_at, updated_at, last_run_at, total_runs
+                created_at, updated_at, last_run_at, total_runs,
+                pending_frontend_tools, pending_backend_results,
+                awaiting_frontend_tools, current_step, conversation_history
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                 $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-                $21, $22, $23, $24, $25, $26
+                $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31
             )
             ON CONFLICT (agent_uuid) DO UPDATE SET
                 system_prompt = EXCLUDED.system_prompt,
@@ -434,7 +436,12 @@ class SQLBackend:
                 last_known_output_tokens = EXCLUDED.last_known_output_tokens,
                 updated_at = EXCLUDED.updated_at,
                 last_run_at = EXCLUDED.last_run_at,
-                total_runs = EXCLUDED.total_runs
+                total_runs = EXCLUDED.total_runs,
+                pending_frontend_tools = EXCLUDED.pending_frontend_tools,
+                pending_backend_results = EXCLUDED.pending_backend_results,
+                awaiting_frontend_tools = EXCLUDED.awaiting_frontend_tools,
+                current_step = EXCLUDED.current_step,
+                conversation_history = EXCLUDED.conversation_history
         """
         
         async with pool.acquire() as conn:
@@ -466,6 +473,12 @@ class SQLBackend:
                 self._to_datetime(config.get("updated_at")),
                 self._to_datetime(config.get("last_run_at")),
                 config.get("total_runs"),
+                # Frontend tool relay state
+                self._to_jsonb(config.get("pending_frontend_tools", [])),
+                self._to_jsonb(config.get("pending_backend_results", [])),
+                config.get("awaiting_frontend_tools", False),
+                config.get("current_step", 0),
+                self._to_jsonb(config.get("conversation_history", [])),
             )
         
         logger.debug(f"Saved agent config for {config.get('agent_uuid')}")
@@ -489,7 +502,9 @@ class SQLBackend:
                 stream_meta_history_and_tool_results, compactor_type,
                 memory_store_type, file_registry, max_retries, base_delay,
                 last_known_input_tokens, last_known_output_tokens,
-                created_at, updated_at, last_run_at, total_runs
+                created_at, updated_at, last_run_at, total_runs,
+                pending_frontend_tools, pending_backend_results,
+                awaiting_frontend_tools, current_step, conversation_history
             FROM agent_config
             WHERE agent_uuid = $1
         """
@@ -528,6 +543,12 @@ class SQLBackend:
             "updated_at": self._parse_datetime(row["updated_at"]),
             "last_run_at": self._parse_datetime(row["last_run_at"]),
             "total_runs": row["total_runs"],
+            # Frontend tool relay state
+            "pending_frontend_tools": self._from_jsonb(row["pending_frontend_tools"]) or [],
+            "pending_backend_results": self._from_jsonb(row["pending_backend_results"]) or [],
+            "awaiting_frontend_tools": row["awaiting_frontend_tools"] or False,
+            "current_step": row["current_step"] or 0,
+            "conversation_history": self._from_jsonb(row["conversation_history"]) or [],
         }
         
         logger.debug(f"Loaded agent config for {agent_uuid}")
