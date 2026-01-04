@@ -62,6 +62,7 @@ class DatabaseManager:
                 self._connection_string,
                 min_size=self._min_pool_size,
                 max_size=self._max_pool_size,
+                server_settings={'timezone': 'Asia/Kolkata'}
             )
         return self._pool
     

@@ -1,4 +1,4 @@
-import { useState, type FormEvent, type KeyboardEvent } from 'react';
+import { useState, useEffect, useRef, type FormEvent, type KeyboardEvent } from 'react';
 import { useConversation } from '@/hooks/use-conversation';
 import { ChatThread } from '@/components/chat';
 import { Button } from '@/components/ui/button';
@@ -16,11 +16,16 @@ import type { PendingFrontendTool } from '@/lib/parsers/types';
 
 type PromptFormat = 'text' | 'json';
 
+interface AgentViewerProps {
+  /** Callback fired when streaming completes (for sidebar refresh) */
+  onStreamComplete?: () => void;
+}
+
 /**
  * AgentViewer is the main chat interface container.
  * Displays a conversation thread with user/assistant messages and handles input.
  */
-export function AgentViewer() {
+export function AgentViewer({ onStreamComplete }: AgentViewerProps) {
   const {
     turns,
     hasMore,
@@ -41,6 +46,17 @@ export function AgentViewer() {
   const [agentType, setAgentType] = useState<AgentType>('agent_frontend_tools');
   const [promptFormat, setPromptFormat] = useState<PromptFormat>('text');
   const [promptError, setPromptError] = useState<string | null>(null);
+
+  // Track previous streaming state to detect completion
+  const wasStreamingRef = useRef(false);
+
+  // Notify parent when streaming completes (for sidebar refresh)
+  useEffect(() => {
+    if (wasStreamingRef.current && !isStreaming) {
+      onStreamComplete?.();
+    }
+    wasStreamingRef.current = isStreaming;
+  }, [isStreaming, onStreamComplete]);
 
   /**
    * Handle frontend tool response from user interaction.
