@@ -133,6 +133,23 @@ class DatabaseBackend(Protocol):
             True if updated successfully, False if agent not found
         """
         ...
+    
+    async def list_agent_sessions(
+        self,
+        limit: int = 50,
+        offset: int = 0
+    ) -> tuple[list[dict], int]:
+        """List all agent sessions with metadata.
+        
+        Args:
+            limit: Maximum number of sessions to return
+            offset: Number of sessions to skip
+            
+        Returns:
+            Tuple of (sessions list, total count) where each session has:
+            {agent_uuid, title, created_at, updated_at, total_runs}
+        """
+        ...
 
 
 class FilesystemBackend:
@@ -210,6 +227,56 @@ class FilesystemBackend:
         await self.save_agent_config(config)
         logger.debug(f"Updated title for {agent_uuid}: {title}")
         return True
+    
+    async def list_agent_sessions(
+        self,
+        limit: int = 50,
+        offset: int = 0
+    ) -> tuple[list[dict], int]:
+        """List all agent sessions with metadata."""
+        config_dir = self.base_path / "agent_config"
+        
+        if not config_dir.exists():
+            return [], 0
+        
+        # Get all config files and their metadata
+        sessions: list[dict] = []
+        config_files = list(config_dir.glob("*.json"))
+        
+        for config_file in config_files:
+            if config_file.name.endswith(".tmp"):
+                continue
+            
+            try:
+                with open(config_file, "r") as f:
+                    config = json.load(f)
+                
+                # Use file modification time as fallback for updated_at
+                file_mtime = datetime.fromtimestamp(config_file.stat().st_mtime)
+                
+                sessions.append({
+                    "agent_uuid": config.get("agent_uuid", config_file.stem),
+                    "title": config.get("title"),
+                    "created_at": config.get("created_at"),
+                    "updated_at": config.get("updated_at") or file_mtime.isoformat(),
+                    "total_runs": config.get("total_runs", 0),
+                })
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(f"Failed to load config file {config_file}: {e}")
+                continue
+        
+        # Sort by updated_at descending (newest first)
+        sessions.sort(
+            key=lambda x: x.get("updated_at") or "",
+            reverse=True
+        )
+        
+        total = len(sessions)
+        # Apply pagination
+        sessions = sessions[offset:offset + limit]
+        
+        logger.debug(f"Listed {len(sessions)} agent sessions (total: {total})")
+        return sessions, total
     
     async def save_conversation_history(self, conversation: dict) -> None:
         """Save conversation history entry with automatic sequence numbering."""
@@ -676,6 +743,46 @@ class SQLBackend:
         
         logger.debug(f"Updated title for {agent_uuid}: {title}")
         return True
+    
+    async def list_agent_sessions(
+        self,
+        limit: int = 50,
+        offset: int = 0
+    ) -> tuple[list[dict], int]:
+        """List all agent sessions with metadata."""
+        pool = await self._get_pool()
+        
+        # Get total count
+        count_query = "SELECT COUNT(*) FROM agent_config"
+        
+        # Get sessions with pagination
+        list_query = """
+            SELECT 
+                agent_uuid, title, created_at, updated_at, total_runs
+            FROM agent_config
+            ORDER BY updated_at DESC NULLS LAST
+            LIMIT $1 OFFSET $2
+        """
+        
+        async with pool.acquire() as conn:
+            total_row = await conn.fetchrow(count_query)
+            total = total_row[0] if total_row else 0
+            
+            rows = await conn.fetch(list_query, limit, offset)
+        
+        sessions = [
+            {
+                "agent_uuid": str(row["agent_uuid"]),
+                "title": row["title"],
+                "created_at": self._parse_datetime(row["created_at"]),
+                "updated_at": self._parse_datetime(row["updated_at"]),
+                "total_runs": row["total_runs"] or 0,
+            }
+            for row in rows
+        ]
+        
+        logger.debug(f"Listed {len(sessions)} agent sessions (total: {total})")
+        return sessions, total
     
     async def save_conversation_history(self, conversation: dict) -> None:
         """Save conversation history entry.

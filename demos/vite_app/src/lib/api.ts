@@ -46,6 +46,25 @@ export interface GenerateTitleResponse {
 }
 
 /**
+ * A single agent session from the sessions list API.
+ */
+export interface AgentSession {
+  agent_uuid: string;
+  title: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  total_runs: number;
+}
+
+/**
+ * Response from the agent sessions list endpoint.
+ */
+export interface AgentSessionListResponse {
+  sessions: AgentSession[];
+  total: number;
+}
+
+/**
  * Fetch conversation history for an agent with cursor-based pagination.
  * 
  * @param agentUuid - The agent's UUID
@@ -112,3 +131,31 @@ export async function generateConversationTitle(
   return data.title;
 }
 
+/**
+ * Fetch all agent sessions with pagination.
+ * 
+ * @param limit - Maximum number of sessions to return (default 50, max 100)
+ * @param offset - Number of sessions to skip for pagination
+ * @param agentType - Agent type to determine database backend (default 'agent_frontend_tools')
+ * @returns List of sessions and total count
+ */
+export async function fetchAgentSessions(
+  limit: number = 50,
+  offset: number = 0,
+  agentType: string = 'agent_frontend_tools'
+): Promise<AgentSessionListResponse> {
+  const params = new URLSearchParams();
+  params.set('limit', String(limit));
+  params.set('offset', String(offset));
+  params.set('agent_type', agentType);
+
+  const url = `${API_BASE}/agent/sessions?${params.toString()}`;
+  
+  const response = await fetch(url);
+  
+  if (!response.ok) {
+    throw new Error(`Failed to fetch agent sessions: ${response.status} ${response.statusText}`);
+  }
+  
+  return response.json();
+}

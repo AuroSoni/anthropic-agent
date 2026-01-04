@@ -15,7 +15,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from anthropic_agent.core import AnthropicAgent
-from anthropic_agent.database import SQLBackend, FilesystemBackend
+from anthropic_agent.database import SQLBackend
 from anthropic_agent.file_backends import S3Backend
 from anthropic_agent.tools import SAMPLE_TOOL_FUNCTIONS, tool
 
@@ -151,6 +151,21 @@ class GenerateTitleResponse(BaseModel):
     title: str
 
 
+class AgentSessionItem(BaseModel):
+    """A single agent session in the list."""
+    agent_uuid: str
+    title: str | None
+    created_at: str | None
+    updated_at: str | None
+    total_runs: int
+
+
+class AgentSessionListResponse(BaseModel):
+    """Response for paginated agent sessions list."""
+    sessions: list[AgentSessionItem]
+    total: int
+
+
 ########################################################
 # AGENT CONFIGURATIONS
 ########################################################
@@ -276,8 +291,6 @@ agent_all_xml = AgentConfig(
 )
 
 # Agent with frontend tools (for browser-executed tools like user_confirm)
-# NOTE: Uses FilesystemBackend to avoid asyncpg event loop conflicts when re-hydrating
-# from the /agent/tool_results endpoint (asyncpg connections are bound to specific event loops)
 agent_frontend_tools = AgentConfig(
     system_prompt="""You are a helpful assistant that should help the user with their questions.
 When performing calculations that result in significant values (over 50), or when taking 
@@ -288,7 +301,7 @@ any action that could have consequences, ask for user confirmation using the use
     tools=SAMPLE_TOOL_FUNCTIONS,
     frontend_tools=FRONTEND_TOOL_FUNCTIONS,  # Include frontend tools
     file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
-    db_backend=FilesystemBackend(base_path="./agent_data"),  # Use filesystem to avoid asyncpg issues
+    db_backend=SQLBackend(connection_string=os.getenv("DATABASE_URL")),
     formatter="xml",  # XML formatter for proper tag streaming
 )
 
@@ -303,7 +316,7 @@ any action that could have consequences, ask for user confirmation using the use
     tools=SAMPLE_TOOL_FUNCTIONS,
     frontend_tools=FRONTEND_TOOL_FUNCTIONS,
     file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
-    db_backend=FilesystemBackend(base_path="./agent_data"),
+    db_backend=SQLBackend(connection_string=os.getenv("DATABASE_URL")),
     formatter="raw",  # Raw JSON format for testing
 )
 
@@ -643,6 +656,52 @@ async def upload_files(
                 )
     
     return UploadResponse(files=uploaded_files)
+
+
+@router.get("/sessions")
+async def list_sessions(
+    limit: int = Query(default=50, le=100, description="Maximum number of sessions to return"),
+    offset: int = Query(default=0, ge=0, description="Number of sessions to skip"),
+    agent_type: AgentType = Query(default="agent_frontend_tools", description="Agent type to determine database backend"),
+) -> AgentSessionListResponse:
+    """List all agent sessions with metadata.
+    
+    Returns sessions sorted by updated_at descending (newest first).
+    Supports offset-based pagination.
+    
+    Args:
+        limit: Maximum number of sessions to return (max 100)
+        offset: Number of sessions to skip
+        agent_type: Agent type to determine which database backend to query
+        
+    Returns:
+        AgentSessionListResponse with list of sessions and total count
+    """
+    # Get the database backend from the agent config
+    config = AGENT_CONFIGS.get(agent_type)
+    if not config or not config.db_backend:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Agent type '{agent_type}' does not have a database backend configured"
+        )
+    
+    db_backend = config.db_backend
+    
+    sessions, total = await db_backend.list_agent_sessions(limit=limit, offset=offset)
+    
+    return AgentSessionListResponse(
+        sessions=[
+            AgentSessionItem(
+                agent_uuid=s["agent_uuid"],
+                title=s.get("title"),
+                created_at=s.get("created_at"),
+                updated_at=s.get("updated_at"),
+                total_runs=s.get("total_runs", 0),
+            )
+            for s in sessions
+        ],
+        total=total,
+    )
 
 
 @router.get("/{agent_uuid}/conversations")
