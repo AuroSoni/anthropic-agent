@@ -61,6 +61,9 @@ CREATE TABLE agent_config (
     -- conversation_history TABLE (Table 2) which stores completed runs across user turns.
     conversation_history JSONB DEFAULT '[]',  -- Preserved for frontend tool resume only
     
+    -- UI metadata
+    title VARCHAR(255),  -- Auto-generated conversation title
+    
     -- Metadata
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW(),
@@ -159,6 +162,9 @@ CREATE INDEX idx_agent_config_last_run ON agent_config(last_run_at DESC);
   # can be returned in the AgentResult after continuation. This is distinct from the
   # conversation_history TABLE (Table 2) which stores completed runs across user turns.
   "conversation_history": [],  # Preserved only when awaiting_frontend_tools=true
+  
+  # UI metadata
+  "title": "Python Function for List Sorting",  # Auto-generated conversation title (nullable)
   
   # Metadata
   "created_at": "2025-11-25T10:00:00Z",

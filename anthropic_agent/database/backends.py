@@ -121,6 +121,18 @@ class DatabaseBackend(Protocol):
             List of log entries in chronological order
         """
         ...
+    
+    async def update_agent_title(self, agent_uuid: str, title: str) -> bool:
+        """Update the title for an agent session.
+        
+        Args:
+            agent_uuid: Agent session UUID
+            title: New title for the conversation
+            
+        Returns:
+            True if updated successfully, False if agent not found
+        """
+        ...
 
 
 class FilesystemBackend:
@@ -187,6 +199,17 @@ class FilesystemBackend:
         
         logger.debug(f"Loaded agent config for {agent_uuid}")
         return config
+    
+    async def update_agent_title(self, agent_uuid: str, title: str) -> bool:
+        """Update the title for an agent session."""
+        config = await self.load_agent_config(agent_uuid)
+        if config is None:
+            return False
+        
+        config["title"] = title
+        await self.save_agent_config(config)
+        logger.debug(f"Updated title for {agent_uuid}: {title}")
+        return True
     
     async def save_conversation_history(self, conversation: dict) -> None:
         """Save conversation history entry with automatic sequence numbering."""
@@ -573,7 +596,8 @@ class SQLBackend:
                 last_known_input_tokens, last_known_output_tokens,
                 created_at, updated_at, last_run_at, total_runs,
                 pending_frontend_tools, pending_backend_results,
-                awaiting_frontend_tools, current_step, conversation_history
+                awaiting_frontend_tools, current_step, conversation_history,
+                title
             FROM agent_config
             WHERE agent_uuid = $1
         """
@@ -618,10 +642,40 @@ class SQLBackend:
             "awaiting_frontend_tools": row["awaiting_frontend_tools"] or False,
             "current_step": row["current_step"] or 0,
             "conversation_history": self._from_jsonb(row["conversation_history"]) or [],
+            # Title for conversation display
+            "title": row["title"],
         }
         
         logger.debug(f"Loaded agent config for {agent_uuid}")
         return config
+    
+    async def update_agent_title(self, agent_uuid: str, title: str) -> bool:
+        """Update the title for an agent session.
+        
+        Args:
+            agent_uuid: Agent session UUID
+            title: New title for the conversation
+            
+        Returns:
+            True if updated successfully, False if agent not found
+        """
+        pool = await self._get_pool()
+        
+        query = """
+            UPDATE agent_config
+            SET title = $2, updated_at = NOW()
+            WHERE agent_uuid = $1
+            RETURNING agent_uuid
+        """
+        
+        async with pool.acquire() as conn:
+            result = await conn.fetchrow(query, agent_uuid, title)
+        
+        if result is None:
+            return False
+        
+        logger.debug(f"Updated title for {agent_uuid}: {title}")
+        return True
     
     async def save_conversation_history(self, conversation: dict) -> None:
         """Save conversation history entry.

@@ -30,6 +30,7 @@ export function AgentViewer() {
     pendingFrontendTools,
     error,
     agentUuid,
+    title,
     sendMessage,
     submitToolResults,
     loadMore,
@@ -108,11 +109,11 @@ export function AgentViewer() {
       <header className="flex items-center justify-between border-b border-zinc-200 bg-white px-4 py-3 dark:border-zinc-800 dark:bg-zinc-950">
         <div>
           <h1 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">
-            Agent Chat
+            {title || 'New Chat'}
           </h1>
           {agentUuid && (
             <p className="text-xs text-zinc-500 dark:text-zinc-400">
-              Session: {agentUuid.slice(0, 8)}...
+              {agentUuid.slice(0, 8)}...
             </p>
           )}
         </div>

@@ -7,7 +7,7 @@ import {
   type UserPrompt,
   type FrontendToolResult,
 } from '../lib/agent-stream';
-import { fetchConversationHistory } from '../lib/api';
+import { fetchConversationHistory, generateConversationTitle } from '../lib/api';
 import { useAgentUrlState } from './use-url-state';
 import { convertMessagesToNodes } from '../lib/message-converter';
 import type { AgentNode } from '../lib/parsers/types';
@@ -40,6 +40,8 @@ export interface ConversationState {
   isAwaitingTools: boolean;
   error?: string;
   pendingFrontendTools?: AgentState['pendingFrontendTools'];
+  title?: string;
+  isGeneratingTitle: boolean;
 }
 
 /**
@@ -54,6 +56,7 @@ export function useConversation() {
     isLoadingHistory: false,
     isStreaming: false,
     isAwaitingTools: false,
+    isGeneratingTitle: false,
   });
 
   // Track the current streaming state for the active turn
@@ -109,6 +112,8 @@ export function useConversation() {
           : turnsInDisplayOrder,
         hasMore: response.has_more,
         isLoadingHistory: false,
+        // Set title from response (only on initial load)
+        title: before === undefined ? (response.title ?? prev.title) : prev.title,
       }));
     } catch (error) {
       console.error('Failed to load conversation history:', error);
@@ -172,6 +177,21 @@ export function useConversation() {
         // Update the agent UUID from metadata if this is a new conversation
         if (streamState.metadata?.agent_uuid && !agentUuid) {
           setAgentUuid(streamState.metadata.agent_uuid);
+          
+          // Generate title for new conversation (parallel to streaming)
+          setState(prev => ({ ...prev, isGeneratingTitle: true }));
+          generateConversationTitle(
+            streamState.metadata.agent_uuid,
+            userMessageText,
+            config?.agent_type ?? 'agent_frontend_tools'
+          )
+            .then(title => {
+              setState(prev => ({ ...prev, title, isGeneratingTitle: false }));
+            })
+            .catch(error => {
+              console.error('Failed to generate title:', error);
+              setState(prev => ({ ...prev, isGeneratingTitle: false }));
+            });
         }
         
         // Update the streaming turn with live state
@@ -204,6 +224,8 @@ export function useConversation() {
                 ? {
                     ...turn,
                     isStreaming: false,
+                    streamingState: undefined, // Clear to prevent stale state matching
+                    nodes: streamState.nodes, // Preserve nodes for rich rendering
                     assistantResponse: extractFinalResponse(streamState),
                     usage: streamState.completion?.usage,
                     totalSteps: streamState.completion?.total_steps,
@@ -253,9 +275,9 @@ export function useConversation() {
         onUpdate: (streamState) => {
           currentStreamingStateRef.current = streamState;
           
-          // Update the current streaming turn
+          // Update the current streaming turn (use findLastIndex to get the most recent turn)
           setState(prev => {
-            const currentTurnIndex = prev.turns.findIndex(t => t.isStreaming || t.streamingState);
+            const currentTurnIndex = prev.turns.findLastIndex(t => t.isStreaming || t.streamingState);
             if (currentTurnIndex === -1) return prev;
             
             const updatedTurns = [...prev.turns];
@@ -276,13 +298,15 @@ export function useConversation() {
           
           if (streamState.status === 'complete' || streamState.status === 'error') {
             setState(prev => {
-              const currentTurnIndex = prev.turns.findIndex(t => t.streamingState);
+              const currentTurnIndex = prev.turns.findLastIndex(t => t.streamingState);
               if (currentTurnIndex === -1) return prev;
               
               const updatedTurns = [...prev.turns];
               updatedTurns[currentTurnIndex] = {
                 ...updatedTurns[currentTurnIndex],
                 isStreaming: false,
+                streamingState: undefined, // Clear to prevent stale state matching
+                nodes: streamState.nodes, // Preserve nodes for rich rendering
                 assistantResponse: extractFinalResponse(streamState),
                 usage: streamState.completion?.usage,
                 totalSteps: streamState.completion?.total_steps,
@@ -322,6 +346,8 @@ export function useConversation() {
       isLoadingHistory: false,
       isStreaming: false,
       isAwaitingTools: false,
+      title: undefined,
+      isGeneratingTitle: false,
     });
   }, [setAgentUuid]);
 
