@@ -132,6 +132,9 @@ class AnthropicAgent:
         else:
             self.db_backend = db_backend
         
+        # Initialization state - tracks whether state has been loaded from DB
+        # Use initialize() to load state, or run() will call it automatically
+        self._initialized = False
         
         #################################################################### 
         # Non serializable params that are not loaded from database.
@@ -173,16 +176,13 @@ class AnthropicAgent:
                         f"Frontend tool '{fn.__name__}' must be decorated with @tool(executor='frontend')"
                     )
 
-        # Load persisted configuration if agent_uuid provided
+        # Agent UUID for session tracking
+        # If agent_uuid provided, state will be loaded from DB via initialize() 
+        # (called automatically in run() or explicitly by caller)
+        self.agent_uuid = agent_uuid or str(uuid.uuid4())
+        
+        # db_config is empty at construction - state is loaded asynchronously via initialize()
         db_config: dict[str, Any] = {}
-        if agent_uuid:
-            self.agent_uuid = agent_uuid
-            if not self.db_backend:
-                raise ValueError("Database backend is required to load state from database")
-            db_config = self._load_state_from_db()
-        else:
-            # Agent UUID for session tracking
-            self.agent_uuid = agent_uuid or str(uuid.uuid4())
         
         #################################################################### 
         # Resolve core configuration and state from (constructor args, DB, defaults)
@@ -227,41 +227,22 @@ class AnthropicAgent:
             else db_config.get("server_tools", [])
         )
         
-        # Messages and container_id are strictly from DB for resumed agents,
-        # and from constructor for new agents.
-        if agent_uuid:
-            self.messages = db_config.get("messages", [])
-            self.container_id = db_config.get("container_id")
-            self.file_registry = db_config.get("file_registry", {})
-            self._last_known_input_tokens = db_config.get("last_known_input_tokens", 0)
-            self._last_known_output_tokens = db_config.get("last_known_output_tokens", 0)
-            # Frontend tool relay state (for resume after browser execution)
-            self._pending_frontend_tools = db_config.get("pending_frontend_tools", [])
-            self._pending_backend_results = db_config.get("pending_backend_results", [])
-            self._awaiting_frontend_tools = db_config.get("awaiting_frontend_tools", False)
-            self._current_step = db_config.get("current_step", 0)
-            # Conversation history - only load when resuming due to frontend tools
-            # Regular agent resumptions should start fresh with a new conversation_history.
-            # NOTE: This is the per-run history used to populate AgentResult, NOT the
-            # conversation_history TABLE which stores completed runs across user turns.
-            # When frontend tools pause the agent, we preserve this so AgentResult
-            # contains the complete run history after continuation.
-            if self._awaiting_frontend_tools:
-                self._loaded_conversation_history = db_config.get("conversation_history", [])
-            else:
-                self._loaded_conversation_history = []
-        else:
-            self.messages = messages or []
-            self.container_id = container_id
-            self.file_registry: dict[str, dict] = {}
-            self._last_known_input_tokens = 0
-            self._last_known_output_tokens = 0
-            # Initialize frontend tool relay state for new agents
-            self._pending_frontend_tools = []
-            self._pending_backend_results = []
-            self._awaiting_frontend_tools = False
-            self._current_step = 0
-            self._loaded_conversation_history = []
+        # Messages and container state - initialized to defaults or constructor args.
+        # For resumed agents (with agent_uuid), these will be overwritten by
+        # _restore_state_from_config() when initialize() is called.
+        self.messages = messages or []
+        self.container_id = container_id
+        self.file_registry: dict[str, dict] = {}
+        self._last_known_input_tokens = 0
+        self._last_known_output_tokens = 0
+        
+        # Frontend tool relay state (for resume after browser execution)
+        # Will be restored from DB via initialize() for resumed agents
+        self._pending_frontend_tools: list = []
+        self._pending_backend_results: list = []
+        self._awaiting_frontend_tools = False
+        self._current_step = 0
+        self._loaded_conversation_history: list = []
         
         # Runtime configuration that may be persisted but can always be overridden
         # by explicit (non-None) constructor arguments.
@@ -341,6 +322,64 @@ class AnthropicAgent:
         # Initialize the Anthropic async client for proper async streaming
         self.client = anthropic.AsyncAnthropic()
     
+    @property
+    def is_initialized(self) -> bool:
+        """Check if agent has been initialized (state loaded from DB).
+        
+        Returns True if initialize() has been called or if there's no agent_uuid
+        to load state for.
+        """
+        return self._initialized
+    
+    async def initialize(self) -> dict[str, Any]:
+        """Initialize agent by loading state from database.
+        
+        Can be called explicitly to access agent state before run(),
+        or will be called automatically at the start of run().
+        
+        This method is idempotent - calling it multiple times has no effect
+        after the first successful initialization.
+        
+        Returns:
+            Loaded configuration dict, or empty dict if:
+            - Already initialized
+            - No db_backend configured
+            - No agent_uuid (new agent)
+            - Agent not found in database
+            - Error during loading
+        """
+        if self._initialized:
+            return {}  # Already initialized
+        
+        if not self.db_backend:
+            self._initialized = True
+            return {}
+        
+        try:
+            config = await self.db_backend.load_agent_config(self.agent_uuid)
+            
+            if config is None:
+                # New agent - will be created on first run
+                logger.info(f"No existing state for agent {self.agent_uuid}, creating new")
+                self._initialized = True
+                return {}
+            
+            # Restore state from loaded configuration
+            self._restore_state_from_config(config)
+            
+            logger.info(
+                f"Loaded state for agent {self.agent_uuid}: "
+                f"{len(config.get('messages', []))} messages, "
+                f"container_id={config.get('container_id')}"
+            )
+            self._initialized = True
+            return config
+            
+        except Exception as e:
+            logger.error(f"Failed to load state for agent {self.agent_uuid}: {e}", exc_info=True)
+            self._initialized = True
+            return {}
+    
     async def run(
         self,
         prompt: str | list[dict],
@@ -366,6 +405,10 @@ class AnthropicAgent:
                 - container_id: Container ID (if applicable)
                 - total_steps: Number of agent steps taken
         """
+        # Ensure agent is initialized (loads state from DB if needed)
+        if not self._initialized:
+            await self.initialize()
+        
         #################################################################### 
         # The following params are used to track the agent's run state.
         # They are initialized per run.
@@ -1829,50 +1872,38 @@ class AnthropicAgent:
         }
         return json.dumps(config_snapshot, indent=2)
     
-    def _load_state_from_db(self) -> dict[str, Any]:
-        """Synchronously load agent configuration from database.
+    def _restore_state_from_config(self, config: dict[str, Any]) -> None:
+        """Restore agent state from a loaded configuration dict.
         
-        Called during __init__ if agent_uuid is provided.
-        Handles both sync contexts and async contexts (when called from within an event loop).
+        Called by initialize() after loading config from database.
+        Updates agent instance variables with persisted state.
         
-        Returns:
-            Configuration dict loaded from the backend, or {} if not found or on error.
+        Args:
+            config: Configuration dict loaded from database
         """
-        try:
-            # Check if we're inside an existing event loop
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-            
-            if loop is not None:
-                # We're inside an async context - create a task in the current loop
-                # Use a thread to run the async operation synchronously
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(
-                        asyncio.run,
-                        self.db_backend.load_agent_config(self.agent_uuid)
-                    )
-                    config = future.result()
-            else:
-                # We're in a sync context - use asyncio.run directly
-                config = asyncio.run(self.db_backend.load_agent_config(self.agent_uuid))
-            
-            if config is None:
-                # New agent - will be created on first run
-                logger.info(f"No existing state for agent {self.agent_uuid}, creating new")
-                return {}
-            
-            logger.info(
-                f"Loaded state for agent {self.agent_uuid}: "
-                f"{len(config.get('messages', []))} messages, "
-                f"container_id={config.get('container_id')}"
-            )
-            return config
-        except Exception as e:
-            logger.error(f"Failed to load state for agent {self.agent_uuid}: {e}", exc_info=True)
-            return {}
+        # Restore messages and container state
+        self.messages = config.get("messages", [])
+        self.container_id = config.get("container_id")
+        self.file_registry = config.get("file_registry", {})
+        self._last_known_input_tokens = config.get("last_known_input_tokens", 0)
+        self._last_known_output_tokens = config.get("last_known_output_tokens", 0)
+        
+        # Frontend tool relay state (for resume after browser execution)
+        self._pending_frontend_tools = config.get("pending_frontend_tools", [])
+        self._pending_backend_results = config.get("pending_backend_results", [])
+        self._awaiting_frontend_tools = config.get("awaiting_frontend_tools", False)
+        self._current_step = config.get("current_step", 0)
+        
+        # Conversation history - only load when resuming due to frontend tools
+        # Regular agent resumptions should start fresh with a new conversation_history.
+        # NOTE: This is the per-run history used to populate AgentResult, NOT the
+        # conversation_history TABLE which stores completed runs across user turns.
+        # When frontend tools pause the agent, we preserve this so AgentResult
+        # contains the complete run history after continuation.
+        if self._awaiting_frontend_tools:
+            self._loaded_conversation_history = config.get("conversation_history", [])
+        else:
+            self._loaded_conversation_history = []
     
     def _log_action(
         self,

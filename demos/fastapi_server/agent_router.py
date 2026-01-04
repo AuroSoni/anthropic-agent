@@ -1,5 +1,6 @@
 """Agent endpoint for streaming responses via SSE."""
 import asyncio
+import json
 import logging
 import mimetypes
 import os
@@ -8,12 +9,13 @@ from urllib.parse import urlparse
 
 import anthropic
 import httpx
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+import litellm
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from anthropic_agent.core import AnthropicAgent
-from anthropic_agent.database import SQLBackend, FilesystemBackend
+from anthropic_agent.database import SQLBackend
 from anthropic_agent.file_backends import S3Backend
 from anthropic_agent.tools import SAMPLE_TOOL_FUNCTIONS, tool
 
@@ -81,11 +83,10 @@ class AgentRunRequest(BaseModel):
 
     @model_validator(mode='after')
     def validate_agent_source(self) -> "AgentRunRequest":
-        if self.agent_uuid and self.agent_type:
-            raise ValueError("Only one of agent_uuid or agent_type can be provided")
-        # Default to agent_all_raw if neither provided
+        # Allow both agent_uuid and agent_type (agent_type provides config)
+        # Default to agent_frontend_tools if neither provided
         if not self.agent_uuid and not self.agent_type:
-            self.agent_type = "agent_all_raw"
+            self.agent_type = "agent_frontend_tools"
         return self
 
 
@@ -115,6 +116,54 @@ class ToolResultsRequest(BaseModel):
     """Request to submit frontend tool results and resume agent execution."""
     agent_uuid: str
     tool_results: list[ToolResult]
+
+
+class ConversationItem(BaseModel):
+    """A single conversation turn in the history."""
+    conversation_id: str
+    run_id: str
+    sequence_number: int
+    user_message: str
+    final_response: str | None
+    started_at: str | None
+    completed_at: str | None
+    stop_reason: str | None
+    total_steps: int | None
+    usage: dict | None
+    generated_files: list[dict] | None
+    messages: list[dict]
+
+
+class ConversationListResponse(BaseModel):
+    """Response for paginated conversation history."""
+    conversations: list[ConversationItem]
+    has_more: bool
+    title: str | None = None  # Session title if available
+
+
+class GenerateTitleRequest(BaseModel):
+    """Request to generate a conversation title."""
+    user_message: str
+
+
+class GenerateTitleResponse(BaseModel):
+    """Response with generated title."""
+    title: str
+
+
+class AgentSessionItem(BaseModel):
+    """A single agent session in the list."""
+    agent_uuid: str
+    title: str | None
+    created_at: str | None
+    updated_at: str | None
+    total_runs: int
+
+
+class AgentSessionListResponse(BaseModel):
+    """Response for paginated agent sessions list."""
+    sessions: list[AgentSessionItem]
+    total: int
 
 
 ########################################################
@@ -242,8 +291,6 @@ agent_all_xml = AgentConfig(
 )
 
 # Agent with frontend tools (for browser-executed tools like user_confirm)
-# NOTE: Uses FilesystemBackend to avoid asyncpg event loop conflicts when re-hydrating
-# from the /agent/tool_results endpoint (asyncpg connections are bound to specific event loops)
 agent_frontend_tools = AgentConfig(
     system_prompt="""You are a helpful assistant that should help the user with their questions.
 When performing calculations that result in significant values (over 50), or when taking 
@@ -254,7 +301,7 @@ any action that could have consequences, ask for user confirmation using the use
     tools=SAMPLE_TOOL_FUNCTIONS,
     frontend_tools=FRONTEND_TOOL_FUNCTIONS,  # Include frontend tools
     file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
-    db_backend=FilesystemBackend(base_path="./agent_data"),  # Use filesystem to avoid asyncpg issues
+    db_backend=SQLBackend(connection_string=os.getenv("DATABASE_URL")),
     formatter="xml",  # XML formatter for proper tag streaming
 )
 
@@ -269,7 +316,7 @@ any action that could have consequences, ask for user confirmation using the use
     tools=SAMPLE_TOOL_FUNCTIONS,
     frontend_tools=FRONTEND_TOOL_FUNCTIONS,
     file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
-    db_backend=FilesystemBackend(base_path="./agent_data"),
+    db_backend=SQLBackend(connection_string=os.getenv("DATABASE_URL")),
     formatter="raw",  # Raw JSON format for testing
 )
 
@@ -334,6 +381,15 @@ async def stream_agent_response(
         # Wait for agent to complete
         await agent_task
         
+        # Wait for background persistence tasks to complete
+        # This prevents "Event loop is closed" errors from asyncpg
+        try:
+            drain_result = await agent.drain_background_tasks(timeout=10.0)
+            if drain_result.get("timed_out", 0) > 0:
+                logger.warning(f"Some persistence tasks timed out: {drain_result}")
+        except Exception as e:
+            logger.warning(f"Error draining background tasks: {e}")
+        
         # Send final SSE marker to close stream
         yield "data: [DONE]\n\n"
         
@@ -394,6 +450,15 @@ async def stream_tool_results_response(
         
         # Wait for agent to complete
         await agent_task
+        
+        # Wait for background persistence tasks to complete
+        # This prevents "Event loop is closed" errors from asyncpg
+        try:
+            drain_result = await agent.drain_background_tasks(timeout=10.0)
+            if drain_result.get("timed_out", 0) > 0:
+                logger.warning(f"Some persistence tasks timed out: {drain_result}")
+        except Exception as e:
+            logger.warning(f"Error draining background tasks: {e}")
         
         # Send final SSE marker
         yield "data: [DONE]\n\n"
@@ -591,3 +656,194 @@ async def upload_files(
                 )
     
     return UploadResponse(files=uploaded_files)
+
+
+@router.get("/sessions")
+async def list_sessions(
+    limit: int = Query(default=50, le=100, description="Maximum number of sessions to return"),
+    offset: int = Query(default=0, ge=0, description="Number of sessions to skip"),
+    agent_type: AgentType = Query(default="agent_frontend_tools", description="Agent type to determine database backend"),
+) -> AgentSessionListResponse:
+    """List all agent sessions with metadata.
+    
+    Returns sessions sorted by updated_at descending (newest first).
+    Supports offset-based pagination.
+    
+    Args:
+        limit: Maximum number of sessions to return (max 100)
+        offset: Number of sessions to skip
+        agent_type: Agent type to determine which database backend to query
+        
+    Returns:
+        AgentSessionListResponse with list of sessions and total count
+    """
+    # Get the database backend from the agent config
+    config = AGENT_CONFIGS.get(agent_type)
+    if not config or not config.db_backend:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Agent type '{agent_type}' does not have a database backend configured"
+        )
+    
+    db_backend = config.db_backend
+    
+    sessions, total = await db_backend.list_agent_sessions(limit=limit, offset=offset)
+    
+    return AgentSessionListResponse(
+        sessions=[
+            AgentSessionItem(
+                agent_uuid=s["agent_uuid"],
+                title=s.get("title"),
+                created_at=s.get("created_at"),
+                updated_at=s.get("updated_at"),
+                total_runs=s.get("total_runs", 0),
+            )
+            for s in sessions
+        ],
+        total=total,
+    )
+
+
+@router.get("/{agent_uuid}/conversations")
+async def get_conversations(
+    agent_uuid: str,
+    before: int | None = Query(default=None, description="Load conversations with sequence_number < before"),
+    limit: int = Query(default=20, le=100, description="Maximum conversations to return"),
+    agent_type: AgentType = Query(default="agent_frontend_tools", description="Agent type to determine database backend"),
+) -> ConversationListResponse:
+    """Get paginated conversation history for an agent (newest first).
+    
+    Uses cursor-based pagination for efficient infinite scroll. On initial load,
+    omit the `before` parameter to get the newest conversations. For subsequent
+    pages, pass the smallest `sequence_number` from the previous response as `before`.
+    
+    Args:
+        agent_uuid: The agent's UUID
+        before: Load conversations with sequence_number < this value (None = latest)
+        limit: Maximum number of conversations to return (max 100)
+        agent_type: Agent type to determine which database backend to query
+        
+    Returns:
+        ConversationListResponse with conversations and has_more flag
+        
+    Example:
+        ```
+        # Initial load (newest conversations)
+        GET /agent/{uuid}/conversations?limit=20
+        
+        # Load older conversations (scroll up)
+        GET /agent/{uuid}/conversations?before=31&limit=20
+        ```
+    """
+    # Get the database backend from the agent config
+    config = AGENT_CONFIGS.get(agent_type)
+    if not config or not config.db_backend:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid agent_type or no database backend configured: {agent_type}",
+        )
+    
+    db_backend = config.db_backend
+    
+    # Load conversations using cursor-based pagination
+    conversations, has_more = await db_backend.load_conversation_history_cursor(
+        agent_uuid=agent_uuid,
+        before=before,
+        limit=limit,
+    )
+    
+    # Convert to response models
+    items = [
+        ConversationItem(
+            conversation_id=conv.get("conversation_id", ""),
+            run_id=conv.get("run_id", ""),
+            sequence_number=conv.get("sequence_number", 0),
+            user_message=conv.get("user_message", ""),
+            final_response=conv.get("final_response"),
+            started_at=conv.get("started_at"),
+            completed_at=conv.get("completed_at"),
+            stop_reason=conv.get("stop_reason"),
+            total_steps=conv.get("total_steps"),
+            usage=conv.get("usage"),
+            generated_files=conv.get("generated_files"),
+            messages=conv.get("messages", []),
+        )
+        for conv in conversations
+    ]
+    
+    # Get session title from agent config
+    agent_config = await db_backend.load_agent_config(agent_uuid)
+    session_title = agent_config.get("title") if agent_config else None
+    
+    return ConversationListResponse(
+        conversations=items,
+        has_more=has_more,
+        title=session_title,
+    )
+
+
+@router.post("/{agent_uuid}/title")
+async def generate_title(
+    agent_uuid: str,
+    request: GenerateTitleRequest,
+    agent_type: AgentType = Query(default="agent_frontend_tools", description="Agent type to determine database backend"),
+) -> GenerateTitleResponse:
+    """Generate a conversation title using LiteLLM.
+    
+    Uses OpenAI GPT-4o-mini for fast, cost-effective title generation.
+    The title is persisted to the agent_config in the database.
+    
+    Args:
+        agent_uuid: The agent's UUID
+        request: Contains the user_message to generate title from
+        agent_type: Agent type to determine which database backend to use
+        
+    Returns:
+        GenerateTitleResponse with the generated title
+    """
+    # Get the database backend from the agent config
+    config = AGENT_CONFIGS.get(agent_type)
+    if not config or not config.db_backend:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid agent_type or no database backend configured: {agent_type}",
+        )
+    
+    db_backend = config.db_backend
+    
+    # Generate title using LiteLLM
+    try:
+        response = await litellm.acompletion(
+            model="openai/gpt-5-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Generate a short, descriptive title (max 50 characters) for a conversation "
+                        "based on the user's first message. The title should capture the main topic "
+                        "or intent. Respond with only JSON in this format: {\"title\": \"...\"}"
+                    )
+                },
+                {"role": "user", "content": request.user_message}
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=100,
+            temperature=0.3,
+        )
+        
+        result = json.loads(response.choices[0].message.content)
+        title = result.get("title", "New Conversation")[:50]  # Enforce max length
+        
+    except Exception as e:
+        logger.error(f"Error generating title: {e}")
+        # Fallback: use truncated user message
+        title = request.user_message[:47] + "..." if len(request.user_message) > 50 else request.user_message
+    
+    # Save title to database
+    try:
+        await db_backend.update_agent_title(agent_uuid, title)
+    except Exception as e:
+        logger.error(f"Error saving title to database: {e}")
+        # Continue anyway - we have the title even if save failed
+    
+    return GenerateTitleResponse(title=title)
