@@ -34,7 +34,38 @@ interface ToolResultContent {
   is_error?: boolean;
 }
 
-type ContentBlock = TextContent | ThinkingContent | ToolUseContent | ToolResultContent;
+interface ServerToolUseContent {
+  type: 'server_tool_use';
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+}
+
+/**
+ * Server tool results have dynamic type names like:
+ * - bash_code_execution_tool_result
+ * - web_search_tool_result
+ * - text_editor_code_execution_tool_result
+ * 
+ * Note: Not included in ContentBlock union since type is dynamic.
+ * Handled in default case of contentBlockToNode with type assertion.
+ */
+interface ServerToolResultContent {
+  type: string; // Ends with '_tool_result'
+  tool_use_id: string;
+  content: unknown; // Can be string, array, or complex object
+}
+
+/**
+ * Known content block types. ServerToolResultContent is handled
+ * separately in the default case since its type is dynamic.
+ */
+type ContentBlock = 
+  | TextContent 
+  | ThinkingContent 
+  | ToolUseContent 
+  | ToolResultContent 
+  | ServerToolUseContent;
 
 interface Message {
   role: 'user' | 'assistant';
@@ -45,6 +76,35 @@ interface Message {
  * Track tool names by their IDs so tool_result can reference them.
  */
 type ToolNameMap = Map<string, string>;
+
+/**
+ * Extract content from server tool results which can have complex structures.
+ */
+function extractServerToolResultContent(content: unknown): string {
+  if (content === null || content === undefined) {
+    return '';
+  }
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    // Handle array of content blocks (common in code execution results)
+    return content
+      .map(item => {
+        if (typeof item === 'string') return item;
+        if (item && typeof item === 'object') {
+          // Handle text blocks
+          if ('text' in item && typeof item.text === 'string') return item.text;
+          // Handle other structured content
+          return JSON.stringify(item, null, 2);
+        }
+        return String(item);
+      })
+      .join('\n');
+  }
+  // Object content - serialize to JSON
+  return JSON.stringify(content, null, 2);
+}
 
 /**
  * Convert a single content block to an AgentNode.
@@ -110,9 +170,47 @@ function contentBlockToNode(block: ContentBlock, toolNames: ToolNameMap): AgentN
       };
     }
 
-    default:
-      // Unknown block type - render as text if possible
+    case 'server_tool_use':
+      // Server-side tool call (web_search, code_execution, etc.)
+      toolNames.set(block.id, block.name);
+      
+      return {
+        type: 'element',
+        tagName: 'server_tool_call',  // Matches streaming parser output
+        attributes: {
+          name: block.name,
+          id: block.id,
+        },
+        children: [
+          {
+            type: 'text',
+            content: JSON.stringify(block.input, null, 2),
+          },
+        ],
+      };
+
+    default: {
+      // Handle server tool results (*_tool_result variants like bash_code_execution_tool_result)
+      // Cast to unknown first to access dynamic type property
+      const unknownBlock = block as unknown as { type: string };
+      if (unknownBlock.type.endsWith('_tool_result') && unknownBlock.type !== 'tool_result') {
+        const serverResultBlock = block as unknown as ServerToolResultContent;
+        const resultContent = extractServerToolResultContent(serverResultBlock.content);
+        const toolName = toolNames.get(serverResultBlock.tool_use_id);
+        
+        return {
+          type: 'element',
+          tagName: 'server_tool_result',
+          attributes: {
+            name: toolName || unknownBlock.type,
+            tool_type: unknownBlock.type.replace('_tool_result', ''),
+          },
+          children: [{ type: 'text', content: resultContent }],
+        };
+      }
+      // Unknown block type
       return null;
+    }
   }
 }
 
@@ -131,12 +229,13 @@ export function convertMessagesToNodes(messages: unknown[]): AgentNode[] {
 
   for (const msg of messages as Message[]) {
     // Skip user messages that are just the initial prompt
-    // But include user messages with tool_result content
+    // But include user messages with tool_result content (client or server)
     if (msg.role === 'user') {
       // Check if this user message contains tool results
       if (Array.isArray(msg.content)) {
         for (const block of msg.content as ContentBlock[]) {
-          if (block.type === 'tool_result') {
+          // Handle both client tool_result and server *_tool_result variants
+          if (block.type === 'tool_result' || block.type.endsWith('_tool_result')) {
             const node = contentBlockToNode(block, toolNames);
             if (node) nodes.push(node);
           }
@@ -173,14 +272,20 @@ export function hasRichContent(messages: unknown[]): boolean {
   for (const msg of messages as Message[]) {
     if (msg.role === 'assistant' && Array.isArray(msg.content)) {
       for (const block of msg.content as ContentBlock[]) {
-        if (block.type === 'thinking' || block.type === 'tool_use') {
+        // Check for thinking, client tools, and server tools
+        if (
+          block.type === 'thinking' || 
+          block.type === 'tool_use' ||
+          block.type === 'server_tool_use'
+        ) {
           return true;
         }
       }
     }
     if (msg.role === 'user' && Array.isArray(msg.content)) {
       for (const block of msg.content as ContentBlock[]) {
-        if (block.type === 'tool_result') {
+        // Check for both client tool_result and server *_tool_result variants
+        if (block.type === 'tool_result' || block.type.endsWith('_tool_result')) {
           return true;
         }
       }
