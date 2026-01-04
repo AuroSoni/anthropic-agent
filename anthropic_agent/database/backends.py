@@ -71,6 +71,26 @@ class DatabaseBackend(Protocol):
         """
         ...
     
+    async def load_conversation_history_cursor(
+        self,
+        agent_uuid: str,
+        before: int | None = None,
+        limit: int = 20
+    ) -> tuple[list[dict], bool]:
+        """Load conversations with cursor-based pagination.
+        
+        Designed for infinite scroll UIs that load newest-to-oldest.
+        
+        Args:
+            agent_uuid: Agent session UUID
+            before: Load conversations with sequence_number < before (None = latest)
+            limit: Maximum conversations to return
+            
+        Returns:
+            Tuple of (conversations newest->oldest, has_more)
+        """
+        ...
+    
     async def save_agent_run_logs(
         self, 
         agent_uuid: str, 
@@ -99,6 +119,35 @@ class DatabaseBackend(Protocol):
             
         Returns:
             List of log entries in chronological order
+        """
+        ...
+    
+    async def update_agent_title(self, agent_uuid: str, title: str) -> bool:
+        """Update the title for an agent session.
+        
+        Args:
+            agent_uuid: Agent session UUID
+            title: New title for the conversation
+            
+        Returns:
+            True if updated successfully, False if agent not found
+        """
+        ...
+    
+    async def list_agent_sessions(
+        self,
+        limit: int = 50,
+        offset: int = 0
+    ) -> tuple[list[dict], int]:
+        """List all agent sessions with metadata.
+        
+        Args:
+            limit: Maximum number of sessions to return
+            offset: Number of sessions to skip
+            
+        Returns:
+            Tuple of (sessions list, total count) where each session has:
+            {agent_uuid, title, created_at, updated_at, total_runs}
         """
         ...
 
@@ -168,6 +217,67 @@ class FilesystemBackend:
         logger.debug(f"Loaded agent config for {agent_uuid}")
         return config
     
+    async def update_agent_title(self, agent_uuid: str, title: str) -> bool:
+        """Update the title for an agent session."""
+        config = await self.load_agent_config(agent_uuid)
+        if config is None:
+            return False
+        
+        config["title"] = title
+        await self.save_agent_config(config)
+        logger.debug(f"Updated title for {agent_uuid}: {title}")
+        return True
+    
+    async def list_agent_sessions(
+        self,
+        limit: int = 50,
+        offset: int = 0
+    ) -> tuple[list[dict], int]:
+        """List all agent sessions with metadata."""
+        config_dir = self.base_path / "agent_config"
+        
+        if not config_dir.exists():
+            return [], 0
+        
+        # Get all config files and their metadata
+        sessions: list[dict] = []
+        config_files = list(config_dir.glob("*.json"))
+        
+        for config_file in config_files:
+            if config_file.name.endswith(".tmp"):
+                continue
+            
+            try:
+                with open(config_file, "r") as f:
+                    config = json.load(f)
+                
+                # Use file modification time as fallback for updated_at
+                file_mtime = datetime.fromtimestamp(config_file.stat().st_mtime)
+                
+                sessions.append({
+                    "agent_uuid": config.get("agent_uuid", config_file.stem),
+                    "title": config.get("title"),
+                    "created_at": config.get("created_at"),
+                    "updated_at": config.get("updated_at") or file_mtime.isoformat(),
+                    "total_runs": config.get("total_runs", 0),
+                })
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(f"Failed to load config file {config_file}: {e}")
+                continue
+        
+        # Sort by updated_at descending (newest first)
+        sessions.sort(
+            key=lambda x: x.get("updated_at") or "",
+            reverse=True
+        )
+        
+        total = len(sessions)
+        # Apply pagination
+        sessions = sessions[offset:offset + limit]
+        
+        logger.debug(f"Listed {len(sessions)} agent sessions (total: {total})")
+        return sessions, total
+    
     async def save_conversation_history(self, conversation: dict) -> None:
         """Save conversation history entry with automatic sequence numbering."""
         agent_uuid = conversation["agent_uuid"]
@@ -228,6 +338,55 @@ class FilesystemBackend:
         
         logger.debug(f"Loaded {len(conversations)} conversations for {agent_uuid}")
         return conversations
+    
+    async def load_conversation_history_cursor(
+        self,
+        agent_uuid: str,
+        before: int | None = None,
+        limit: int = 20
+    ) -> tuple[list[dict], bool]:
+        """Load conversations with cursor-based pagination (newest first).
+        
+        Args:
+            agent_uuid: Agent session UUID
+            before: Load conversations with sequence_number < before (None = latest)
+            limit: Maximum conversations to return
+            
+        Returns:
+            Tuple of (conversations newest->oldest, has_more)
+        """
+        conv_dir = self.base_path / "conversation_history" / agent_uuid
+        
+        if not conv_dir.exists():
+            return [], False
+        
+        # Get all conversation files sorted by sequence number descending
+        conv_files = sorted(conv_dir.glob("[0-9]*.json"), reverse=True)
+        
+        # Filter by cursor if provided
+        if before is not None:
+            # Extract sequence number from filename (e.g., "001.json" -> 1)
+            conv_files = [
+                f for f in conv_files
+                if int(f.stem) < before
+            ]
+        
+        # Take limit + 1 to determine has_more
+        selected_files = conv_files[:limit + 1]
+        has_more = len(selected_files) > limit
+        files_to_load = selected_files[:limit]
+        
+        # Load conversations
+        conversations = []
+        for conv_file in files_to_load:
+            with open(conv_file, "r") as f:
+                conversations.append(json.load(f))
+        
+        logger.debug(
+            f"Loaded {len(conversations)} conversations for {agent_uuid} "
+            f"(before={before}, has_more={has_more})"
+        )
+        return conversations, has_more
     
     async def save_agent_run_logs(
         self, 
@@ -404,11 +563,13 @@ class SQLBackend:
                 stream_meta_history_and_tool_results, compactor_type,
                 memory_store_type, file_registry, max_retries, base_delay,
                 last_known_input_tokens, last_known_output_tokens,
-                created_at, updated_at, last_run_at, total_runs
+                created_at, updated_at, last_run_at, total_runs,
+                pending_frontend_tools, pending_backend_results,
+                awaiting_frontend_tools, current_step, conversation_history
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                 $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-                $21, $22, $23, $24, $25, $26
+                $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31
             )
             ON CONFLICT (agent_uuid) DO UPDATE SET
                 system_prompt = EXCLUDED.system_prompt,
@@ -434,7 +595,12 @@ class SQLBackend:
                 last_known_output_tokens = EXCLUDED.last_known_output_tokens,
                 updated_at = EXCLUDED.updated_at,
                 last_run_at = EXCLUDED.last_run_at,
-                total_runs = EXCLUDED.total_runs
+                total_runs = EXCLUDED.total_runs,
+                pending_frontend_tools = EXCLUDED.pending_frontend_tools,
+                pending_backend_results = EXCLUDED.pending_backend_results,
+                awaiting_frontend_tools = EXCLUDED.awaiting_frontend_tools,
+                current_step = EXCLUDED.current_step,
+                conversation_history = EXCLUDED.conversation_history
         """
         
         async with pool.acquire() as conn:
@@ -466,6 +632,12 @@ class SQLBackend:
                 self._to_datetime(config.get("updated_at")),
                 self._to_datetime(config.get("last_run_at")),
                 config.get("total_runs"),
+                # Frontend tool relay state
+                self._to_jsonb(config.get("pending_frontend_tools", [])),
+                self._to_jsonb(config.get("pending_backend_results", [])),
+                config.get("awaiting_frontend_tools", False),
+                config.get("current_step", 0),
+                self._to_jsonb(config.get("conversation_history", [])),
             )
         
         logger.debug(f"Saved agent config for {config.get('agent_uuid')}")
@@ -489,7 +661,10 @@ class SQLBackend:
                 stream_meta_history_and_tool_results, compactor_type,
                 memory_store_type, file_registry, max_retries, base_delay,
                 last_known_input_tokens, last_known_output_tokens,
-                created_at, updated_at, last_run_at, total_runs
+                created_at, updated_at, last_run_at, total_runs,
+                pending_frontend_tools, pending_backend_results,
+                awaiting_frontend_tools, current_step, conversation_history,
+                title
             FROM agent_config
             WHERE agent_uuid = $1
         """
@@ -528,10 +703,86 @@ class SQLBackend:
             "updated_at": self._parse_datetime(row["updated_at"]),
             "last_run_at": self._parse_datetime(row["last_run_at"]),
             "total_runs": row["total_runs"],
+            # Frontend tool relay state
+            "pending_frontend_tools": self._from_jsonb(row["pending_frontend_tools"]) or [],
+            "pending_backend_results": self._from_jsonb(row["pending_backend_results"]) or [],
+            "awaiting_frontend_tools": row["awaiting_frontend_tools"] or False,
+            "current_step": row["current_step"] or 0,
+            "conversation_history": self._from_jsonb(row["conversation_history"]) or [],
+            # Title for conversation display
+            "title": row["title"],
         }
         
         logger.debug(f"Loaded agent config for {agent_uuid}")
         return config
+    
+    async def update_agent_title(self, agent_uuid: str, title: str) -> bool:
+        """Update the title for an agent session.
+        
+        Args:
+            agent_uuid: Agent session UUID
+            title: New title for the conversation
+            
+        Returns:
+            True if updated successfully, False if agent not found
+        """
+        pool = await self._get_pool()
+        
+        query = """
+            UPDATE agent_config
+            SET title = $2, updated_at = NOW()
+            WHERE agent_uuid = $1
+            RETURNING agent_uuid
+        """
+        
+        async with pool.acquire() as conn:
+            result = await conn.fetchrow(query, agent_uuid, title)
+        
+        if result is None:
+            return False
+        
+        logger.debug(f"Updated title for {agent_uuid}: {title}")
+        return True
+    
+    async def list_agent_sessions(
+        self,
+        limit: int = 50,
+        offset: int = 0
+    ) -> tuple[list[dict], int]:
+        """List all agent sessions with metadata."""
+        pool = await self._get_pool()
+        
+        # Get total count
+        count_query = "SELECT COUNT(*) FROM agent_config"
+        
+        # Get sessions with pagination
+        list_query = """
+            SELECT 
+                agent_uuid, title, created_at, updated_at, total_runs
+            FROM agent_config
+            ORDER BY updated_at DESC NULLS LAST
+            LIMIT $1 OFFSET $2
+        """
+        
+        async with pool.acquire() as conn:
+            total_row = await conn.fetchrow(count_query)
+            total = total_row[0] if total_row else 0
+            
+            rows = await conn.fetch(list_query, limit, offset)
+        
+        sessions = [
+            {
+                "agent_uuid": str(row["agent_uuid"]),
+                "title": row["title"],
+                "created_at": self._parse_datetime(row["created_at"]),
+                "updated_at": self._parse_datetime(row["updated_at"]),
+                "total_runs": row["total_runs"] or 0,
+            }
+            for row in rows
+        ]
+        
+        logger.debug(f"Listed {len(sessions)} agent sessions (total: {total})")
+        return sessions, total
     
     async def save_conversation_history(self, conversation: dict) -> None:
         """Save conversation history entry.
@@ -629,6 +880,82 @@ class SQLBackend:
         
         logger.debug(f"Loaded {len(conversations)} conversations for {agent_uuid}")
         return conversations
+    
+    async def load_conversation_history_cursor(
+        self,
+        agent_uuid: str,
+        before: int | None = None,
+        limit: int = 20
+    ) -> tuple[list[dict], bool]:
+        """Load conversations with cursor-based pagination (newest first).
+        
+        Args:
+            agent_uuid: Agent session UUID
+            before: Load conversations with sequence_number < before (None = latest)
+            limit: Maximum conversations to return
+            
+        Returns:
+            Tuple of (conversations newest->oldest, has_more)
+        """
+        pool = await self._get_pool()
+        
+        # Build query with optional cursor filter
+        # Fetch limit + 1 to determine has_more
+        if before is not None:
+            query = """
+                SELECT 
+                    conversation_id, agent_uuid, run_id, started_at, completed_at,
+                    user_message, final_response, messages, stop_reason, total_steps,
+                    usage, generated_files, sequence_number, created_at
+                FROM conversation_history
+                WHERE agent_uuid = $1 AND sequence_number < $2
+                ORDER BY sequence_number DESC
+                LIMIT $3
+            """
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(query, agent_uuid, before, limit + 1)
+        else:
+            query = """
+                SELECT 
+                    conversation_id, agent_uuid, run_id, started_at, completed_at,
+                    user_message, final_response, messages, stop_reason, total_steps,
+                    usage, generated_files, sequence_number, created_at
+                FROM conversation_history
+                WHERE agent_uuid = $1
+                ORDER BY sequence_number DESC
+                LIMIT $2
+            """
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(query, agent_uuid, limit + 1)
+        
+        # Determine has_more and slice to limit
+        has_more = len(rows) > limit
+        rows_to_process = rows[:limit]
+        
+        conversations = []
+        for row in rows_to_process:
+            conversations.append({
+                "conversation_id": str(row["conversation_id"]),
+                "agent_uuid": str(row["agent_uuid"]),
+                "run_id": str(row["run_id"]),
+                "started_at": self._parse_datetime(row["started_at"]),
+                "completed_at": self._parse_datetime(row["completed_at"]),
+                "user_message": row["user_message"],
+                "final_response": row["final_response"],
+                "messages": self._from_jsonb(row["messages"]),
+                "stop_reason": row["stop_reason"],
+                "total_steps": row["total_steps"],
+                "usage": self._from_jsonb(row["usage"]),
+                "generated_files": self._from_jsonb(row["generated_files"]),
+                "sequence_number": row["sequence_number"],
+                "created_at": self._parse_datetime(row["created_at"]),
+            })
+        
+        logger.debug(
+            f"Loaded {len(conversations)} conversations for {agent_uuid} "
+            f"(before={before}, has_more={has_more})"
+        )
+        return conversations, has_more
     
     async def save_agent_run_logs(
         self, 

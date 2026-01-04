@@ -1,4 +1,10 @@
+/**
+ * String-level "mixed content" parser: turns a single text string into AgentNode[] by
+ * recognizing only whitelisted XML-like tags (keeps other HTML-ish tags as plain text).
+ * Used both by XmlStreamParser (XML stream format) and AnthropicStreamParser (embedded tags in raw text blocks).
+ */
 import type { AgentNode } from './types';
+import { decodeHtmlEntities } from './utils';
 
 /**
  * Whitelist of tag names that should be parsed as XML elements.
@@ -19,6 +25,11 @@ const RECOGNIZED_TAGS = new Set([
   'content-block-error',
   'content-block-meta_files',
   'meta_init',
+  // Frontend tool relay tag
+  'awaiting_frontend_tools',
+  // Citation tags
+  'citations',
+  'citation',
   // Custom rendering tags within text blocks
   'chart',
   'table',
@@ -147,12 +158,13 @@ export function parseMixedContent(text: string): AgentNode[] {
 
 function parseAttributes(attrString: string): Record<string, string> {
   const attrs: Record<string, string> = {};
-  const attrRegex = /([a-zA-Z0-9:-]+)=(?:"([^"]*)"|'([^']*)'|([^ \t\n\r\f/>]+))/g;
+  // Note: underscore included for attributes like tool_use_id
+  const attrRegex = /([a-zA-Z0-9_:-]+)=(?:"([^"]*)"|'([^']*)'|([^ \t\n\r\f/>]+))/g;
   let match;
   while ((match = attrRegex.exec(attrString)) !== null) {
     const key = match[1];
     const value = match[2] || match[3] || match[4] || "";
-    attrs[key] = value;
+    attrs[key] = decodeHtmlEntities(value);
   }
   return attrs;
 }

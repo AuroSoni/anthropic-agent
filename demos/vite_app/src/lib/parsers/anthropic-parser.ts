@@ -1,9 +1,23 @@
-import type { AgentNode, AnthropicEvent, ContentBlockType } from './types';
+/**
+ * Streaming parser for raw Anthropic JSON events: maintains per-content-block state and emits AgentNode[].
+ * Note: for `text` blocks it also runs parseMixedContent() to support embedded XML-like tags inside streamed text.
+ */
+import type { AgentNode, AnthropicEvent, ContentBlockType, Citation } from './types';
 import { parseMixedContent } from './xml-parser';
+
+/**
+ * Check if a block type represents a SERVER-side tool result.
+ * Matches server_tool_use and dynamic types like bash_code_execution_tool_result.
+ */
+function isServerToolResultType(type: string): boolean {
+  return type === 'server_tool_use' ||
+         (type.endsWith('_tool_result') && type !== 'tool_result');
+}
 
 interface BlockState {
   type: ContentBlockType;
   content: string; // For text, thinking
+  citations?: Citation[]; // Citations captured from content_block_stop
   toolData?: {
     id: string;
     name: string;
@@ -82,6 +96,12 @@ export class AnthropicStreamParser {
         const block = this.blocks.get(index);
         if (block) {
           block.isComplete = true;
+          
+          // Capture citations from the complete content block
+          if (event.content_block?.citations) {
+            block.citations = event.content_block.citations;
+          }
+          
           // Try to parse tool input JSON when block is complete
           if ((block.type === 'tool_use' || block.type === 'server_tool_use') && block.toolData) {
             try {
@@ -114,7 +134,18 @@ export class AnthropicStreamParser {
 
       if (block.type === 'text') {
         // Parse text content for mixed XML tags (artifacts, etc.)
-        nodes.push(...parseMixedContent(block.content));
+        // Wrap in <text> element to match XmlStreamParser output structure
+        const textChildren = parseMixedContent(block.content);
+        nodes.push({
+          type: 'element',
+          tagName: 'text',
+          children: textChildren
+        });
+        
+        // Add citations node if present (matching XML parser structure)
+        if (block.citations && block.citations.length > 0) {
+          nodes.push(this.createCitationsNode(block.citations));
+        }
       } else if (block.type === 'thinking') {
         nodes.push({
           type: 'element',
@@ -151,19 +182,68 @@ export class AnthropicStreamParser {
         
         const attributes: Record<string, string> = {};
         if (block.rawBlock?.tool_use_id) {
-            attributes.tool_use_id = block.rawBlock.tool_use_id;
+            attributes.id = block.rawBlock.tool_use_id;
         }
 
-        nodes.push({
+        // Normalize server tool results consistently with XmlStreamParser
+        if (isServerToolResultType(block.type)) {
+          const toolType = block.type.replace(/_tool_result$/, '');
+          nodes.push({
             type: 'element',
-            tagName: block.type, // Use the raw type as tag name (e.g. text_editor_code_execution_tool_result)
-            attributes,
+            tagName: 'server_tool_result',
+            attributes: {
+              ...attributes,
+              name: block.type,
+              toolType: toolType,
+            },
             children: [{ type: 'text', content }]
-        });
+          });
+        } else {
+          nodes.push({
+            type: 'element',
+            tagName: block.type,
+            attributes: {
+              ...attributes,
+              name: block.rawBlock?.name || block.type,
+            },
+            children: [{ type: 'text', content }]
+          });
+        }
       }
     }
 
     return nodes;
+  }
+
+  /**
+   * Create a citations node matching the XML parser's structure.
+   */
+  private createCitationsNode(citations: Citation[]): AgentNode {
+    return {
+      type: 'element',
+      tagName: 'citations',
+      attributes: {},
+      children: citations.map(c => ({
+        type: 'element' as const,
+        tagName: 'citation',
+        attributes: this.buildCitationAttrs(c),
+        children: [{ type: 'text' as const, content: c.cited_text || '' }]
+      }))
+    };
+  }
+
+  /**
+   * Build citation attributes, only including non-empty values.
+   */
+  private buildCitationAttrs(c: Citation): Record<string, string> {
+    const attrs: Record<string, string> = {};
+    if (c.type) attrs.type = c.type;
+    if (c.url) attrs.url = c.url;
+    if (c.title) attrs.title = c.title;
+    if (c.document_index) attrs.document_index = c.document_index;
+    if (c.start_page_number) attrs.start_page_number = c.start_page_number;
+    if (c.end_page_number) attrs.end_page_number = c.end_page_number;
+    return attrs;
   }
 
   /**

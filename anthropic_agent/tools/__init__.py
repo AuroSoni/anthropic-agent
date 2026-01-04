@@ -1,6 +1,6 @@
 """Tool execution utilities."""
 from .base import ToolExecutor, ToolRegistry
-from .decorators import tool
+from .decorators import tool, ExecutorType
 from .sample_tools import (
     SAMPLE_TOOL_SCHEMAS, 
     SAMPLE_TOOL_FUNCTIONS, 
@@ -15,6 +15,7 @@ __all__ = [
     'ToolRegistry',
     # Decorator
     'tool',
+    'ExecutorType',
     # Sample tools and utilities
     'SAMPLE_TOOL_SCHEMAS', 
     'SAMPLE_TOOL_FUNCTIONS', 

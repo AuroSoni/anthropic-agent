@@ -5,6 +5,7 @@ import html
 import anthropic
 import logging
 import uuid
+import warnings
 from datetime import datetime
 from typing import Optional, Callable, Any, Awaitable
 from collections.abc import Mapping, Sequence
@@ -33,6 +34,11 @@ DEFAULT_FORMATTER: FormatterType = "xml"
 DEFAULT_MAX_RETRIES = 5
 DEFAULT_BASE_DELAY = 1.0
 
+# Cache control configuration (Anthropic limits)
+MAX_CACHE_BLOCKS = 4
+MIN_CACHE_TOKENS_SONNET = 1024  # Claude Sonnet/Opus minimum
+MIN_CACHE_TOKENS_HAIKU = 2048   # Claude Haiku minimum
+
 class AnthropicAgent:
     def __init__(
         self,
@@ -43,6 +49,7 @@ class AnthropicAgent:
         max_tokens: Optional[int] = None,
         stream_meta_history_and_tool_results: Optional[bool] = None,
         tools: list[Callable[..., Any]] | None = None,
+        frontend_tools: list[Callable[..., Any]] | None = None,
         server_tools: list[dict[str, Any]] | None = None,
         beta_headers: list[str] | None = None,
         container_id: str | None = None,
@@ -50,6 +57,7 @@ class AnthropicAgent:
         max_retries: Optional[int] = None,
         base_delay: Optional[float] = None,
         formatter: FormatterType | None = None,
+        enable_cache_control: Optional[bool] = None,
         compactor: CompactorType | Compactor | None = None,
         memory_store: MemoryStoreType | MemoryStore | None = None,
         final_answer_check: Optional[Callable[[str], tuple[bool, str]]] = None,
@@ -67,13 +75,20 @@ class AnthropicAgent:
             thinking_tokens: Budget for extended thinking tokens (default: 0 / disabled)
             max_tokens: Maximum tokens in response (default: 2048)
             stream_meta_history_and_tool_results: Include metadata in stream (default: False)
-            tools: List of functions decorated with @tool (default: None)
+            tools: List of functions decorated with @tool for backend execution (default: None)
+            frontend_tools: List of functions decorated with @tool(executor="frontend") for
+                browser-side execution. These tools are schema-only on the server; when Claude
+                calls them, the agent pauses and emits an awaiting_frontend_tools event. The
+                browser executes the tool and POSTs the result back via /agent/tool_results.
             beta_headers: Beta feature headers for Anthropic API (default: None)
             container_id: Container ID for multi-turn conversations (default: None)
             messages: Initial message history (default: None)
             max_retries: Maximum retry attempts for API calls (default: 5)
             base_delay: Base delay in seconds for exponential backoff (default: 5.0)
             formatter: Default formatter for stream output ("xml" or "raw", default: "xml")
+            enable_cache_control: Enable cache_control injection for message content blocks
+                (default: True). When enabled, adds cache_control to supported content block
+                types (text, image, document) in both user and assistant messages.
             compactor: Either a compactor name ("tool_result_removal", "none") or a pre-configured
                 Compactor instance. If a string is provided, a compactor is created with default
                 settings (no threshold). For custom threshold, create and pass a Compactor instance.
@@ -117,6 +132,9 @@ class AnthropicAgent:
         else:
             self.db_backend = db_backend
         
+        # Initialization state - tracks whether state has been loaded from DB
+        # Use initialize() to load state, or run() will call it automatically
+        self._initialized = False
         
         #################################################################### 
         # Non serializable params that are not loaded from database.
@@ -143,17 +161,28 @@ class AnthropicAgent:
             self.tool_registry = ToolRegistry()
             self.tool_registry.register_tools(tools)
             self.tool_schemas = self.tool_registry.get_schemas()
+        
+        # Frontend tools (executed in browser, schema-only on server)
+        self.frontend_tool_schemas: list[dict[str, Any]] = []
+        self.frontend_tool_names: set[str] = set()
+        if frontend_tools:
+            for fn in frontend_tools:
+                if hasattr(fn, "__tool_schema__"):
+                    schema = fn.__tool_schema__
+                    self.frontend_tool_schemas.append(schema)
+                    self.frontend_tool_names.add(schema["name"])
+                else:
+                    raise ValueError(
+                        f"Frontend tool '{fn.__name__}' must be decorated with @tool(executor='frontend')"
+                    )
 
-        # Load persisted configuration if agent_uuid provided
+        # Agent UUID for session tracking
+        # If agent_uuid provided, state will be loaded from DB via initialize() 
+        # (called automatically in run() or explicitly by caller)
+        self.agent_uuid = agent_uuid or str(uuid.uuid4())
+        
+        # db_config is empty at construction - state is loaded asynchronously via initialize()
         db_config: dict[str, Any] = {}
-        if agent_uuid:
-            self.agent_uuid = agent_uuid
-            if not self.db_backend:
-                raise ValueError("Database backend is required to load state from database")
-            db_config = self._load_state_from_db()
-        else:
-            # Agent UUID for session tracking
-            self.agent_uuid = agent_uuid or str(uuid.uuid4())
         
         #################################################################### 
         # Resolve core configuration and state from (constructor args, DB, defaults)
@@ -198,20 +227,22 @@ class AnthropicAgent:
             else db_config.get("server_tools", [])
         )
         
-        # Messages and container_id are strictly from DB for resumed agents,
-        # and from constructor for new agents.
-        if agent_uuid:
-            self.messages = db_config.get("messages", [])
-            self.container_id = db_config.get("container_id")
-            self.file_registry = db_config.get("file_registry", {})
-            self._last_known_input_tokens = db_config.get("last_known_input_tokens", 0)
-            self._last_known_output_tokens = db_config.get("last_known_output_tokens", 0)
-        else:
-            self.messages = messages or []
-            self.container_id = container_id
-            self.file_registry: dict[str, dict] = {}
-            self._last_known_input_tokens = 0
-            self._last_known_output_tokens = 0
+        # Messages and container state - initialized to defaults or constructor args.
+        # For resumed agents (with agent_uuid), these will be overwritten by
+        # _restore_state_from_config() when initialize() is called.
+        self.messages = messages or []
+        self.container_id = container_id
+        self.file_registry: dict[str, dict] = {}
+        self._last_known_input_tokens = 0
+        self._last_known_output_tokens = 0
+        
+        # Frontend tool relay state (for resume after browser execution)
+        # Will be restored from DB via initialize() for resumed agents
+        self._pending_frontend_tools: list = []
+        self._pending_backend_results: list = []
+        self._awaiting_frontend_tools = False
+        self._current_step = 0
+        self._loaded_conversation_history: list = []
         
         # Runtime configuration that may be persisted but can always be overridden
         # by explicit (non-None) constructor arguments.
@@ -237,6 +268,11 @@ class AnthropicAgent:
             base_delay
             if base_delay is not None
             else db_config.get("base_delay", DEFAULT_BASE_DELAY)
+        )
+        self.enable_cache_control = (
+            enable_cache_control
+            if enable_cache_control is not None
+            else db_config.get("enable_cache_control", True)
         )
         # Arbitrary API kwargs (e.g., temperature, top_p, stop_sequences)
         self.api_kwargs: dict[str, Any] = (
@@ -279,8 +315,70 @@ class AnthropicAgent:
         # conversation_history: per-run uncompacted history (reset in run())
         # agent_logs: meta-information about compactions and actions (reset in run())
         
+        # Note: Frontend tool relay state (_pending_frontend_tools, _pending_backend_results,
+        # _awaiting_frontend_tools, _current_step) is initialized in the agent_uuid block above
+        # to support loading from DB for resumed agents.
+        
         # Initialize the Anthropic async client for proper async streaming
         self.client = anthropic.AsyncAnthropic()
+    
+    @property
+    def is_initialized(self) -> bool:
+        """Check if agent has been initialized (state loaded from DB).
+        
+        Returns True if initialize() has been called or if there's no agent_uuid
+        to load state for.
+        """
+        return self._initialized
+    
+    async def initialize(self) -> dict[str, Any]:
+        """Initialize agent by loading state from database.
+        
+        Can be called explicitly to access agent state before run(),
+        or will be called automatically at the start of run().
+        
+        This method is idempotent - calling it multiple times has no effect
+        after the first successful initialization.
+        
+        Returns:
+            Loaded configuration dict, or empty dict if:
+            - Already initialized
+            - No db_backend configured
+            - No agent_uuid (new agent)
+            - Agent not found in database
+            - Error during loading
+        """
+        if self._initialized:
+            return {}  # Already initialized
+        
+        if not self.db_backend:
+            self._initialized = True
+            return {}
+        
+        try:
+            config = await self.db_backend.load_agent_config(self.agent_uuid)
+            
+            if config is None:
+                # New agent - will be created on first run
+                logger.info(f"No existing state for agent {self.agent_uuid}, creating new")
+                self._initialized = True
+                return {}
+            
+            # Restore state from loaded configuration
+            self._restore_state_from_config(config)
+            
+            logger.info(
+                f"Loaded state for agent {self.agent_uuid}: "
+                f"{len(config.get('messages', []))} messages, "
+                f"container_id={config.get('container_id')}"
+            )
+            self._initialized = True
+            return config
+            
+        except Exception as e:
+            logger.error(f"Failed to load state for agent {self.agent_uuid}: {e}", exc_info=True)
+            self._initialized = True
+            return {}
     
     async def run(
         self,
@@ -307,6 +405,10 @@ class AnthropicAgent:
                 - container_id: Container ID (if applicable)
                 - total_steps: Number of agent steps taken
         """
+        # Ensure agent is initialized (loads state from DB if needed)
+        if not self._initialized:
+            await self.initialize()
+        
         #################################################################### 
         # The following params are used to track the agent's run state.
         # They are initialized per run.
@@ -375,14 +477,14 @@ class AnthropicAgent:
             )
             # Note: Memory-injected messages are NOT added to conversation_history
         
-        # Initialize token estimate for current context using API-based counting.
+        # Initialize token estimate for current context using heuristic estimation.
         # Combine client tools (tool_schemas) and server tools for token counting.
         combined_tools: list[dict[str, Any]] = []
         if self.tool_schemas:
             combined_tools.extend(self.tool_schemas)
         if self.server_tools:
             combined_tools.extend(self.server_tools)
-        api_token_count: Optional[int] = await self._count_tokens_api(
+        estimated_tokens: int = await self._estimate_tokens(
             messages=self.messages,
             system=self.system_prompt,
             tools=combined_tools or None,
@@ -394,8 +496,7 @@ class AnthropicAgent:
             betas=self.beta_headers or None,
             container=self.container_id,
         )
-        if api_token_count is not None:
-            self._last_known_input_tokens = api_token_count
+        self._last_known_input_tokens = estimated_tokens
         
         step = 0
         while step < self.max_steps:
@@ -465,10 +566,13 @@ class AnthropicAgent:
                 ]
                 
                 if tool_calls:
-                    # Build tool results message
-                    # TODO: Execute tool calls parallelly.
+                    # Separate tool calls into backend vs frontend
+                    backend_tool_calls = [t for t in tool_calls if t.name not in self.frontend_tool_names]
+                    frontend_tool_calls = [t for t in tool_calls if t.name in self.frontend_tool_names]
+                    
+                    # Execute ALL backend tools first
                     tool_results = []
-                    for tool_call in tool_calls:
+                    for tool_call in backend_tool_calls:
                         is_error = False
                         result_content = None
                         try:
@@ -516,7 +620,46 @@ class AnthropicAgent:
                             "success": not is_error,
                         }, step_number=step)
                     
-                    # Add tool results to live context and conversation history
+                    # If frontend tools exist, pause and wait for browser execution
+                    if frontend_tool_calls:
+                        # Store backend results for later (will be combined with frontend results)
+                        self._pending_backend_results = tool_results
+                        self._pending_frontend_tools = [
+                            {"tool_use_id": t.id, "name": t.name, "input": t.input}
+                            for t in frontend_tool_calls
+                        ]
+                        self._awaiting_frontend_tools = True
+                        self._current_step = step
+                        
+                        # Log: awaiting frontend tools
+                        self._log_action("awaiting_frontend_tools", {
+                            "frontend_tools": [t.name for t in frontend_tool_calls],
+                            "backend_results_count": len(tool_results),
+                        }, step_number=step)
+                        
+                        # Emit all pending frontend tools to client
+                        if queue is not None:
+                            tools_json = html.escape(json.dumps(self._pending_frontend_tools), quote=True)
+                            await queue.put(f'<awaiting_frontend_tools data="{tools_json}"></awaiting_frontend_tools>')
+                        
+                        # Persist state to DB before returning (required for re-hydration)
+                        await self._save_agent_config()
+                        
+                        # Return early with partial result (agent is paused)
+                        return AgentResult(
+                            final_message=accumulated_message,
+                            final_answer="",
+                            conversation_history=self.conversation_history.copy(),
+                            stop_reason="awaiting_frontend_tools",
+                            model=accumulated_message.model,
+                            usage=accumulated_message.usage,
+                            container_id=self.container_id,
+                            total_steps=step,
+                            agent_logs=self.agent_logs.copy(),
+                            generated_files=None
+                        )
+                    
+                    # No frontend tools - add all tool results and continue
                     tool_result_message = {
                         "role": "user",
                         "content": tool_results
@@ -634,17 +777,177 @@ class AnthropicAgent:
         logger.warning(f"Max steps ({self.max_steps}) reached, generating final summary")
         return await self._generate_final_summary(queue=queue, formatter=formatter)
     
+    def _apply_cache_control(
+        self,
+        messages: list[dict[str, Any]],
+        system: str | None = None
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | str | None]:
+        """Apply cache_control to message content blocks with prioritized slot allocation.
+        
+        Anthropic limits cache_control to 4 blocks maximum. This method applies
+        caching in priority order:
+        1. System prompt (if large enough)
+        2. Document/image blocks (high value, typically large)
+        3. Large text blocks (sorted by size)
+        4. Recent message blocks (fallback)
+        
+        Args:
+            messages: List of message dicts to process
+            system: Optional system prompt string
+            
+        Returns:
+            Tuple of (processed_messages, processed_system) where:
+            - processed_messages: Messages with cache_control applied to priority blocks
+            - processed_system: Either block-format list with cache_control, or original string
+        """
+        if not self.enable_cache_control:
+            return messages, system
+        
+        # Determine minimum token threshold based on model
+        min_tokens = (
+            MIN_CACHE_TOKENS_HAIKU 
+            if "haiku" in self.model.lower() 
+            else MIN_CACHE_TOKENS_SONNET
+        )
+        remaining_slots = MAX_CACHE_BLOCKS
+        
+        # Block types that support cache_control
+        supported_types = {"text", "image", "document"}
+        
+        # Track which blocks to cache: list of (msg_idx, block_idx) tuples
+        blocks_to_cache: list[tuple[int, int]] = []
+        
+        # ----------------------------------------------------------------
+        # Priority 1: System prompt
+        # ----------------------------------------------------------------
+        processed_system: list[dict[str, Any]] | str | None = system
+        if system and remaining_slots > 0:
+            system_tokens = len(system) // 4  # Reuse existing heuristic
+            if system_tokens >= min_tokens:
+                # Convert to block format with cache_control
+                processed_system = [{
+                    "type": "text",
+                    "text": system,
+                    "cache_control": {"type": "ephemeral"}
+                }]
+                remaining_slots -= 1
+        
+        # ----------------------------------------------------------------
+        # Priority 2: Document/Image blocks (scan all messages)
+        # ----------------------------------------------------------------
+        doc_image_blocks: list[tuple[int, int]] = []
+        for msg_idx, msg in enumerate(messages):
+            content = msg.get("content", [])
+            if not isinstance(content, list):
+                continue
+            for block_idx, block in enumerate(content):
+                if not isinstance(block, dict):
+                    continue
+                block_type = block.get("type")
+                if block_type in ("document", "image"):
+                    doc_image_blocks.append((msg_idx, block_idx))
+        
+        # Add document/image blocks up to remaining slots
+        for loc in doc_image_blocks:
+            if remaining_slots <= 0:
+                break
+            blocks_to_cache.append(loc)
+            remaining_slots -= 1
+        
+        # ----------------------------------------------------------------
+        # Priority 3: Large text blocks (sorted by size descending)
+        # ----------------------------------------------------------------
+        if remaining_slots > 0:
+            large_text_blocks: list[tuple[int, int, int]] = []  # (msg_idx, block_idx, size)
+            for msg_idx, msg in enumerate(messages):
+                content = msg.get("content", [])
+                if not isinstance(content, list):
+                    continue
+                for block_idx, block in enumerate(content):
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "text" and "text" in block:
+                        text_len = len(block["text"])
+                        text_tokens = text_len // 4
+                        if text_tokens >= min_tokens:
+                            # Skip if already marked for caching (shouldn't happen but safe)
+                            if (msg_idx, block_idx) not in blocks_to_cache:
+                                large_text_blocks.append((msg_idx, block_idx, text_len))
+            
+            # Sort by size descending and add up to remaining slots
+            large_text_blocks.sort(key=lambda x: x[2], reverse=True)
+            for msg_idx, block_idx, _ in large_text_blocks:
+                if remaining_slots <= 0:
+                    break
+                blocks_to_cache.append((msg_idx, block_idx))
+                remaining_slots -= 1
+        
+        # ----------------------------------------------------------------
+        # Priority 4: Recent message blocks (fallback)
+        # ----------------------------------------------------------------
+        if remaining_slots > 0:
+            # Iterate messages in reverse, then blocks in reverse
+            for msg_idx in range(len(messages) - 1, -1, -1):
+                if remaining_slots <= 0:
+                    break
+                msg = messages[msg_idx]
+                role = msg.get("role")
+                content = msg.get("content", [])
+                
+                # Only process user/assistant messages with list content
+                if role not in ("user", "assistant") or not isinstance(content, list):
+                    continue
+                
+                for block_idx in range(len(content) - 1, -1, -1):
+                    if remaining_slots <= 0:
+                        break
+                    block = content[block_idx]
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") in supported_types:
+                        # Skip if already marked for caching
+                        if (msg_idx, block_idx) not in blocks_to_cache:
+                            blocks_to_cache.append((msg_idx, block_idx))
+                            remaining_slots -= 1
+        
+        # ----------------------------------------------------------------
+        # Build result messages with cache_control applied to selected blocks
+        # ----------------------------------------------------------------
+        blocks_to_cache_set = set(blocks_to_cache)
+        result: list[dict[str, Any]] = []
+        
+        for msg_idx, msg in enumerate(messages):
+            role = msg.get("role")
+            content = msg.get("content", [])
+            
+            # Pass through messages without list content unchanged
+            if not isinstance(content, list):
+                result.append(msg)
+                continue
+            
+            # Deep copy message and inject cache_control into selected blocks
+            new_msg = {"role": role, "content": []}
+            for block_idx, block in enumerate(content):
+                new_block = dict(block) if isinstance(block, dict) else block
+                if (msg_idx, block_idx) in blocks_to_cache_set:
+                    new_block["cache_control"] = {"type": "ephemeral"}
+                new_msg["content"].append(new_block)
+            result.append(new_msg)
+        
+        return result, processed_system
+    
     def _prepare_request_params(self) -> dict:
-        # Prepare request parameters
+        # Prepare request parameters with prioritized cache_control applied
+        messages, system = self._apply_cache_control(self.messages, self.system_prompt)
         request_params = {
             "model": self.model,
             "max_tokens": self.max_tokens,
-            "messages": self.messages,
+            "messages": messages,
         }
         
-        # Add optional parameters
-        if self.system_prompt:
-            request_params["system"] = self.system_prompt
+        # Add system prompt (may be block format with cache_control or original string)
+        if system:
+            request_params["system"] = system
         
         if self.thinking_tokens > 0:
             request_params["thinking"] = {
@@ -652,10 +955,12 @@ class AnthropicAgent:
                 "budget_tokens": self.thinking_tokens
             }
         
-        # Merge client tools (tool_schemas) and Anthropic server tools for this call.
+        # Merge client tools (tool_schemas), frontend tools, and Anthropic server tools for this call.
         combined_tools: list[dict[str, Any]] = []
         if self.tool_schemas:
             combined_tools.extend(self.tool_schemas)
+        if self.frontend_tool_schemas:
+            combined_tools.extend(self.frontend_tool_schemas)
         if self.server_tools:
             combined_tools.extend(self.server_tools)
         if combined_tools:
@@ -687,6 +992,369 @@ class AnthropicAgent:
             return "No tools have been registered for this agent."
         
         return self.tool_registry.execute(tool_name, tool_input)
+    
+    async def continue_with_tool_results(
+        self,
+        frontend_results: list[dict],
+        queue: Optional[asyncio.Queue] = None,
+        formatter: Optional[FormatterType] = None,
+    ) -> AgentResult:
+        """Resume agent execution after frontend tools have been executed.
+        
+        This method is called after the browser executes frontend tools and POSTs
+        the results back. It combines backend results (already executed) with
+        frontend results, adds them to the conversation, and continues the agent loop.
+        
+        Args:
+            frontend_results: List of frontend tool results, each containing:
+                - tool_use_id: ID of the tool call being responded to
+                - content: String result from frontend execution
+                - is_error: Optional boolean indicating if execution failed
+            queue: Optional async queue to stream formatted output chunks
+            formatter: Formatter to use for stream output ("xml" or "raw")
+            
+        Returns:
+            AgentResult from continuing the agent run
+            
+        Raises:
+            ValueError: If agent is not awaiting frontend tools, or if tool_use_ids
+                don't match the pending frontend tools
+        """
+        if not self._awaiting_frontend_tools:
+            raise ValueError("Agent is not awaiting frontend tools")
+        
+        if not self._pending_frontend_tools:
+            raise ValueError("No pending frontend tools found - state may not have been loaded from DB")
+        
+        # Initialize run state if resuming from DB (these are normally set in run())
+        if not hasattr(self, 'conversation_history') or not self.conversation_history:
+            self.conversation_history = getattr(self, '_loaded_conversation_history', []).copy()
+        if not hasattr(self, 'agent_logs'):
+            self.agent_logs = []
+        if not hasattr(self, '_run_logs_buffer'):
+            self._run_logs_buffer = []
+        if not hasattr(self, '_run_id'):
+            self._run_id = str(uuid.uuid4())
+        if not hasattr(self, '_run_start_time'):
+            self._run_start_time = datetime.now()
+        
+        # Validate all tool_use_ids match pending tools
+        pending_ids = {t["tool_use_id"] for t in self._pending_frontend_tools}
+        result_ids = {r["tool_use_id"] for r in frontend_results}
+        if pending_ids != result_ids:
+            raise ValueError(
+                f"Tool result mismatch. Expected tool_use_ids: {pending_ids}, got: {result_ids}"
+            )
+        
+        # Combine backend + frontend results (backend results come first)
+        all_results = self._pending_backend_results + [
+            {
+                "type": "tool_result",
+                "tool_use_id": r["tool_use_id"],
+                "content": r["content"],
+                **({"is_error": True} if r.get("is_error") else {})
+            }
+            for r in frontend_results
+        ]
+        
+        # Stream frontend tool results to queue
+        if queue is not None:
+            for r in frontend_results:
+                tool_use_id = html.escape(str(r["tool_use_id"]), quote=True)
+                # Find the tool name from pending tools
+                tool_name = next(
+                    (t["name"] for t in self._pending_frontend_tools if t["tool_use_id"] == r["tool_use_id"]),
+                    "unknown"
+                )
+                tool_name = html.escape(tool_name, quote=True)
+                content_str = r["content"] if isinstance(r["content"], str) else json.dumps(r["content"], default=str)
+                await queue.put(
+                    f'<content-block-tool_result id="{tool_use_id}" name="{tool_name}"><![CDATA[{content_str}]]></content-block-tool_result>'
+                )
+        
+        # Add combined tool results to messages and conversation history
+        tool_result_message = {
+            "role": "user",
+            "content": all_results
+        }
+        self.messages.append(tool_result_message)
+        self.conversation_history.append(tool_result_message)
+        
+        # Log: frontend tools completed
+        self._log_action("frontend_tools_completed", {
+            "frontend_results_count": len(frontend_results),
+            "backend_results_count": len(self._pending_backend_results),
+            "total_results": len(all_results),
+        }, step_number=self._current_step)
+        
+        # Clear pending state
+        self._pending_frontend_tools = []
+        self._pending_backend_results = []
+        self._awaiting_frontend_tools = False
+        
+        # Update token estimate
+        delta_tokens: int = await self._estimate_tokens(
+            messages=[tool_result_message],
+            system=None,
+            tools=None,
+            thinking=None,
+            betas=None,
+            container=None,
+        )
+        self._last_known_input_tokens += delta_tokens
+        
+        # Resume agent loop from current step
+        return await self._resume_run(queue=queue, formatter=formatter)
+    
+    async def _resume_run(
+        self,
+        queue: Optional[asyncio.Queue] = None,
+        formatter: Optional[FormatterType] = None,
+    ) -> AgentResult:
+        """Internal method to resume the agent loop after frontend tool completion.
+        
+        This continues from the current step, streaming responses and handling
+        any subsequent tool calls.
+        """
+        step = self._current_step
+        
+        while step < self.max_steps:
+            step += 1
+            self._current_step = step
+            
+            # Always pass through compactor (it decides whether to compact)
+            if self.compactor:
+                self._apply_compaction(step_number=step)
+            
+            # Prepare request parameters
+            request_params = self._prepare_request_params()
+            
+            # Stream the response with retry logic
+            accumulated_message = await anthropic_stream_with_backoff(
+                client=self.client,
+                request_params=request_params,
+                queue=queue,
+                max_retries=self.max_retries,
+                base_delay=self.base_delay,
+                formatter=formatter if formatter is not None else self.formatter,
+            )
+            
+            # Track token usage from API response
+            input_tokens = accumulated_message.usage.input_tokens
+            output_tokens = accumulated_message.usage.output_tokens
+            self._last_known_input_tokens = input_tokens + output_tokens
+            self._last_known_output_tokens = output_tokens
+            self._token_usage_history.append({
+                "step": step,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cache_creation_input_tokens": accumulated_message.usage.cache_creation_input_tokens,
+                "cache_read_input_tokens": accumulated_message.usage.cache_read_input_tokens,
+            })
+            
+            # Log: API response received
+            self._log_action("api_response_received", {
+                "stop_reason": accumulated_message.stop_reason,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+            }, step_number=step)
+            
+            # Add assistant's response to messages and conversation history
+            assistant_message = accumulated_message.model_dump(
+                mode="json",
+                include=["role", "content"],
+                exclude_unset=True,
+                exclude=getattr(accumulated_message, "__api_exclude__", None),
+                warnings=False
+            )
+            self.messages.append(assistant_message)
+            self.conversation_history.append(assistant_message)
+            logger.debug("Assistant message: %s", assistant_message)
+            if accumulated_message.container is not None:
+                self.container_id = accumulated_message.container.id
+            
+            # Check if there are tool calls to execute
+            if accumulated_message.stop_reason == "tool_use":
+                tool_calls = [
+                    block for block in accumulated_message.content 
+                    if block.type == 'tool_use'
+                ]
+                
+                if tool_calls:
+                    # Separate backend vs frontend tools
+                    backend_tool_calls = [t for t in tool_calls if t.name not in self.frontend_tool_names]
+                    frontend_tool_calls = [t for t in tool_calls if t.name in self.frontend_tool_names]
+                    
+                    # Execute ALL backend tools first
+                    tool_results = []
+                    for tool_call in backend_tool_calls:
+                        is_error = False
+                        result_content = None
+                        try:
+                            result = self.execute_tool_call(tool_call.name, tool_call.input)
+                            if asyncio.iscoroutine(result):
+                                result = await result
+                            result_content = result
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": tool_call.id,
+                                "content": result
+                            })
+                        except Exception as e:
+                            is_error = True
+                            result_content = f"Error executing tool: {str(e)}"
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": tool_call.id,
+                                "content": result_content,
+                                "is_error": True
+                            })
+                        
+                        # Stream tool result to queue
+                        if queue is not None:
+                            tool_use_id = html.escape(str(tool_call.id), quote=True)
+                            tool_name = html.escape(str(tool_call.name), quote=True)
+                            if result_content is None:
+                                content_str = ""
+                            elif isinstance(result_content, str):
+                                content_str = result_content
+                            else:
+                                content_str = json.dumps(result_content, default=str)
+                            await queue.put(
+                                f'<content-block-tool_result id="{tool_use_id}" name="{tool_name}"><![CDATA[{content_str}]]></content-block-tool_result>'
+                            )
+                        
+                        self._log_action("tool_execution", {
+                            "tool_name": tool_call.name,
+                            "tool_use_id": tool_call.id,
+                            "success": not is_error,
+                        }, step_number=step)
+                    
+                    # If frontend tools exist, pause and wait
+                    if frontend_tool_calls:
+                        self._pending_backend_results = tool_results
+                        self._pending_frontend_tools = [
+                            {"tool_use_id": t.id, "name": t.name, "input": t.input}
+                            for t in frontend_tool_calls
+                        ]
+                        self._awaiting_frontend_tools = True
+                        self._current_step = step
+                        
+                        self._log_action("awaiting_frontend_tools", {
+                            "frontend_tools": [t.name for t in frontend_tool_calls],
+                            "backend_results_count": len(tool_results),
+                        }, step_number=step)
+                        
+                        if queue is not None:
+                            tools_json = html.escape(json.dumps(self._pending_frontend_tools), quote=True)
+                            await queue.put(f'<awaiting_frontend_tools data="{tools_json}"></awaiting_frontend_tools>')
+                        
+                        # Persist state to DB before returning (required for re-hydration)
+                        await self._save_agent_config()
+                        
+                        return AgentResult(
+                            final_message=accumulated_message,
+                            final_answer="",
+                            conversation_history=self.conversation_history.copy(),
+                            stop_reason="awaiting_frontend_tools",
+                            model=accumulated_message.model,
+                            usage=accumulated_message.usage,
+                            container_id=self.container_id,
+                            total_steps=step,
+                            agent_logs=self.agent_logs.copy(),
+                            generated_files=None
+                        )
+                    
+                    # No frontend tools - add results and continue
+                    tool_result_message = {
+                        "role": "user",
+                        "content": tool_results
+                    }
+                    self.messages.append(tool_result_message)
+                    self.conversation_history.append(tool_result_message)
+                    
+                    delta_tokens = await self._estimate_tokens(
+                        messages=[tool_result_message],
+                        system=None,
+                        tools=None,
+                        thinking=None,
+                        betas=None,
+                        container=None,
+                    )
+                    self._last_known_input_tokens += delta_tokens
+                    continue
+            
+            # If stop_reason is not "tool_use", validate final answer format
+            if accumulated_message.stop_reason != "tool_use":
+                if self.final_answer_check:
+                    extracted_final_answer = self._extract_final_answer(accumulated_message)
+                    success, error_message = self.final_answer_check(extracted_final_answer)
+                    if not success:
+                        self.agent_logs.append({
+                            "timestamp": datetime.now().isoformat(),
+                            "action": "final_answer_validation_failed",
+                            "details": {"error": error_message, "step": step}
+                        })
+                        logger.warning(f"Final answer validation failed at step {step}: {error_message}")
+                        
+                        error_user_message = {
+                            "role": "user",
+                            "content": [{
+                                "type": "text",
+                                "text": error_message
+                            }]
+                        }
+                        self.messages.append(error_user_message)
+                        self.conversation_history.append(error_user_message)
+                        continue
+                
+            # Update memory store
+            if self.memory_store:
+                memory_metadata = self.memory_store.update(
+                    messages=self.messages,
+                    conversation_history=self.conversation_history,
+                    tools=self.tool_schemas,
+                    model=self.model
+                )
+                self.agent_logs.append({
+                    "timestamp": datetime.now().isoformat(),
+                    "action": "memory_update",
+                    "details": memory_metadata
+                })
+                logger.info(f"Memory updated: {memory_metadata}")
+
+            # Build AgentResult
+            result = AgentResult(
+                final_message=accumulated_message,
+                final_answer=self._extract_final_answer(accumulated_message),
+                conversation_history=self.conversation_history.copy(),
+                stop_reason=accumulated_message.stop_reason,
+                model=accumulated_message.model,
+                usage=accumulated_message.usage,
+                container_id=self.container_id,
+                total_steps=step,
+                agent_logs=self.agent_logs.copy(),
+                generated_files=None
+            )
+            
+            self._log_action("run_completed", {
+                "stop_reason": accumulated_message.stop_reason,
+                "total_steps": step,
+                "total_input_tokens": accumulated_message.usage.input_tokens,
+                "total_output_tokens": accumulated_message.usage.output_tokens,
+            }, step_number=step)
+
+            # Finalize file processing
+            await self._finalize_file_processing(queue)
+            all_files_metadata: list[dict[str, Any]] = list(self.file_registry.values())
+            result.generated_files = all_files_metadata
+            self._save_run_data_async(result, all_files_metadata)
+            
+            return result
+
+        # Max steps reached
+        logger.warning(f"Max steps ({self.max_steps}) reached in _resume_run")
+        return await self._generate_final_summary(queue=queue, formatter=formatter)
     
     def _apply_compaction(self, step_number: int = 0) -> None:
         """Apply compaction to self.messages and log the event.
@@ -802,12 +1470,13 @@ class AnthropicAgent:
             "Please provide a final summary or response based on the work completed so far."
         )
         
-        # Prepare request parameters (tools disabled)
+        # Prepare request parameters (tools disabled) with prioritized cache_control applied
+        messages, system = self._apply_cache_control(self.messages, summary_system_prompt)
         request_params = {
             "model": self.model,
             "max_tokens": self.max_tokens,
-            "messages": self.messages,
-            "system": summary_system_prompt,
+            "messages": messages,
+            "system": system or summary_system_prompt,  # Fallback if caching returned None
         }
         
         # Add thinking tokens if configured
@@ -972,6 +1641,53 @@ class AnthropicAgent:
         """
         return self._last_known_input_tokens
     
+    def _filter_messages_for_token_count(
+        self,
+        messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Filter messages to remove content types unsupported by token counting API.
+        
+        The count_tokens endpoint doesn't support URL-based document sources
+        (especially PDFs). This method removes such blocks to prevent 400 errors.
+        
+        Args:
+            messages: List of message dicts to filter
+            
+        Returns:
+            Filtered messages list with unsupported content removed
+        """
+        filtered: list[dict[str, Any]] = []
+        
+        for msg in messages:
+            content = msg.get("content")
+            
+            # Pass through messages without list content unchanged
+            if not isinstance(content, list):
+                filtered.append(msg)
+                continue
+            
+            # Filter content blocks
+            filtered_content: list[dict[str, Any]] = []
+            for block in content:
+                if not isinstance(block, dict):
+                    filtered_content.append(block)
+                    continue
+                
+                # Check for document blocks with URL sources
+                if block.get("type") == "document":
+                    source = block.get("source", {})
+                    if isinstance(source, dict) and source.get("type") == "url":
+                        # Skip URL-based documents (not supported by count_tokens)
+                        continue
+                
+                filtered_content.append(block)
+            
+            # Only include message if it still has content
+            if filtered_content:
+                filtered.append({"role": msg.get("role"), "content": filtered_content})
+        
+        return filtered
+    
     async def _count_tokens_api(
         self,
         *,
@@ -984,9 +1700,19 @@ class AnthropicAgent:
     ) -> Optional[int]:
         """Best-effort token counting via Anthropic count_tokens API.
         
+        .. deprecated::
+            This method is deprecated and will be removed in a future version.
+            Use :meth:`_estimate_tokens` instead.
+        
         Returns:
             input_tokens from the API response, or None if the call fails.
         """
+        warnings.warn(
+            "_count_tokens_api is deprecated and will be removed in a future version. "
+            "Use _estimate_tokens instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
         # Filter tools to only those supported by the count_tokens API.
         # The endpoint currently only accepts a limited set of server tool
         # types; passing unsupported types like "code_execution_20250825"
@@ -1009,9 +1735,12 @@ class AnthropicAgent:
                 if tool_type is None or tool_type in allowed_server_tool_types:
                     filtered_tools.append(tool)
 
+        # Filter messages to remove unsupported content types (e.g., URL PDF sources)
+        filtered_messages = self._filter_messages_for_token_count(messages)
+
         params: dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
+            "messages": filtered_messages,
         }
         if system:
             params["system"] = system
@@ -1143,32 +1872,38 @@ class AnthropicAgent:
         }
         return json.dumps(config_snapshot, indent=2)
     
-    def _load_state_from_db(self) -> dict[str, Any]:
-        """Synchronously load agent configuration from database.
+    def _restore_state_from_config(self, config: dict[str, Any]) -> None:
+        """Restore agent state from a loaded configuration dict.
         
-        Called during __init__ if agent_uuid is provided.
+        Called by initialize() after loading config from database.
+        Updates agent instance variables with persisted state.
         
-        Returns:
-            Configuration dict loaded from the backend, or {} if not found or on error.
+        Args:
+            config: Configuration dict loaded from database
         """
-        try:
-            # Use asyncio.run since we're in __init__ (sync context)
-            config = asyncio.run(self.db_backend.load_agent_config(self.agent_uuid))
-            
-            if config is None:
-                # New agent - will be created on first run
-                logger.info(f"No existing state for agent {self.agent_uuid}, creating new")
-                return {}
-            
-            logger.info(
-                f"Loaded state for agent {self.agent_uuid}: "
-                f"{len(config.get('messages', []))} messages, "
-                f"container_id={config.get('container_id')}"
-            )
-            return config
-        except Exception as e:
-            logger.error(f"Failed to load state for agent {self.agent_uuid}: {e}", exc_info=True)
-            return {}
+        # Restore messages and container state
+        self.messages = config.get("messages", [])
+        self.container_id = config.get("container_id")
+        self.file_registry = config.get("file_registry", {})
+        self._last_known_input_tokens = config.get("last_known_input_tokens", 0)
+        self._last_known_output_tokens = config.get("last_known_output_tokens", 0)
+        
+        # Frontend tool relay state (for resume after browser execution)
+        self._pending_frontend_tools = config.get("pending_frontend_tools", [])
+        self._pending_backend_results = config.get("pending_backend_results", [])
+        self._awaiting_frontend_tools = config.get("awaiting_frontend_tools", False)
+        self._current_step = config.get("current_step", 0)
+        
+        # Conversation history - only load when resuming due to frontend tools
+        # Regular agent resumptions should start fresh with a new conversation_history.
+        # NOTE: This is the per-run history used to populate AgentResult, NOT the
+        # conversation_history TABLE which stores completed runs across user turns.
+        # When frontend tools pause the agent, we preserve this so AgentResult
+        # contains the complete run history after continuation.
+        if self._awaiting_frontend_tools:
+            self._loaded_conversation_history = config.get("conversation_history", [])
+        else:
+            self._loaded_conversation_history = []
     
     def _log_action(
         self,
@@ -1242,6 +1977,16 @@ class AnthropicAgent:
             "api_kwargs": self.api_kwargs,
             "last_known_input_tokens": self._last_known_input_tokens,
             "last_known_output_tokens": self._last_known_output_tokens,
+            # Frontend tool relay state (for resume after browser execution)
+            "pending_frontend_tools": self._pending_frontend_tools,
+            "pending_backend_results": self._pending_backend_results,
+            "awaiting_frontend_tools": self._awaiting_frontend_tools,
+            "current_step": self._current_step,
+            # NOTE: This conversation_history is the per-run history used to populate AgentResult.
+            # When frontend tools cause a pause, this preserves the current run's history so it
+            # can be returned in the AgentResult after continuation. This is distinct from the
+            # conversation_history TABLE which stores completed runs across multiple user turns.
+            "conversation_history": getattr(self, "conversation_history", []),
             # Preserve created_at from existing config, or set to now (as datetime)
             "created_at": (
                 datetime.fromisoformat(existing_config["created_at"].replace("Z", "+00:00"))
@@ -1249,7 +1994,7 @@ class AnthropicAgent:
                 else (existing_config.get("created_at") or datetime.now())
             ),
             "updated_at": datetime.now(),
-            "last_run_at": self._run_start_time if self._run_start_time else None,
+            "last_run_at": getattr(self, "_run_start_time", None),
             # Increment total_runs counter
             "total_runs": existing_config.get("total_runs", 0) + 1,
         }

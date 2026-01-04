@@ -1,4 +1,8 @@
 /**
+ * Shared type definitions for parser inputs/outputs (AgentNode tree + Anthropic streaming event shapes).
+ * Parsers in this folder normalize different stream formats into AgentNode[] for rendering.
+ */
+/**
  * Core types for the agent stream parser library.
  * These types are used across all parsers and can be exported for use in other projects.
  */
@@ -15,6 +19,19 @@ export interface AgentNode {
   tagName?: string; // For element nodes
   attributes?: Record<string, string>; // For element nodes
   children?: AgentNode[]; // For element nodes
+}
+
+/**
+ * Citation data from Anthropic API (used in content_block_stop events).
+ */
+export interface Citation {
+  cited_text?: string;
+  type?: string;
+  url?: string;
+  title?: string;
+  document_index?: string;
+  start_page_number?: string;
+  end_page_number?: string;
 }
 
 // ============================================================================
@@ -104,6 +121,10 @@ export interface ContentBlockDeltaEvent {
 export interface ContentBlockStopEvent {
   type: 'content_block_stop';
   index: number;
+  content_block?: {
+    citations?: Citation[];
+    [key: string]: any;
+  };
 }
 
 export type AnthropicEvent = 
@@ -133,5 +154,28 @@ export interface MetaInit {
   message_history: any[];
   agent_uuid: string;
   model: string;
+}
+
+// ============================================================================
+// Frontend Tool Types (for browser-executed tools)
+// ============================================================================
+
+/**
+ * Pending frontend tool waiting for browser execution.
+ * Received from the agent via the awaiting_frontend_tools tag.
+ */
+export interface PendingFrontendTool {
+  tool_use_id: string;
+  name: string;
+  input: Record<string, unknown>;
+}
+
+/**
+ * Result of frontend tool execution to send back to the agent.
+ */
+export interface FrontendToolResult {
+  tool_use_id: string;
+  content: string;
+  is_error?: boolean;
 }
 
