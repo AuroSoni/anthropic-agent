@@ -790,7 +790,7 @@ async def generate_title(
 ) -> GenerateTitleResponse:
     """Generate a conversation title using LiteLLM.
     
-    Uses OpenAI GPT-4o-mini for fast, cost-effective title generation.
+    Uses OpenAI GPT-5-mini for fast, cost-effective title generation.
     The title is persisted to the agent_config in the database.
     
     Args:
@@ -828,7 +828,6 @@ async def generate_title(
             ],
             response_format={"type": "json_object"},
             max_tokens=100,
-            temperature=0.3,
         )
         
         result = json.loads(response.choices[0].message.content)
