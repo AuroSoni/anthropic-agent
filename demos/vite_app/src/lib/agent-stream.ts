@@ -64,7 +64,7 @@ export interface AgentConfig {
   max_steps?: number;
   formatter?: StreamFormat;
   agent_type?: AgentType;
-  // Add other config options as needed
+  agent_uuid?: string; // UUID to resume existing conversation
 }
 
 export type AgentStreamCallbacks = {
@@ -153,6 +153,7 @@ export async function streamAgent(
       body: JSON.stringify({
         user_prompt: userPrompt,
         agent_type: config?.agent_type,
+        agent_uuid: config?.agent_uuid,
       }),
 
       onopen: async (response) => {

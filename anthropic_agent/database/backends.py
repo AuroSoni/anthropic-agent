@@ -71,6 +71,26 @@ class DatabaseBackend(Protocol):
         """
         ...
     
+    async def load_conversation_history_cursor(
+        self,
+        agent_uuid: str,
+        before: int | None = None,
+        limit: int = 20
+    ) -> tuple[list[dict], bool]:
+        """Load conversations with cursor-based pagination.
+        
+        Designed for infinite scroll UIs that load newest-to-oldest.
+        
+        Args:
+            agent_uuid: Agent session UUID
+            before: Load conversations with sequence_number < before (None = latest)
+            limit: Maximum conversations to return
+            
+        Returns:
+            Tuple of (conversations newest->oldest, has_more)
+        """
+        ...
+    
     async def save_agent_run_logs(
         self, 
         agent_uuid: str, 
@@ -228,6 +248,55 @@ class FilesystemBackend:
         
         logger.debug(f"Loaded {len(conversations)} conversations for {agent_uuid}")
         return conversations
+    
+    async def load_conversation_history_cursor(
+        self,
+        agent_uuid: str,
+        before: int | None = None,
+        limit: int = 20
+    ) -> tuple[list[dict], bool]:
+        """Load conversations with cursor-based pagination (newest first).
+        
+        Args:
+            agent_uuid: Agent session UUID
+            before: Load conversations with sequence_number < before (None = latest)
+            limit: Maximum conversations to return
+            
+        Returns:
+            Tuple of (conversations newest->oldest, has_more)
+        """
+        conv_dir = self.base_path / "conversation_history" / agent_uuid
+        
+        if not conv_dir.exists():
+            return [], False
+        
+        # Get all conversation files sorted by sequence number descending
+        conv_files = sorted(conv_dir.glob("[0-9]*.json"), reverse=True)
+        
+        # Filter by cursor if provided
+        if before is not None:
+            # Extract sequence number from filename (e.g., "001.json" -> 1)
+            conv_files = [
+                f for f in conv_files
+                if int(f.stem) < before
+            ]
+        
+        # Take limit + 1 to determine has_more
+        selected_files = conv_files[:limit + 1]
+        has_more = len(selected_files) > limit
+        files_to_load = selected_files[:limit]
+        
+        # Load conversations
+        conversations = []
+        for conv_file in files_to_load:
+            with open(conv_file, "r") as f:
+                conversations.append(json.load(f))
+        
+        logger.debug(
+            f"Loaded {len(conversations)} conversations for {agent_uuid} "
+            f"(before={before}, has_more={has_more})"
+        )
+        return conversations, has_more
     
     async def save_agent_run_logs(
         self, 
@@ -650,6 +719,82 @@ class SQLBackend:
         
         logger.debug(f"Loaded {len(conversations)} conversations for {agent_uuid}")
         return conversations
+    
+    async def load_conversation_history_cursor(
+        self,
+        agent_uuid: str,
+        before: int | None = None,
+        limit: int = 20
+    ) -> tuple[list[dict], bool]:
+        """Load conversations with cursor-based pagination (newest first).
+        
+        Args:
+            agent_uuid: Agent session UUID
+            before: Load conversations with sequence_number < before (None = latest)
+            limit: Maximum conversations to return
+            
+        Returns:
+            Tuple of (conversations newest->oldest, has_more)
+        """
+        pool = await self._get_pool()
+        
+        # Build query with optional cursor filter
+        # Fetch limit + 1 to determine has_more
+        if before is not None:
+            query = """
+                SELECT 
+                    conversation_id, agent_uuid, run_id, started_at, completed_at,
+                    user_message, final_response, messages, stop_reason, total_steps,
+                    usage, generated_files, sequence_number, created_at
+                FROM conversation_history
+                WHERE agent_uuid = $1 AND sequence_number < $2
+                ORDER BY sequence_number DESC
+                LIMIT $3
+            """
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(query, agent_uuid, before, limit + 1)
+        else:
+            query = """
+                SELECT 
+                    conversation_id, agent_uuid, run_id, started_at, completed_at,
+                    user_message, final_response, messages, stop_reason, total_steps,
+                    usage, generated_files, sequence_number, created_at
+                FROM conversation_history
+                WHERE agent_uuid = $1
+                ORDER BY sequence_number DESC
+                LIMIT $2
+            """
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(query, agent_uuid, limit + 1)
+        
+        # Determine has_more and slice to limit
+        has_more = len(rows) > limit
+        rows_to_process = rows[:limit]
+        
+        conversations = []
+        for row in rows_to_process:
+            conversations.append({
+                "conversation_id": str(row["conversation_id"]),
+                "agent_uuid": str(row["agent_uuid"]),
+                "run_id": str(row["run_id"]),
+                "started_at": self._parse_datetime(row["started_at"]),
+                "completed_at": self._parse_datetime(row["completed_at"]),
+                "user_message": row["user_message"],
+                "final_response": row["final_response"],
+                "messages": self._from_jsonb(row["messages"]),
+                "stop_reason": row["stop_reason"],
+                "total_steps": row["total_steps"],
+                "usage": self._from_jsonb(row["usage"]),
+                "generated_files": self._from_jsonb(row["generated_files"]),
+                "sequence_number": row["sequence_number"],
+                "created_at": self._parse_datetime(row["created_at"]),
+            })
+        
+        logger.debug(
+            f"Loaded {len(conversations)} conversations for {agent_uuid} "
+            f"(before={before}, has_more={has_more})"
+        )
+        return conversations, has_more
     
     async def save_agent_run_logs(
         self, 

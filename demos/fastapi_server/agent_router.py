@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 
 import anthropic
 import httpx
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, model_validator
 
@@ -81,11 +81,10 @@ class AgentRunRequest(BaseModel):
 
     @model_validator(mode='after')
     def validate_agent_source(self) -> "AgentRunRequest":
-        if self.agent_uuid and self.agent_type:
-            raise ValueError("Only one of agent_uuid or agent_type can be provided")
-        # Default to agent_all_raw if neither provided
+        # Allow both agent_uuid and agent_type (agent_type provides config)
+        # Default to agent_frontend_tools if neither provided
         if not self.agent_uuid and not self.agent_type:
-            self.agent_type = "agent_all_raw"
+            self.agent_type = "agent_frontend_tools"
         return self
 
 
@@ -115,6 +114,28 @@ class ToolResultsRequest(BaseModel):
     """Request to submit frontend tool results and resume agent execution."""
     agent_uuid: str
     tool_results: list[ToolResult]
+
+
+class ConversationItem(BaseModel):
+    """A single conversation turn in the history."""
+    conversation_id: str
+    run_id: str
+    sequence_number: int
+    user_message: str
+    final_response: str | None
+    started_at: str | None
+    completed_at: str | None
+    stop_reason: str | None
+    total_steps: int | None
+    usage: dict | None
+    generated_files: list[dict] | None
+    messages: list[dict]
+
+
+class ConversationListResponse(BaseModel):
+    """Response for paginated conversation history."""
+    conversations: list[ConversationItem]
+    has_more: bool
 
 
 ########################################################
@@ -334,6 +355,15 @@ async def stream_agent_response(
         # Wait for agent to complete
         await agent_task
         
+        # Wait for background persistence tasks to complete
+        # This prevents "Event loop is closed" errors from asyncpg
+        try:
+            drain_result = await agent.drain_background_tasks(timeout=10.0)
+            if drain_result.get("timed_out", 0) > 0:
+                logger.warning(f"Some persistence tasks timed out: {drain_result}")
+        except Exception as e:
+            logger.warning(f"Error draining background tasks: {e}")
+        
         # Send final SSE marker to close stream
         yield "data: [DONE]\n\n"
         
@@ -394,6 +424,15 @@ async def stream_tool_results_response(
         
         # Wait for agent to complete
         await agent_task
+        
+        # Wait for background persistence tasks to complete
+        # This prevents "Event loop is closed" errors from asyncpg
+        try:
+            drain_result = await agent.drain_background_tasks(timeout=10.0)
+            if drain_result.get("timed_out", 0) > 0:
+                logger.warning(f"Some persistence tasks timed out: {drain_result}")
+        except Exception as e:
+            logger.warning(f"Error draining background tasks: {e}")
         
         # Send final SSE marker
         yield "data: [DONE]\n\n"
@@ -591,3 +630,76 @@ async def upload_files(
                 )
     
     return UploadResponse(files=uploaded_files)
+
+
+@router.get("/{agent_uuid}/conversations")
+async def get_conversations(
+    agent_uuid: str,
+    before: int | None = Query(default=None, description="Load conversations with sequence_number < before"),
+    limit: int = Query(default=20, le=100, description="Maximum conversations to return"),
+    agent_type: AgentType = Query(default="agent_frontend_tools", description="Agent type to determine database backend"),
+) -> ConversationListResponse:
+    """Get paginated conversation history for an agent (newest first).
+    
+    Uses cursor-based pagination for efficient infinite scroll. On initial load,
+    omit the `before` parameter to get the newest conversations. For subsequent
+    pages, pass the smallest `sequence_number` from the previous response as `before`.
+    
+    Args:
+        agent_uuid: The agent's UUID
+        before: Load conversations with sequence_number < this value (None = latest)
+        limit: Maximum number of conversations to return (max 100)
+        agent_type: Agent type to determine which database backend to query
+        
+    Returns:
+        ConversationListResponse with conversations and has_more flag
+        
+    Example:
+        ```
+        # Initial load (newest conversations)
+        GET /agent/{uuid}/conversations?limit=20
+        
+        # Load older conversations (scroll up)
+        GET /agent/{uuid}/conversations?before=31&limit=20
+        ```
+    """
+    # Get the database backend from the agent config
+    config = AGENT_CONFIGS.get(agent_type)
+    if not config or not config.db_backend:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid agent_type or no database backend configured: {agent_type}",
+        )
+    
+    db_backend = config.db_backend
+    
+    # Load conversations using cursor-based pagination
+    conversations, has_more = await db_backend.load_conversation_history_cursor(
+        agent_uuid=agent_uuid,
+        before=before,
+        limit=limit,
+    )
+    
+    # Convert to response models
+    items = [
+        ConversationItem(
+            conversation_id=conv.get("conversation_id", ""),
+            run_id=conv.get("run_id", ""),
+            sequence_number=conv.get("sequence_number", 0),
+            user_message=conv.get("user_message", ""),
+            final_response=conv.get("final_response"),
+            started_at=conv.get("started_at"),
+            completed_at=conv.get("completed_at"),
+            stop_reason=conv.get("stop_reason"),
+            total_steps=conv.get("total_steps"),
+            usage=conv.get("usage"),
+            generated_files=conv.get("generated_files"),
+            messages=conv.get("messages", []),
+        )
+        for conv in conversations
+    ]
+    
+    return ConversationListResponse(
+        conversations=items,
+        has_more=has_more,
+    )
