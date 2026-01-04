@@ -13,6 +13,7 @@ from anthropic.types.beta import BetaMessage, FileMetadata
 
 from .types import AgentResult
 from .retry import anthropic_stream_with_backoff, retry_with_backoff
+from .title_generator import generate_title
 from ..tools.base import ToolRegistry
 from ..streaming import FormatterType
 from .compaction import CompactorType, get_compactor, Compactor
@@ -2073,6 +2074,41 @@ class AnthropicAgent:
             self._run_logs_buffer
         )
     
+    def _extract_first_user_message(self) -> str | None:
+        """Extract the first user message from conversation history."""
+        for msg in self.messages:
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    return content
+                if isinstance(content, list):
+                    # Handle content blocks
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            return block.get("text", "")
+        return None
+    
+    async def _generate_and_save_title(self, user_message: str) -> None:
+        """Background task to generate and persist conversation title.
+        
+        Only runs for new conversations (no existing title).
+        """
+        if not self.db_backend:
+            return
+        
+        # Check if title already exists
+        existing_config = await self.db_backend.load_agent_config(self.agent_uuid)
+        if existing_config and existing_config.get("title"):
+            return  # Don't overwrite existing title
+        
+        title = await generate_title(user_message)
+        
+        try:
+            await self.db_backend.update_agent_title(self.agent_uuid, title)
+            logger.debug(f"Generated title for {self.agent_uuid}: {title}")
+        except Exception as e:
+            logger.error(f"Failed to save title for {self.agent_uuid}: {e}")
+    
     async def _save_run_data_with_retry(
         self,
         result: AgentResult,
@@ -2110,6 +2146,17 @@ class AnthropicAgent:
                     "error_type": type(e).__name__,
                 }
                 self._on_persistence_failure(e, failure_metadata)
+        
+        # Schedule title generation as background task
+        # The _generate_and_save_title method checks if title already exists before generating
+        if self.db_backend:
+            user_message = self._extract_first_user_message()
+            if user_message:
+                title_task = asyncio.create_task(
+                    self._generate_and_save_title(user_message)
+                )
+                self._background_tasks.add(title_task)
+                title_task.add_done_callback(self._background_tasks.discard)
     
     def _save_run_data_async(
         self,

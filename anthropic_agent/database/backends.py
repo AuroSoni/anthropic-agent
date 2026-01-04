@@ -471,9 +471,10 @@ class SQLBackend:
             self._pool = await asyncpg.create_pool(
                 self._connection_string,
                 min_size=1,
-                max_size=self._pool_size
+                max_size=self._pool_size,
+                server_settings={'timezone': 'Asia/Kolkata'}
             )
-            logger.info(f"Created PostgreSQL connection pool (max_size={self._pool_size})")
+            logger.info(f"Created PostgreSQL connection pool (max_size={self._pool_size}, timezone=Asia/Kolkata)")
         return self._pool
     
     async def close(self) -> None:

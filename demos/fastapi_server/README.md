@@ -163,40 +163,6 @@ curl "http://127.0.0.1:8000/agent/abc-123/conversations?limit=10"
 
 ---
 
-### `POST /agent/{agent_uuid}/title` - Generate Conversation Title
-
-Generates a title for the conversation using LLM (GPT-4o-mini via LiteLLM).
-
-#### Request
-
-```json
-{
-  "user_message": "The first message from the user"
-}
-```
-
-#### Query Parameters
-
-- **`agent_type`** (default: `agent_frontend_tools`): Determines database backend
-
-#### Example
-
-```bash
-curl -X POST "http://127.0.0.1:8000/agent/abc-123/title" \
-  -H "Content-Type: application/json" \
-  -d '{"user_message":"Help me debug my Python code"}'
-```
-
-#### Response
-
-```json
-{
-  "title": "Python Debugging Help"
-}
-```
-
----
-
 ### `POST /agent/upload` - Upload Files
 
 Uploads files to Anthropic Files API.

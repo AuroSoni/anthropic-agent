@@ -7,7 +7,7 @@ import {
   type UserPrompt,
   type FrontendToolResult,
 } from '../lib/agent-stream';
-import { fetchConversationHistory, generateConversationTitle } from '../lib/api';
+import { fetchConversationHistory } from '../lib/api';
 import { useAgentUrlState } from './use-url-state';
 import { convertMessagesToNodes } from '../lib/message-converter';
 import type { AgentNode } from '../lib/parsers/types';
@@ -41,7 +41,6 @@ export interface ConversationState {
   error?: string;
   pendingFrontendTools?: AgentState['pendingFrontendTools'];
   title?: string;
-  isGeneratingTitle: boolean;
 }
 
 /**
@@ -56,7 +55,6 @@ export function useConversation() {
     isLoadingHistory: false,
     isStreaming: false,
     isAwaitingTools: false,
-    isGeneratingTitle: false,
   });
 
   // Track the current streaming state for the active turn
@@ -177,21 +175,6 @@ export function useConversation() {
         // Update the agent UUID from metadata if this is a new conversation
         if (streamState.metadata?.agent_uuid && !agentUuid) {
           setAgentUuid(streamState.metadata.agent_uuid);
-          
-          // Generate title for new conversation (parallel to streaming)
-          setState(prev => ({ ...prev, isGeneratingTitle: true }));
-          generateConversationTitle(
-            streamState.metadata.agent_uuid,
-            userMessageText,
-            config?.agent_type ?? 'agent_frontend_tools'
-          )
-            .then(title => {
-              setState(prev => ({ ...prev, title, isGeneratingTitle: false }));
-            })
-            .catch(error => {
-              console.error('Failed to generate title:', error);
-              setState(prev => ({ ...prev, isGeneratingTitle: false }));
-            });
         }
         
         // Update the streaming turn with live state
@@ -239,6 +222,21 @@ export function useConversation() {
               isStreaming: false,
             };
           });
+          
+          // Fetch server-generated title for new conversations after stream completes
+          // Title is generated during drain_background_tasks() so it should be ready
+          if (streamState.status === 'complete' && streamState.metadata?.agent_uuid && !agentUuid) {
+            const newAgentUuid = streamState.metadata.agent_uuid;
+            setTimeout(() => {
+              fetchConversationHistory(newAgentUuid, undefined, 1)
+                .then(response => {
+                  if (response.title) {
+                    setState(prev => ({ ...prev, title: response.title ?? undefined }));
+                  }
+                })
+                .catch(() => {}); // Silently ignore errors
+            }, 500);
+          }
         }
       },
       onError: (error) => {
@@ -347,7 +345,6 @@ export function useConversation() {
       isStreaming: false,
       isAwaitingTools: false,
       title: undefined,
-      isGeneratingTitle: false,
     });
   }, [setAgentUuid]);
 

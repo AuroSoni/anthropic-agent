@@ -9,7 +9,6 @@ from urllib.parse import urlparse
 
 import anthropic
 import httpx
-import litellm
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -139,16 +138,6 @@ class ConversationListResponse(BaseModel):
     conversations: list[ConversationItem]
     has_more: bool
     title: str | None = None  # Session title if available
-
-
-class GenerateTitleRequest(BaseModel):
-    """Request to generate a conversation title."""
-    user_message: str
-
-
-class GenerateTitleResponse(BaseModel):
-    """Response with generated title."""
-    title: str
 
 
 class AgentSessionItem(BaseModel):
@@ -780,69 +769,3 @@ async def get_conversations(
         has_more=has_more,
         title=session_title,
     )
-
-
-@router.post("/{agent_uuid}/title")
-async def generate_title(
-    agent_uuid: str,
-    request: GenerateTitleRequest,
-    agent_type: AgentType = Query(default="agent_frontend_tools", description="Agent type to determine database backend"),
-) -> GenerateTitleResponse:
-    """Generate a conversation title using LiteLLM.
-    
-    Uses OpenAI GPT-5-mini for fast, cost-effective title generation.
-    The title is persisted to the agent_config in the database.
-    
-    Args:
-        agent_uuid: The agent's UUID
-        request: Contains the user_message to generate title from
-        agent_type: Agent type to determine which database backend to use
-        
-    Returns:
-        GenerateTitleResponse with the generated title
-    """
-    # Get the database backend from the agent config
-    config = AGENT_CONFIGS.get(agent_type)
-    if not config or not config.db_backend:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid agent_type or no database backend configured: {agent_type}",
-        )
-    
-    db_backend = config.db_backend
-    
-    # Generate title using LiteLLM
-    try:
-        response = await litellm.acompletion(
-            model="openai/gpt-5-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Generate a short, descriptive title (max 50 characters) for a conversation "
-                        "based on the user's first message. The title should capture the main topic "
-                        "or intent. Respond with only JSON in this format: {\"title\": \"...\"}"
-                    )
-                },
-                {"role": "user", "content": request.user_message}
-            ],
-            response_format={"type": "json_object"},
-            max_tokens=100,
-        )
-        
-        result = json.loads(response.choices[0].message.content)
-        title = result.get("title", "New Conversation")[:50]  # Enforce max length
-        
-    except Exception as e:
-        logger.error(f"Error generating title: {e}")
-        # Fallback: use truncated user message
-        title = request.user_message[:47] + "..." if len(request.user_message) > 50 else request.user_message
-    
-    # Save title to database
-    try:
-        await db_backend.update_agent_title(agent_uuid, title)
-    except Exception as e:
-        logger.error(f"Error saving title to database: {e}")
-        # Continue anyway - we have the title even if save failed
-    
-    return GenerateTitleResponse(title=title)

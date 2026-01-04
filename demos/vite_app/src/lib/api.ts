@@ -39,13 +39,6 @@ export interface ConversationHistoryResponse {
 }
 
 /**
- * Response from the title generation endpoint.
- */
-export interface GenerateTitleResponse {
-  title: string;
-}
-
-/**
  * A single agent session from the sessions list API.
  */
 export interface AgentSession {
@@ -95,40 +88,6 @@ export async function fetchConversationHistory(
   }
   
   return response.json();
-}
-
-/**
- * Generate a conversation title from the first user message.
- * 
- * @param agentUuid - The agent's UUID
- * @param userMessage - The first user message to generate title from
- * @param agentType - Agent type to determine database backend (default 'agent_frontend_tools')
- * @returns Generated title
- */
-export async function generateConversationTitle(
-  agentUuid: string,
-  userMessage: string,
-  agentType: string = 'agent_frontend_tools'
-): Promise<string> {
-  const params = new URLSearchParams();
-  params.set('agent_type', agentType);
-  
-  const url = `${API_BASE}/agent/${agentUuid}/title?${params.toString()}`;
-  
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ user_message: userMessage }),
-  });
-  
-  if (!response.ok) {
-    throw new Error(`Failed to generate title: ${response.status} ${response.statusText}`);
-  }
-  
-  const data: GenerateTitleResponse = await response.json();
-  return data.title;
 }
 
 /**
