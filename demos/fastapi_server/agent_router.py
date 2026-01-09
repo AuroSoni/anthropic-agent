@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, model_validator
 from anthropic_agent.core import AnthropicAgent
 from anthropic_agent.database import SQLBackend
 from anthropic_agent.file_backends import S3Backend
-from anthropic_agent.tools import SAMPLE_TOOL_FUNCTIONS, tool
+from anthropic_agent.tools import SAMPLE_TOOL_FUNCTIONS, tool, ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,63 @@ def user_confirm(message: str) -> str:
     """
     pass  # Never executed server-side - runs in browser
 
+@tool
+def read_image_raw(image_path: str, description: str = "") -> str:
+    """Read an image file and return it with a description.
+    
+    Args:
+        image_path: Path to the image file to read
+        description: Optional description to include with the image
+        
+    Returns:
+        JSON content blocks with image and text
+    """
+    import json
+    import base64
+    from pathlib import Path
+    
+    path = Path(image_path)
+    
+    if not path.exists():
+        return f"Error: Image not found at {image_path}"
+    
+    # Determine media type from extension
+    ext = path.suffix.lower()
+    media_types = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg", 
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+    }
+    media_type = media_types.get(ext, "image/png")
+    
+    # Read and encode image
+    image_bytes = path.read_bytes()
+    b64_data = base64.b64encode(image_bytes).decode("utf-8")
+    
+    # Build content blocks as dictionary structure
+    content_blocks = [
+        {
+            "type": "text",
+            "text": description if description else f"Image from {path.name}"
+        },
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": b64_data
+            }
+        }
+    ]
+    
+    # Return as JSON string (current tools return str)
+    return ToolResult.with_image(
+        image_data=image_bytes,
+        media_type=media_type,
+        text=description if description else f"Image from {path.name}"
+    )
 
 # List of all frontend tools for easy registration
 FRONTEND_TOOL_FUNCTIONS = [user_confirm]
@@ -104,7 +161,7 @@ class UploadResponse(BaseModel):
     files: list[FileMetadata]
 
 
-class ToolResult(BaseModel):
+class FrontendToolResult(BaseModel):
     """A single frontend tool result."""
     tool_use_id: str
     content: str
@@ -114,7 +171,7 @@ class ToolResult(BaseModel):
 class ToolResultsRequest(BaseModel):
     """Request to submit frontend tool results and resume agent execution."""
     agent_uuid: str
-    tool_results: list[ToolResult]
+    tool_results: list[FrontendToolResult]
 
 
 class ConversationItem(BaseModel):
@@ -184,7 +241,7 @@ agent_all_raw = AgentConfig(
     model="claude-sonnet-4-5",
     thinking_tokens=1024,
     max_tokens=64000,
-    tools=SAMPLE_TOOL_FUNCTIONS,
+    tools=SAMPLE_TOOL_FUNCTIONS + [read_image_raw],
     server_tools=[{
         "type": "code_execution_20250825",
         "name": "code_execution"
@@ -234,7 +291,7 @@ agent_all_xml = AgentConfig(
     model="claude-sonnet-4-5",
     thinking_tokens=1024,
     max_tokens=64000,
-    tools=SAMPLE_TOOL_FUNCTIONS,
+    tools=SAMPLE_TOOL_FUNCTIONS + [read_image_raw],
     server_tools=[{
         "type": "code_execution_20250825",
         "name": "code_execution"
@@ -287,7 +344,7 @@ any action that could have consequences, ask for user confirmation using the use
     model="claude-sonnet-4-20250514",
     thinking_tokens=1024,
     max_tokens=64000,
-    tools=SAMPLE_TOOL_FUNCTIONS,
+    tools=SAMPLE_TOOL_FUNCTIONS + [read_image_raw],
     frontend_tools=FRONTEND_TOOL_FUNCTIONS,  # Include frontend tools
     file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
     db_backend=SQLBackend(connection_string=os.getenv("DATABASE_URL")),
@@ -302,7 +359,7 @@ any action that could have consequences, ask for user confirmation using the use
     model="claude-sonnet-4-20250514",
     thinking_tokens=1024,
     max_tokens=64000,
-    tools=SAMPLE_TOOL_FUNCTIONS,
+    tools=SAMPLE_TOOL_FUNCTIONS + [read_image_raw],
     frontend_tools=FRONTEND_TOOL_FUNCTIONS,
     file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
     db_backend=SQLBackend(connection_string=os.getenv("DATABASE_URL")),
