@@ -241,6 +241,23 @@ export function NodeRenderer({ node }: NodeRendererProps) {
       const filesContent = node.children?.[0]?.content || '';
       return <FilesBlock content={filesContent} />;
 
+    case 'image':
+      // Render image from tool result
+      const imgSrc = node.attributes?.src;
+      const mediaType = node.attributes?.media_type;
+      if (!imgSrc) return null;
+      return (
+        <div className="my-2">
+          <img 
+            src={imgSrc} 
+            alt="Tool result image"
+            className="max-w-full h-auto rounded-lg border border-zinc-200 dark:border-zinc-700"
+            style={{ maxHeight: '400px' }}
+            data-media-type={mediaType}
+          />
+        </div>
+      );
+
     case 'chart':
     case 'table':
       // Placeholder for future chart/table implementations

@@ -153,6 +153,10 @@ async function streamToolResultsContinuation(
 
   let chunkCount = 0;
 
+  // Track order of XML chunks relative to main parser blocks (for interleaving)
+  const xmlInsertionPoints: { afterMainBlockCount: number; xmlNodeIndex: number }[] = [];
+  let mainBlockCount = 0;
+
   for await (const data of parseSSEStream(response)) {
     chunkCount++;
 
@@ -163,11 +167,24 @@ async function streamToolResultsContinuation(
     if (existingFormat === 'raw') {
       const trimmed = data.trim();
       if (trimmed.startsWith('<')) {
+        const prevXmlCount = xmlFallbackParser?.getNodes().length || 0;
         xmlFallbackParser?.appendChunk(data);
+        const newXmlCount = xmlFallbackParser?.getNodes().length || 0;
+        
+        // Track where each new XML node should be inserted
+        for (let i = prevXmlCount; i < newXmlCount; i++) {
+          xmlInsertionPoints.push({ afterMainBlockCount: mainBlockCount, xmlNodeIndex: i });
+        }
       } else {
         const unescaped = data.replace(/\\\\/g, '\\');
         try {
           const event = JSON.parse(unescaped) as AnthropicEvent;
+          
+          // Track when new blocks start
+          if (event.type === 'content_block_start') {
+            mainBlockCount++;
+          }
+          
           (parser as AnthropicStreamParser).processEvent(event);
         } catch {
           // Ignore parse errors in continuation
@@ -178,13 +195,40 @@ async function streamToolResultsContinuation(
     }
   }
 
-  const mainNodes = parser.getNodes();
-  const xmlNodes = xmlFallbackParser?.getNodes() || [];
-
-  return {
-    nodes: [...mainNodes, ...xmlNodes],
-    chunkCount,
-  };
+  // Return interleaved nodes for raw mode, direct for xml mode
+  if (existingFormat === 'raw') {
+    const mainNodes = parser.getNodes();
+    const xmlNodes = xmlFallbackParser?.getNodes() || [];
+    const allNodes: AgentNode[] = [];
+    let xmlInsertIdx = 0;
+    
+    for (let mainIdx = 0; mainIdx <= mainNodes.length; mainIdx++) {
+      // Insert XML nodes at this position
+      while (xmlInsertIdx < xmlInsertionPoints.length && 
+             xmlInsertionPoints[xmlInsertIdx].afterMainBlockCount === mainIdx) {
+        const xmlNodeIdx = xmlInsertionPoints[xmlInsertIdx].xmlNodeIndex;
+        if (xmlNodeIdx < xmlNodes.length) {
+          allNodes.push(xmlNodes[xmlNodeIdx]);
+        }
+        xmlInsertIdx++;
+      }
+      if (mainIdx < mainNodes.length) {
+        allNodes.push(mainNodes[mainIdx]);
+      }
+    }
+    // Add remaining XML nodes
+    while (xmlInsertIdx < xmlInsertionPoints.length) {
+      const xmlNodeIdx = xmlInsertionPoints[xmlInsertIdx].xmlNodeIndex;
+      if (xmlNodeIdx < xmlNodes.length) {
+        allNodes.push(xmlNodes[xmlNodeIdx]);
+      }
+      xmlInsertIdx++;
+    }
+    
+    return { nodes: allNodes, chunkCount };
+  } else {
+    return { nodes: parser.getNodes(), chunkCount };
+  }
 }
 
 /**
@@ -200,6 +244,11 @@ async function runTest(testCase: TestCase): Promise<TestResult> {
   let error: string | undefined;
   let agentUuid: string | null = null;
 
+  // Track order of XML chunks relative to main parser blocks (for interleaving)
+  // Each entry: { afterMainBlockCount: number, xmlNodeIndex: number }
+  const xmlInsertionPoints: { afterMainBlockCount: number; xmlNodeIndex: number }[] = [];
+  let mainBlockCount = 0;  // Tracks number of content_block_start events processed
+
   /**
    * Process a chunk through the appropriate parser.
    * Handles hybrid content in raw mode: JSON events + XML tool results.
@@ -212,7 +261,14 @@ async function runTest(testCase: TestCase): Promise<TestResult> {
       
       // XML content (tool results) injected by backend
       if (trimmed.startsWith('<')) {
+        const prevXmlCount = xmlFallbackParser?.getNodes().length || 0;
         xmlFallbackParser?.appendChunk(chunk);
+        const newXmlCount = xmlFallbackParser?.getNodes().length || 0;
+        
+        // Track where each new XML node should be inserted (relative to main block count)
+        for (let i = prevXmlCount; i < newXmlCount; i++) {
+          xmlInsertionPoints.push({ afterMainBlockCount: mainBlockCount, xmlNodeIndex: i });
+        }
         return;
       }
       
@@ -221,6 +277,12 @@ async function runTest(testCase: TestCase): Promise<TestResult> {
       const unescaped = chunk.replace(/\\\\/g, '\\');
       try {
         const event = JSON.parse(unescaped) as AnthropicEvent;
+        
+        // Track when new blocks start (for interleaving with XML nodes)
+        if (event.type === 'content_block_start') {
+          mainBlockCount++;
+        }
+        
         (parser as AnthropicStreamParser).processEvent(event);
       } catch (e) {
         // Debug: show error and full chunk
@@ -298,10 +360,44 @@ async function runTest(testCase: TestCase): Promise<TestResult> {
     console.error(`  [ERROR] ${error}`);
   }
 
-  // Merge nodes from main parser and XML fallback parser (for tool results in raw mode)
-  const mainNodes = parser?.getNodes() || [];
-  const xmlNodes = xmlFallbackParser?.getNodes() || [];
-  let allNodes = [...mainNodes, ...xmlNodes];
+  // Collect final nodes - interleave main and XML nodes for raw mode
+  let allNodes: AgentNode[];
+  if (streamFormat === 'raw') {
+    // Get complete nodes from both parsers (now that all deltas are processed)
+    const mainNodes = parser?.getNodes() || [];
+    const xmlNodes = xmlFallbackParser?.getNodes() || [];
+    
+    // Interleave XML nodes at their recorded insertion points
+    allNodes = [];
+    let xmlInsertIdx = 0;
+    
+    for (let mainIdx = 0; mainIdx <= mainNodes.length; mainIdx++) {
+      // Insert any XML nodes that belong at this position
+      while (xmlInsertIdx < xmlInsertionPoints.length && 
+             xmlInsertionPoints[xmlInsertIdx].afterMainBlockCount === mainIdx) {
+        const xmlNodeIdx = xmlInsertionPoints[xmlInsertIdx].xmlNodeIndex;
+        if (xmlNodeIdx < xmlNodes.length) {
+          allNodes.push(xmlNodes[xmlNodeIdx]);
+        }
+        xmlInsertIdx++;
+      }
+      // Add the main node
+      if (mainIdx < mainNodes.length) {
+        allNodes.push(mainNodes[mainIdx]);
+      }
+    }
+    // Add any remaining XML nodes
+    while (xmlInsertIdx < xmlInsertionPoints.length) {
+      const xmlNodeIdx = xmlInsertionPoints[xmlInsertIdx].xmlNodeIndex;
+      if (xmlNodeIdx < xmlNodes.length) {
+        allNodes.push(xmlNodes[xmlNodeIdx]);
+      }
+      xmlInsertIdx++;
+    }
+  } else {
+    // For XML mode, just get nodes from the single parser
+    allNodes = parser?.getNodes() || [];
+  }
 
   // Check for awaiting_frontend_tools and continue if found
   const pendingTools = findAwaitingFrontendTools(allNodes);

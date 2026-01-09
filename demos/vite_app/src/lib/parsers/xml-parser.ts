@@ -33,6 +33,9 @@ const RECOGNIZED_TAGS = new Set([
   // Custom rendering tags within text blocks
   'chart',
   'table',
+  // Tool result inner content tags (for multimodal results)
+  'text',   // Text wrapper inside tool results
+  'image',  // Image element inside tool results
 ]);
 
 /**
@@ -119,8 +122,10 @@ export function parseMixedContent(text: string): AgentNode[] {
         });
       }
     } else {
-      // Opening tag <tagName attributes>
-      const attributes = parseAttributes(attributesStr);
+      // Opening tag <tagName attributes> or self-closing <tagName attributes />
+      const isSelfClosing = attributesStr.trimEnd().endsWith('/');
+      const cleanAttrsStr = isSelfClosing ? attributesStr.slice(0, -1) : attributesStr;
+      const attributes = parseAttributes(cleanAttrsStr);
       const newNode: AgentNode = {
         type: 'element',
         tagName: tagName,
@@ -132,9 +137,10 @@ export function parseMixedContent(text: string): AgentNode[] {
       if (!currentParent.children) currentParent.children = [];
       currentParent.children.push(newNode);
       
-      // Push to stack to capture children
-      // Self-closing tags logic could be added here if needed, but LLMs usually output <tag></tag>
-      stack.push(newNode);
+      // Only push to stack if not self-closing (self-closing tags have no children)
+      if (!isSelfClosing) {
+        stack.push(newNode);
+      }
     }
 
     lastIndex = tagRegex.lastIndex;
