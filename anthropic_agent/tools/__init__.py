@@ -1,5 +1,11 @@
 """Tool execution utilities."""
-from .base import ToolExecutor, ToolRegistry
+from .base import (
+    ToolExecutor,
+    ToolRegistry,
+    ToolResult,
+    ImageBlock,
+    ToolResultContent,
+)
 from .decorators import tool, ExecutorType
 from .sample_tools import (
     SAMPLE_TOOL_SCHEMAS, 
@@ -13,6 +19,10 @@ __all__ = [
     # Core interfaces
     'ToolExecutor',
     'ToolRegistry',
+    # Multimodal tool results
+    'ToolResult',
+    'ImageBlock',
+    'ToolResultContent',
     # Decorator
     'tool',
     'ExecutorType',

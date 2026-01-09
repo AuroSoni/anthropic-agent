@@ -14,7 +14,7 @@ from anthropic.types.beta import BetaMessage, FileMetadata
 from .types import AgentResult
 from .retry import anthropic_stream_with_backoff, retry_with_backoff
 from .title_generator import generate_title
-from ..tools.base import ToolRegistry
+from ..tools.base import ToolRegistry, ToolResultContent
 from ..streaming import FormatterType
 from .compaction import CompactorType, get_compactor, Compactor
 from ..memory import MemoryStoreType, get_memory_store, MemoryStore
@@ -575,23 +575,26 @@ class AnthropicAgent:
                     tool_results = []
                     for tool_call in backend_tool_calls:
                         is_error = False
-                        result_content = None
+                        result_content: ToolResultContent = ""
+                        image_refs: list[dict[str, Any]] = []
                         try:
                             # Execute the tool (support both sync and async executors)
                             result = self.execute_tool_call(tool_call.name, tool_call.input)
                             # Check if result is a coroutine (async function)
                             if asyncio.iscoroutine(result):
                                 result = await result
-                            result_content = result
+                            # Unpack result tuple (content, image_refs)
+                            result_content, image_refs = result
                             tool_results.append({
                                 "type": "tool_result",
                                 "tool_use_id": tool_call.id,
-                                "content": result
+                                "content": result_content
                             })
                         except Exception as e:
                             # Handle tool execution errors
                             is_error = True
                             result_content = f"Error executing tool: {str(e)}"
+                            image_refs = []
                             tool_results.append({
                                 "type": "tool_result",
                                 "tool_use_id": tool_call.id,
@@ -602,23 +605,48 @@ class AnthropicAgent:
                         # Stream tool result to queue in XML format
                         if queue is not None:
                             tool_use_id = html.escape(str(tool_call.id), quote=True)
-                            tool_name = html.escape(str(tool_call.name), quote=True)
-                            # Serialize result content to string
-                            if result_content is None:
-                                content_str = ""
-                            elif isinstance(result_content, str):
-                                content_str = result_content
+                            tool_name_escaped = html.escape(str(tool_call.name), quote=True)
+                            
+                            # Build streaming output based on content type
+                            if image_refs:
+                                # Multimodal result: stream text + image references
+                                text_parts = []
+                                if isinstance(result_content, list):
+                                    for block in result_content:
+                                        if isinstance(block, dict) and block.get("type") == "text":
+                                            text_parts.append(block.get("text", ""))
+                                text_content = "\n".join(text_parts) if text_parts else ""
+                                
+                                # Build image reference tags
+                                image_tags = "".join(
+                                    f'<image src="{html.escape(ref["src"], quote=True)}" media_type="{html.escape(ref["media_type"], quote=True)}" />'
+                                    for ref in image_refs
+                                )
+                                
+                                await queue.put(
+                                    f'<content-block-tool_result id="{tool_use_id}" name="{tool_name_escaped}">'
+                                    f'<text><![CDATA[{text_content}]]></text>'
+                                    f'{image_tags}'
+                                    f'</content-block-tool_result>'
+                                )
                             else:
-                                content_str = json.dumps(result_content, default=str)
-                            await queue.put(
-                                f'<content-block-tool_result id="{tool_use_id}" name="{tool_name}"><![CDATA[{content_str}]]></content-block-tool_result>'
-                            )
+                                # Text-only result: serialize as before
+                                if result_content is None:
+                                    content_str = ""
+                                elif isinstance(result_content, str):
+                                    content_str = result_content
+                                else:
+                                    content_str = json.dumps(result_content, default=str)
+                                await queue.put(
+                                    f'<content-block-tool_result id="{tool_use_id}" name="{tool_name_escaped}"><![CDATA[{content_str}]]></content-block-tool_result>'
+                                )
                         
                         # Log: tool execution
                         self._log_action("tool_execution", {
                             "tool_name": tool_call.name,
                             "tool_use_id": tool_call.id,
                             "success": not is_error,
+                            "has_images": len(image_refs) > 0,
                         }, step_number=step)
                     
                     # If frontend tools exist, pause and wait for browser execution
@@ -979,7 +1007,11 @@ class AnthropicAgent:
         
         return request_params
     
-    def execute_tool_call(self, tool_name: str, tool_input: dict) -> str:
+    def execute_tool_call(
+        self,
+        tool_name: str,
+        tool_input: dict,
+    ) -> tuple[ToolResultContent, list[dict[str, Any]]]:
         """Execute a registered tool function through the ToolRegistry.
         
         Args:
@@ -987,12 +1019,19 @@ class AnthropicAgent:
             tool_input: Dictionary of input parameters for the tool
             
         Returns:
-            String result from the tool execution
+            Tuple of (content, image_refs) where:
+            - content: String or list of content blocks for Anthropic API
+            - image_refs: List of image reference dicts for streaming
         """
         if not self.tool_registry:
-            return "No tools have been registered for this agent."
+            return "No tools have been registered for this agent.", []
         
-        return self.tool_registry.execute(tool_name, tool_input)
+        return self.tool_registry.execute(
+            tool_name,
+            tool_input,
+            file_backend=self.file_backend,
+            agent_uuid=self.agent_uuid,
+        )
     
     async def continue_with_tool_results(
         self,
@@ -1190,20 +1229,23 @@ class AnthropicAgent:
                     tool_results = []
                     for tool_call in backend_tool_calls:
                         is_error = False
-                        result_content = None
+                        result_content: ToolResultContent = ""
+                        image_refs: list[dict[str, Any]] = []
                         try:
                             result = self.execute_tool_call(tool_call.name, tool_call.input)
                             if asyncio.iscoroutine(result):
                                 result = await result
-                            result_content = result
+                            # Unpack result tuple (content, image_refs)
+                            result_content, image_refs = result
                             tool_results.append({
                                 "type": "tool_result",
                                 "tool_use_id": tool_call.id,
-                                "content": result
+                                "content": result_content
                             })
                         except Exception as e:
                             is_error = True
                             result_content = f"Error executing tool: {str(e)}"
+                            image_refs = []
                             tool_results.append({
                                 "type": "tool_result",
                                 "tool_use_id": tool_call.id,
@@ -1214,21 +1256,47 @@ class AnthropicAgent:
                         # Stream tool result to queue
                         if queue is not None:
                             tool_use_id = html.escape(str(tool_call.id), quote=True)
-                            tool_name = html.escape(str(tool_call.name), quote=True)
-                            if result_content is None:
-                                content_str = ""
-                            elif isinstance(result_content, str):
-                                content_str = result_content
+                            tool_name_escaped = html.escape(str(tool_call.name), quote=True)
+                            
+                            # Build streaming output based on content type
+                            if image_refs:
+                                # Multimodal result: stream text + image references
+                                text_parts = []
+                                if isinstance(result_content, list):
+                                    for block in result_content:
+                                        if isinstance(block, dict) and block.get("type") == "text":
+                                            text_parts.append(block.get("text", ""))
+                                text_content = "\n".join(text_parts) if text_parts else ""
+                                
+                                # Build image reference tags
+                                image_tags = "".join(
+                                    f'<image src="{html.escape(ref["src"], quote=True)}" media_type="{html.escape(ref["media_type"], quote=True)}" />'
+                                    for ref in image_refs
+                                )
+                                
+                                await queue.put(
+                                    f'<content-block-tool_result id="{tool_use_id}" name="{tool_name_escaped}">'
+                                    f'<text><![CDATA[{text_content}]]></text>'
+                                    f'{image_tags}'
+                                    f'</content-block-tool_result>'
+                                )
                             else:
-                                content_str = json.dumps(result_content, default=str)
-                            await queue.put(
-                                f'<content-block-tool_result id="{tool_use_id}" name="{tool_name}"><![CDATA[{content_str}]]></content-block-tool_result>'
-                            )
+                                # Text-only result: serialize as before
+                                if result_content is None:
+                                    content_str = ""
+                                elif isinstance(result_content, str):
+                                    content_str = result_content
+                                else:
+                                    content_str = json.dumps(result_content, default=str)
+                                await queue.put(
+                                    f'<content-block-tool_result id="{tool_use_id}" name="{tool_name_escaped}"><![CDATA[{content_str}]]></content-block-tool_result>'
+                                )
                         
                         self._log_action("tool_execution", {
                             "tool_name": tool_call.name,
                             "tool_use_id": tool_call.id,
                             "success": not is_error,
+                            "has_images": len(image_refs) > 0,
                         }, step_number=step)
                     
                     # If frontend tools exist, pause and wait
