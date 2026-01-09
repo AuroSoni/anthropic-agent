@@ -2,8 +2,8 @@
  * Test case definitions for parser integration tests.
  * Ported from demos/fastapi_server/agent_api_test.ipynb
  * 
- * NOTE: The following test cases from the notebook are intentionally excluded:
- * - image_receipt_usd_to_inr (raw/xml) - Requires loading and base64 encoding a local image file
+ * NOTE: Image tests use read_image_raw tool which reads from a relative path.
+ * Ensure the test image exists at the expected path relative to fastapi_server.
  */
 import type { TestCase } from './types';
 
@@ -18,6 +18,9 @@ const PROMPTS = {
   ycombinator: "Fetch me the latest happenings in the Y Combinator ecosystem",
   markdownReport: "Produce a markdown report with a table + code block + nested bullets about 'How to reduce latency in an API.'",
   fileGeneration: "Generate a JSON file named `users.json` with 20 synthetic users: id, name, email, country.",
+  
+  // Image tool result prompt (triggers read_image_raw tool)
+  imageToolResult: "Read and analyze the image at ../../currency_receipt_usd_jpy.png",
   
   // PDF citations prompt
   pdfCitations: [
@@ -290,6 +293,22 @@ export const TEST_CASES: TestCase[] = [
     prompt: PROMPTS.frontendToolsConfirm,
     agentType: "agent_frontend_tools_raw",
     description: "Frontend tools with user_confirm - raw format, pauses at awaiting_frontend_tools",
+  },
+  
+  // Image tool result - Raw format
+  {
+    name: "image_tool_result_raw",
+    prompt: PROMPTS.imageToolResult,
+    agentType: "agent_all_raw",
+    description: "Tool result with image - raw format, tests read_image_raw tool",
+  },
+  
+  // Image tool result - XML format
+  {
+    name: "image_tool_result_xml",
+    prompt: PROMPTS.imageToolResult,
+    agentType: "agent_all_xml",
+    description: "Tool result with image - XML format, tests read_image_raw tool",
   },
 ];
 

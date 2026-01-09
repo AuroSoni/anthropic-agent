@@ -40,6 +40,7 @@ interface BlockState {
  */
 export class AnthropicStreamParser {
   private blocks: Map<number, BlockState> = new Map();
+  private blockOffset: number = 0;
   
   /**
    * Process a single raw event from the stream.
@@ -47,12 +48,17 @@ export class AnthropicStreamParser {
   processEvent(event: AnthropicEvent): void {
     switch (event.type) {
       case 'message_start':
-        // Reset state if needed, or just ignore if we're only handling content
-        this.blocks.clear();
+        // Calculate offset so new message blocks don't overwrite previous ones
+        // This preserves blocks from earlier messages in multi-message streams
+        // (e.g., when backend auto-executes client tools)
+        if (this.blocks.size > 0) {
+          this.blockOffset = Math.max(...this.blocks.keys()) + 1;
+        }
         break;
 
       case 'content_block_start': {
         const { index, content_block } = event;
+        const absoluteIndex = this.blockOffset + index;
         const blockState: BlockState = {
           type: content_block.type,
           content: '',
@@ -72,13 +78,14 @@ export class AnthropicStreamParser {
           };
         }
 
-        this.blocks.set(index, blockState);
+        this.blocks.set(absoluteIndex, blockState);
         break;
       }
 
       case 'content_block_delta': {
         const { index, delta } = event;
-        const block = this.blocks.get(index);
+        const absoluteIndex = this.blockOffset + index;
+        const block = this.blocks.get(absoluteIndex);
         if (!block) return;
 
         if (delta.type === 'text_delta' && delta.text) {
@@ -93,7 +100,8 @@ export class AnthropicStreamParser {
 
       case 'content_block_stop': {
         const { index } = event;
-        const block = this.blocks.get(index);
+        const absoluteIndex = this.blockOffset + index;
+        const block = this.blocks.get(absoluteIndex);
         if (block) {
           block.isComplete = true;
           
@@ -251,6 +259,7 @@ export class AnthropicStreamParser {
    */
   reset(): void {
     this.blocks.clear();
+    this.blockOffset = 0;
   }
 }
 
