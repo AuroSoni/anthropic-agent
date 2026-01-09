@@ -214,7 +214,7 @@ dev = [
 requires-dist = [
     { name = "anthropic", specifier = ">=0.75.0" },
     { name = "asyncpg", specifier = ">=0.31.0" },
-    { name = "boto3", specifier = ">=1.42.4" },
+    { name = "boto3", specifier = ">=1.40.46" },
     { name = "litellm", specifier = ">=1.80.11" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
 ]
