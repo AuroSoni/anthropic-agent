@@ -632,6 +632,48 @@ class OtherClass:
         # OtherClass method should be modified
         assert "return 999" in new_content
 
+    def test_nested_scope_with_content_between(
+        self, temp_workspace: Path, apply_patch_fn
+    ) -> None:
+        """Test nested scope lines that are NOT consecutive in the file.
+        
+        Regression test: nested scopes like '## Section' then '### Subsection'
+        may have content between them. The scope finder must search sequentially,
+        not require consecutive lines.
+        """
+        content = '''# Document
+
+## Section
+- item one
+- item two
+
+### Subsection
+note: original
+
+## Another Section
+### Subsection
+note: should not change
+'''
+        create_test_file(temp_workspace, "doc.md", content)
+        
+        # Target the Subsection under "## Section" (not "## Another Section")
+        patch = """*** Begin Patch
+*** Update File: doc.md
+@@ ## Section
+@@ ### Subsection
+-note: original
++note: updated
+*** End Patch"""
+        
+        result = parse_response(apply_patch_fn(patch))
+        
+        assert result["status"] == "ok"
+        new_content = (temp_workspace / "doc.md").read_text()
+        # First Subsection should be modified
+        assert "note: updated" in new_content
+        # Second Subsection (under Another Section) should be unchanged
+        assert "note: should not change" in new_content
+
 
 # ---------------------------------------------------------------------------
 # Tests for EOF Marker

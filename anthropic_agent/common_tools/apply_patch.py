@@ -404,56 +404,73 @@ def _find_context(
     return -1, 0
 
 
-def _find_scope(
+def _find_single_scope(
     lines: List[str],
-    scope_lines: List[str],
+    scope_pattern: str,
     start: int,
 ) -> Tuple[int, int]:
-    """Find scope signature in file and return position after it.
-    
-    Scope lines narrow the search context to within a specific function/class.
-    This helps when the same context appears multiple times in a file.
+    """Find a single scope signature in file and return position after it.
     
     Args:
         lines: The file content split into lines.
-        scope_lines: The scope signature lines to search for (e.g., ["def func_name"]).
+        scope_pattern: The scope signature to search for (e.g., "def func_name").
         start: The starting index for the search.
         
     Returns:
         Tuple of (index_after_scope, fuzz_level) where index_after_scope is the
         position immediately after the scope signature, or (-1, 0) if not found.
     """
+    scope_stripped = scope_pattern.strip()
+    
+    # Level 0: Match at line start (after stripping leading whitespace)
+    for i in range(start, len(lines)):
+        line_stripped = lines[i].lstrip()
+        if line_stripped.startswith(scope_stripped):
+            return i + 1, 0
+    
+    # Level 1: Fallback to substring match with fuzz penalty
+    for i in range(start, len(lines)):
+        if scope_stripped in lines[i]:
+            return i + 1, 1
+    
+    return -1, 0
+
+
+def _find_scope(
+    lines: List[str],
+    scope_lines: List[str],
+    start: int,
+) -> Tuple[int, int]:
+    """Find scope signatures in file and return position after the last one.
+    
+    Scope lines narrow the search context to within a specific function/class.
+    For nested scopes (e.g., class then method), each scope is searched
+    sequentially from the position after the previous scope was found.
+    
+    Args:
+        lines: The file content split into lines.
+        scope_lines: The scope signature lines to search for (e.g., ["class Foo", "def bar"]).
+        start: The starting index for the search.
+        
+    Returns:
+        Tuple of (index_after_scope, fuzz_level) where index_after_scope is the
+        position immediately after the last scope signature, or (-1, 0) if not found.
+    """
     if not scope_lines:
         return start, 0
     
-    n = len(scope_lines)
+    current_pos = start
+    total_fuzz = 0
     
-    # Level 0: Match at line start (after stripping leading whitespace)
-    # This prevents matching comments like "# def foo" when looking for "def foo"
-    for i in range(start, len(lines) - n + 1):
-        match = True
-        for j, scope_line in enumerate(scope_lines):
-            line_stripped = lines[i + j].lstrip()
-            scope_stripped = scope_line.strip()
-            # Match if line starts with scope signature
-            if not line_stripped.startswith(scope_stripped):
-                match = False
-                break
-        if match:
-            return i + n, 0
+    # Find each scope line sequentially, starting from where the previous one was found
+    for scope_pattern in scope_lines:
+        pos, fuzz = _find_single_scope(lines, scope_pattern, current_pos)
+        if pos == -1:
+            return -1, 0
+        current_pos = pos
+        total_fuzz += fuzz
     
-    # Level 1: Fallback to substring match with fuzz penalty
-    # More lenient matching when startswith fails
-    for i in range(start, len(lines) - n + 1):
-        match = True
-        for j, scope_line in enumerate(scope_lines):
-            if scope_line.strip() not in lines[i + j]:
-                match = False
-                break
-        if match:
-            return i + n, 1
-    
-    return -1, 0
+    return current_pos, total_fuzz
 
 
 def _format_context_mismatch(
