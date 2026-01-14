@@ -250,13 +250,16 @@ class TestStatePersistence:
         asyncio.run(agent1._save_agent_config())
         saved_uuid = agent1.agent_uuid
         
-        # Create second agent with same UUID (sync context - this calls asyncio.run internally)
+        # Create second agent with same UUID
         agent2 = AnthropicAgent(
             frontend_tools=[user_confirm],
             tools=[add_numbers],
             db_backend="filesystem",
             agent_uuid=saved_uuid,
         )
+        
+        # State is loaded asynchronously via initialize()
+        asyncio.run(agent2.initialize())
         
         # Verify state was restored
         assert agent2._pending_frontend_tools == expected_frontend_tools

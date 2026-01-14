@@ -14,6 +14,7 @@ from .sample_tools import (
     create_calculator_registry,
     get_tool_schemas,
 )
+from .sandbox_config import ToolSandboxConfig
 
 __all__ = [
     # Core interfaces
@@ -26,6 +27,8 @@ __all__ = [
     # Decorator
     'tool',
     'ExecutorType',
+    # Sandbox configuration
+    'ToolSandboxConfig',
     # Sample tools and utilities
     'SAMPLE_TOOL_SCHEMAS', 
     'SAMPLE_TOOL_FUNCTIONS', 

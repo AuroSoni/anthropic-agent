@@ -283,17 +283,17 @@ def _normalize_path(raw_path: str) -> str:
     return _posix_normpath(cleaned)
 
 
-def _has_allowed_extension(path: str) -> bool:
+def _has_allowed_extension(path: str, allowed_exts: set[str]) -> bool:
     """Check if the file has an allowed extension."""
     p = Path(path)
     # Check for compound extensions like .env.local
     name = p.name.lower()
-    for ext in ALLOWED_EXTENSIONS:
+    for ext in allowed_exts:
         if name.endswith(ext):
             return True
     # Check standard suffix
     suffix = p.suffix.lower()
-    return suffix in ALLOWED_EXTENSIONS
+    return suffix in allowed_exts
 
 
 def _contains_null_bytes(content: str) -> bool:
@@ -1009,14 +1009,27 @@ class ApplyPatchTool:
         >>> agent = AnthropicAgent(tools=[patch_tool.get_tool()])
     """
     
-    def __init__(self, base_path: str | Path):
-        """Initialize the ApplyPatchTool with a base path.
+    def __init__(
+        self,
+        base_path: str | Path,
+        max_patch_size_bytes: int = 1 * 1024 * 1024,
+        max_file_size_bytes: int = 10 * 1024 * 1024,
+        allowed_extensions: set[str] | None = None,
+    ):
+        """Initialize the ApplyPatchTool with a base path and configurable limits.
         
         Args:
             base_path: The root directory that apply_patch operates within.
                        All file paths in patches must be relative to this directory.
+            max_patch_size_bytes: Maximum size of a single patch. Defaults to 1MB.
+            max_file_size_bytes: Maximum file size after patch application. Defaults to 10MB.
+            allowed_extensions: Set of allowed file extensions (with leading dot).
+                               Defaults to a comprehensive set of text/code extensions if None.
         """
         self.base_path: Path = Path(base_path).resolve()
+        self.max_patch_size: int = max_patch_size_bytes
+        self.max_file_size: int = max_file_size_bytes
+        self.allowed_extensions: set[str] = allowed_extensions or ALLOWED_EXTENSIONS
     
     def get_tool(self) -> Callable:
         """Return a @tool decorated function for use with AnthropicAgent.
@@ -1060,9 +1073,9 @@ class ApplyPatchTool:
                     `{"status": "error", "error": "...", "path": "..."|null, "hint": "..."|null}`
             """
             # Check patch size
-            if len(patch.encode("utf-8")) > MAX_PATCH_SIZE_BYTES:
+            if len(patch.encode("utf-8")) > instance.max_patch_size:
                 return _make_error_response(
-                    f"Patch exceeds maximum size ({MAX_PATCH_SIZE_BYTES // 1024 // 1024} MB)",
+                    f"Patch exceeds maximum size ({instance.max_patch_size // 1024 // 1024} MB)",
                     hint="Split into smaller patches"
                 )
             
@@ -1099,7 +1112,7 @@ class ApplyPatchTool:
                 )
             
             # Check file extension
-            if not _has_allowed_extension(file_path):
+            if not _has_allowed_extension(file_path, instance.allowed_extensions):
                 return _make_error_response(
                     f"File extension not allowed for editing",
                     path=file_path,
@@ -1118,9 +1131,9 @@ class ApplyPatchTool:
                 content = parsed.add_content or ""
                 
                 # Check content size
-                if len(content.encode("utf-8")) > MAX_FILE_SIZE_BYTES:
+                if len(content.encode("utf-8")) > instance.max_file_size:
                     return _make_error_response(
-                        f"Content exceeds maximum file size ({MAX_FILE_SIZE_BYTES // 1024 // 1024} MB)",
+                        f"Content exceeds maximum file size ({instance.max_file_size // 1024 // 1024} MB)",
                         path=file_path
                     )
                 
@@ -1211,9 +1224,9 @@ class ApplyPatchTool:
                 return _make_error_response(e.error, e.path, e.hint)
             
             # Check result size
-            if len(new_content.encode("utf-8")) > MAX_FILE_SIZE_BYTES:
+            if len(new_content.encode("utf-8")) > instance.max_file_size:
                 return _make_error_response(
-                    f"Result exceeds maximum file size ({MAX_FILE_SIZE_BYTES // 1024 // 1024} MB)",
+                    f"Result exceeds maximum file size ({instance.max_file_size // 1024 // 1024} MB)",
                     path=file_path
                 )
             
@@ -1245,7 +1258,7 @@ class ApplyPatchTool:
                         hint="Path cannot use '..' to escape the workspace"
                     )
                 
-                if not _has_allowed_extension(move_to_path):
+                if not _has_allowed_extension(move_to_path, instance.allowed_extensions):
                     return _make_error_response(
                         "Move target file extension not allowed",
                         path=move_to_path,

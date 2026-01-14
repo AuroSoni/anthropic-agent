@@ -150,14 +150,33 @@ class ListDirTool:
         >>> agent = AnthropicAgent(tools=[list_dir_tool.get_tool()])
     """
     
-    def __init__(self, base_path: str | Path):
-        """Initialize the ListDirTool with a base path.
+    def __init__(
+        self,
+        base_path: str | Path,
+        max_depth: int = 5,
+        large_dir_threshold: int = 50,
+        large_dir_show_files: int = 5,
+        large_dir_show_dirs: int = 5,
+        allowed_extensions: set[str] | None = None,
+    ):
+        """Initialize the ListDirTool with a base path and configurable limits.
         
         Args:
             base_path: The root directory that list_dir operates within.
                        All target_directory paths will be relative to this.
+            max_depth: Maximum recursion depth (root is depth 0). Defaults to 5.
+            large_dir_threshold: Entry count threshold for large directory handling. Defaults to 50.
+            large_dir_show_files: Number of files to show in large directories. Defaults to 5.
+            large_dir_show_dirs: Number of directories to show in large directories. Defaults to 5.
+            allowed_extensions: Set of allowed file extensions (with leading dot).
+                               Defaults to {".md", ".mmd"} if None.
         """
         self.search_root: Path = Path(base_path).resolve()
+        self.max_depth: int = max_depth
+        self.large_dir_threshold: int = large_dir_threshold
+        self.large_dir_show_files: int = large_dir_show_files
+        self.large_dir_show_dirs: int = large_dir_show_dirs
+        self.allowed_extensions: set[str] = allowed_extensions or {".md", ".mmd"}
         self._allowed_cache: Dict[Path, bool] = {}
         self._patterns: List[str] = []
     
@@ -200,7 +219,7 @@ class ListDirTool:
         except Exception:
             # If we cannot determine, treat as not allowed
             return False
-        return path.suffix.lower() in ALLOWED_EXTS
+        return path.suffix.lower() in self.allowed_extensions
     
     def _has_allowed_in_subtree(self, directory: Path) -> bool:
         """Check if a directory contains at least one allowed file in its subtree."""
@@ -310,7 +329,7 @@ class ListDirTool:
             lines.append(format_dir_line(directory.name, depth))
 
         # If beyond depth cap, summarize contents without descending
-        if depth >= MAX_DEPTH:
+        if depth >= self.max_depth:
             files_total, dirs_total, ext_counts = self._count_subtree(directory)
             # Compose summary
             if files_total == 0 and dirs_total == 0:
@@ -340,12 +359,12 @@ class ListDirTool:
         immediate_files = [c for c in children if not c.is_dir()]
 
         total_entries = len(immediate_dirs) + len(immediate_files)
-        is_large = total_entries > LARGE_DIR_ENTRY_THRESHOLD
+        is_large = total_entries > self.large_dir_threshold
 
         # Subdirectories section (directories first)
         if is_large:
-            shown_dirs = immediate_dirs[:LARGE_DIR_SHOW_DIRS]
-            remaining_dirs = immediate_dirs[LARGE_DIR_SHOW_DIRS:]
+            shown_dirs = immediate_dirs[:self.large_dir_show_dirs]
+            remaining_dirs = immediate_dirs[self.large_dir_show_dirs:]
         else:
             shown_dirs = immediate_dirs
             remaining_dirs = []
@@ -367,8 +386,8 @@ class ListDirTool:
 
         # Files section (after directories)
         if is_large:
-            shown_files = immediate_files[:LARGE_DIR_SHOW_FILES]
-            remaining_files = immediate_files[LARGE_DIR_SHOW_FILES:]
+            shown_files = immediate_files[:self.large_dir_show_files]
+            remaining_files = immediate_files[self.large_dir_show_files:]
         else:
             shown_files = immediate_files
             remaining_files = []

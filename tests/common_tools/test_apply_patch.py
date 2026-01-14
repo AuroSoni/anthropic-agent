@@ -1245,3 +1245,161 @@ just regular content"""
         
         new_content = (temp_workspace / "test.py").read_text()
         assert "new" in new_content
+
+
+# ---------------------------------------------------------------------------
+# Tests for configurable limits
+# ---------------------------------------------------------------------------
+class TestConfigurableLimits:
+    """Tests for instance-configurable limits."""
+
+    def test_custom_max_patch_size_rejects_large_patch(
+        self, temp_workspace: Path
+    ) -> None:
+        """Verify custom max_patch_size_bytes rejects oversized patches."""
+        create_test_file(temp_workspace, "test.py", "line 1\nline 2\n")
+
+        # Create tool with very small patch size limit
+        tool = ApplyPatchTool(base_path=temp_workspace, max_patch_size_bytes=50)
+        apply_fn = tool.get_tool()
+
+        # Create a patch larger than 50 bytes
+        patch = """*** Begin Patch
+*** Update File: test.py
+@@
+ line 1
+-line 2
++this is a much longer replacement line that exceeds fifty bytes easily
+*** End Patch"""
+
+        result = parse_response(apply_fn(patch))
+
+        assert result["status"] == "error"
+        assert "too large" in result["error"].lower() or "size" in result["error"].lower()
+
+    def test_custom_max_file_size_rejects_large_result(
+        self, temp_workspace: Path
+    ) -> None:
+        """Verify custom max_file_size_bytes rejects result that exceeds limit."""
+        # Create a small file that we'll make large via patch
+        create_test_file(temp_workspace, "small.py", "line 1\n")
+
+        # Create tool with small file size limit
+        tool = ApplyPatchTool(base_path=temp_workspace, max_file_size_bytes=50)
+        apply_fn = tool.get_tool()
+
+        # Patch that adds content exceeding the limit
+        large_addition = "x" * 100  # 100 bytes exceeds 50 byte limit
+        patch = f"""*** Begin Patch
+*** Update File: small.py
+@@
+ line 1
++{large_addition}
+*** End Patch"""
+
+        result = parse_response(apply_fn(patch))
+
+        assert result["status"] == "error"
+        assert "exceeds maximum file size" in result["error"].lower() or "size" in result["error"].lower()
+
+    def test_default_limits_allow_normal_operations(
+        self, temp_workspace: Path, apply_patch_fn
+    ) -> None:
+        """Verify default limits allow normal-sized operations."""
+        content = "line 1\nline 2\nline 3\n"
+        create_test_file(temp_workspace, "normal.py", content)
+
+        patch = """*** Begin Patch
+*** Update File: normal.py
+@@
+ line 1
+-line 2
++modified line 2
+ line 3
+*** End Patch"""
+
+        result = parse_response(apply_patch_fn(patch))
+
+        assert result["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Tests for custom allowed extensions
+# ---------------------------------------------------------------------------
+class TestCustomExtensions:
+    """Tests for custom allowed_extensions configuration."""
+
+    def test_custom_extension_txt_allowed(self, temp_workspace: Path) -> None:
+        """Verify custom allowed_extensions enables .txt files."""
+        tool = ApplyPatchTool(
+            base_path=temp_workspace,
+            allowed_extensions={".txt", ".py"},
+        )
+        apply_fn = tool.get_tool()
+
+        patch = """*** Begin Patch
+*** Add File: notes.txt
++Hello from txt file
+*** End Patch"""
+
+        result = parse_response(apply_fn(patch))
+
+        assert result["status"] == "ok"
+        assert (temp_workspace / "notes.txt").exists()
+        assert "Hello from txt file" in (temp_workspace / "notes.txt").read_text()
+
+    def test_custom_extension_rejects_unlisted(self, temp_workspace: Path) -> None:
+        """Verify custom allowed_extensions rejects extensions not in set."""
+        tool = ApplyPatchTool(
+            base_path=temp_workspace,
+            allowed_extensions={".txt"},  # Only .txt allowed
+        )
+        apply_fn = tool.get_tool()
+
+        patch = """*** Begin Patch
+*** Add File: script.py
++print("hello")
+*** End Patch"""
+
+        result = parse_response(apply_fn(patch))
+
+        assert result["status"] == "error"
+        assert "extension not allowed" in result["error"]
+
+    def test_default_extensions_allow_py(
+        self, temp_workspace: Path, apply_patch_fn
+    ) -> None:
+        """Verify default extensions include common code files like .py."""
+        patch = """*** Begin Patch
+*** Add File: script.py
++print("hello")
+*** End Patch"""
+
+        result = parse_response(apply_patch_fn(patch))
+
+        assert result["status"] == "ok"
+        assert (temp_workspace / "script.py").exists()
+
+    def test_custom_extension_update_operation(self, temp_workspace: Path) -> None:
+        """Verify custom extensions work for update operations."""
+        tool = ApplyPatchTool(
+            base_path=temp_workspace,
+            allowed_extensions={".cfg"},
+        )
+        apply_fn = tool.get_tool()
+
+        # Create initial file
+        create_test_file(temp_workspace, "config.cfg", "key=old\n")
+
+        patch = """*** Begin Patch
+*** Update File: config.cfg
+@@
+-key=old
++key=new
+*** End Patch"""
+
+        result = parse_response(apply_fn(patch))
+
+        assert result["status"] == "ok"
+        content = (temp_workspace / "config.cfg").read_text()
+        assert "key=new" in content

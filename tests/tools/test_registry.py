@@ -43,13 +43,15 @@ def test_register_tools_requires_decorated_function() -> None:
 
 
 def test_execute_returns_function_result(registry) -> None:
-    result = registry.execute("add", {"a": 2, "b": 3})
-    assert result == "5"
+    content, image_refs = registry.execute("add", {"a": 2, "b": 3})
+    assert content == "5"
+    assert image_refs == []
 
 
 def test_execute_unknown_tool_returns_error(registry) -> None:
-    result = registry.execute("unknown", {})
-    assert result.startswith("Error:")
+    content, image_refs = registry.execute("unknown", {})
+    assert content.startswith("Error:")
+    assert image_refs == []
 
 
 def test_get_schemas_anthropic_format(registry, sample_tools) -> None:
@@ -88,5 +90,7 @@ def test_register_method_overwrites_existing_schema() -> None:
         return str(a + b + 1)
 
     registry.register("add", add_new, add_new.__tool_schema__)
-    assert registry.execute("add", {"a": 1, "b": 1}) == "3"
+    content, image_refs = registry.execute("add", {"a": 1, "b": 1})
+    assert content == "3"
+    assert image_refs == []
 

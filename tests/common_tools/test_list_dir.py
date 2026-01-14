@@ -693,3 +693,186 @@ class TestEdgeCases:
 
         assert "nested.md" in result
         assert "root.md" not in result
+
+
+# ---------------------------------------------------------------------------
+# Tests for configurable limits
+# ---------------------------------------------------------------------------
+class TestConfigurableLimits:
+    """Tests for instance-configurable limits."""
+
+    def test_custom_max_depth_shows_summary(self, temp_workspace: Path) -> None:
+        """Verify custom max_depth shows summary at specified depth."""
+        # Create structure: root/d1/d2/d3/file.md
+        # With max_depth=2, d2 should show summary instead of contents
+        create_file(temp_workspace, "d1/d2/d3/file.md")
+
+        tool = ListDirTool(base_path=temp_workspace, max_depth=2)
+        list_dir_fn = tool.get_tool()
+
+        result = list_dir_fn(".")
+
+        assert "d1/" in result
+        assert "d2/" in result
+        assert "depth limit reached" in result
+        # d3/ should NOT appear as a separate directory line
+        lines = [l for l in result.split("\n") if "- d3/" in l]
+        assert len(lines) == 0
+
+    def test_custom_large_dir_threshold(self, temp_workspace: Path) -> None:
+        """Verify custom large_dir_threshold triggers truncation earlier."""
+        # Create 15 files (more than custom threshold of 10)
+        for i in range(15):
+            create_file(temp_workspace, f"file_{i:02d}.md")
+
+        tool = ListDirTool(
+            base_path=temp_workspace,
+            large_dir_threshold=10,
+            large_dir_show_files=3,
+        )
+        list_dir_fn = tool.get_tool()
+
+        result = list_dir_fn(".")
+
+        # Should show only 3 files
+        file_lines = [l for l in result.split("\n") if ".md" in l and "- " in l]
+        assert len(file_lines) == 3
+
+        # Should have summary for remaining 12 files
+        assert "12 more files of type md" in result
+
+    def test_custom_large_dir_show_dirs(self, temp_workspace: Path) -> None:
+        """Verify custom large_dir_show_dirs limits shown directories."""
+        # Create 15 directories with files (more than custom threshold)
+        for i in range(15):
+            create_file(temp_workspace, f"dir_{i:02d}/file.md")
+
+        tool = ListDirTool(
+            base_path=temp_workspace,
+            large_dir_threshold=10,
+            large_dir_show_dirs=2,
+        )
+        list_dir_fn = tool.get_tool()
+
+        result = list_dir_fn(".")
+
+        # Should show only 2 directories
+        assert "dir_00/" in result
+        assert "dir_01/" in result
+        # 3rd dir should be in summary
+        assert "- dir_02/" not in result
+        assert "13 more subdirectories" in result
+
+    def test_default_max_depth(self, temp_workspace: Path) -> None:
+        """Verify default max_depth (5) allows deep nesting."""
+        # Create structure at depth 4 (under default limit)
+        create_file(temp_workspace, "d1/d2/d3/d4/file.md")
+
+        tool = ListDirTool(base_path=temp_workspace)
+        list_dir_fn = tool.get_tool()
+
+        result = list_dir_fn(".")
+
+        # All directories should be shown
+        assert "d1/" in result
+        assert "d2/" in result
+        assert "d3/" in result
+        assert "d4/" in result
+        assert "file.md" in result
+        # No depth limit message at this depth
+        lines_with_depth = [l for l in result.split("\n") if "depth limit" in l]
+        assert len(lines_with_depth) == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests for custom allowed extensions
+# ---------------------------------------------------------------------------
+class TestCustomExtensions:
+    """Tests for custom allowed_extensions configuration."""
+
+    def test_custom_extension_py_allowed(self, temp_workspace: Path) -> None:
+        """Verify custom allowed_extensions enables .py files."""
+        create_file(temp_workspace, "script.py")
+        create_file(temp_workspace, "readme.md")
+
+        tool = ListDirTool(
+            base_path=temp_workspace,
+            allowed_extensions={".py"},
+        )
+        list_dir_fn = tool.get_tool()
+
+        result = list_dir_fn(".")
+
+        assert "script.py" in result
+        assert "readme.md" not in result
+
+    def test_custom_extension_multiple(self, temp_workspace: Path) -> None:
+        """Verify multiple custom extensions work together."""
+        create_file(temp_workspace, "script.py")
+        create_file(temp_workspace, "config.yaml")
+        create_file(temp_workspace, "readme.md")
+        create_file(temp_workspace, "data.json")
+
+        tool = ListDirTool(
+            base_path=temp_workspace,
+            allowed_extensions={".py", ".yaml"},
+        )
+        list_dir_fn = tool.get_tool()
+
+        result = list_dir_fn(".")
+
+        assert "script.py" in result
+        assert "config.yaml" in result
+        assert "readme.md" not in result
+        assert "data.json" not in result
+
+    def test_custom_extension_prunes_dirs_without_matches(
+        self, temp_workspace: Path
+    ) -> None:
+        """Verify directories without matching extensions are pruned."""
+        create_file(temp_workspace, "docs/readme.md")
+        create_file(temp_workspace, "src/main.py")
+
+        tool = ListDirTool(
+            base_path=temp_workspace,
+            allowed_extensions={".py"},
+        )
+        list_dir_fn = tool.get_tool()
+
+        result = list_dir_fn(".")
+
+        assert "src/" in result
+        assert "main.py" in result
+        # docs/ should be pruned (no .py files)
+        assert "docs/" not in result
+        assert "readme.md" not in result
+
+    def test_default_extensions_md_mmd(
+        self, temp_workspace: Path, list_dir_fn: Callable
+    ) -> None:
+        """Verify default extensions are .md and .mmd only."""
+        create_file(temp_workspace, "readme.md")
+        create_file(temp_workspace, "diagram.mmd")
+        create_file(temp_workspace, "script.py")
+
+        result = list_dir_fn(".")
+
+        assert "readme.md" in result
+        assert "diagram.mmd" in result
+        assert "script.py" not in result
+
+    def test_custom_extension_txt(self, temp_workspace: Path) -> None:
+        """Verify .txt can be allowed via custom extensions."""
+        create_file(temp_workspace, "notes.txt")
+        create_file(temp_workspace, "readme.md")
+
+        tool = ListDirTool(
+            base_path=temp_workspace,
+            allowed_extensions={".txt"},
+        )
+        list_dir_fn = tool.get_tool()
+
+        result = list_dir_fn(".")
+
+        assert "notes.txt" in result
+        assert "readme.md" not in result

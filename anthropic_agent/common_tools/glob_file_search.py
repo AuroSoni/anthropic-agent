@@ -79,9 +79,9 @@ def _ext_label(path: Path) -> str:
     return suffix[1:] if suffix else "noext"
 
 
-def _has_allowed_ext(path: Path) -> bool:
+def _has_allowed_ext(path: Path, allowed_exts: set[str]) -> bool:
     """Check if a path has an allowed extension."""
-    return path.suffix.lower() in ALLOWED_EXTS
+    return path.suffix.lower() in allowed_exts
 
 
 def _summarize_file_exts(paths: Iterable[Path], max_groups: Optional[int] = None) -> str:
@@ -133,14 +133,27 @@ class GlobFileSearchTool:
         >>> agent = AnthropicAgent(tools=[glob_tool.get_tool()])
     """
     
-    def __init__(self, base_path: str | Path):
-        """Initialize the GlobFileSearchTool with a base path.
+    def __init__(
+        self,
+        base_path: str | Path,
+        max_results: int = 50,
+        summary_max_ext_groups: int = 3,
+        allowed_extensions: set[str] | None = None,
+    ):
+        """Initialize the GlobFileSearchTool with a base path and configurable limits.
         
         Args:
             base_path: The root directory that glob_file_search operates within.
                        All searches are executed relative to this directory.
+            max_results: Maximum number of results to return. Defaults to 50.
+            summary_max_ext_groups: Maximum extension groups to show in summary. Defaults to 3.
+            allowed_extensions: Set of allowed file extensions (with leading dot).
+                               Defaults to {".md", ".mmd"} if None.
         """
         self.search_root: Path = Path(base_path).resolve()
+        self.max_results: int = max_results
+        self.summary_max_ext_groups: int = summary_max_ext_groups
+        self.allowed_extensions: set[str] = allowed_extensions or {".md", ".mmd"}
     
     def get_tool(self) -> Callable:
         """Return a @tool decorated function for use with AnthropicAgent.
@@ -200,7 +213,7 @@ class GlobFileSearchTool:
                         continue
                 except Exception:
                     pass
-                if not _has_allowed_ext(p):
+                if not _has_allowed_ext(p, instance.allowed_extensions):
                     continue
                 matches_with_mtime.append((p, mtime))
 
@@ -229,8 +242,8 @@ class GlobFileSearchTool:
                 return "No matches found."
 
             # Truncate and summarize
-            shown_paths = rel_matches[:MAX_RESULTS]
-            remaining_paths = rel_matches[MAX_RESULTS:]
+            shown_paths = rel_matches[:instance.max_results]
+            remaining_paths = rel_matches[instance.max_results:]
 
             lines = [_posix_normpath(sp.as_posix()) for sp in shown_paths]
 
@@ -249,7 +262,7 @@ class GlobFileSearchTool:
                         # If we cannot determine, treat as file to avoid undercounting
                         remaining_files.append(ap)
 
-                file_summary = _summarize_file_exts(remaining_files)
+                file_summary = _summarize_file_exts(remaining_files, instance.summary_max_ext_groups)
                 if file_summary:
                     lines.append(f"[{file_summary}]")
 

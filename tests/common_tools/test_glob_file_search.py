@@ -114,16 +114,18 @@ class TestExtLabel:
 
 class TestHasAllowedExt:
     def test_allowed_extensions(self) -> None:
-        assert _has_allowed_ext(Path("file.md")) is True
-        assert _has_allowed_ext(Path("file.mmd")) is True
-        assert _has_allowed_ext(Path("file.MD")) is True  # case insensitive
-        assert _has_allowed_ext(Path("file.MMD")) is True
+        allowed = {".md", ".mmd"}
+        assert _has_allowed_ext(Path("file.md"), allowed) is True
+        assert _has_allowed_ext(Path("file.mmd"), allowed) is True
+        assert _has_allowed_ext(Path("file.MD"), allowed) is True  # case insensitive
+        assert _has_allowed_ext(Path("file.MMD"), allowed) is True
     
     def test_disallowed_extensions(self) -> None:
-        assert _has_allowed_ext(Path("file.txt")) is False
-        assert _has_allowed_ext(Path("file.py")) is False
-        assert _has_allowed_ext(Path("file.json")) is False
-        assert _has_allowed_ext(Path("README")) is False
+        allowed = {".md", ".mmd"}
+        assert _has_allowed_ext(Path("file.txt"), allowed) is False
+        assert _has_allowed_ext(Path("file.py"), allowed) is False
+        assert _has_allowed_ext(Path("file.json"), allowed) is False
+        assert _has_allowed_ext(Path("README"), allowed) is False
 
 
 class TestIsWithin:
@@ -656,3 +658,138 @@ class TestEdgeCases:
         result = search_fn("*.md")
         
         assert "file with spaces.md" in result
+
+
+# ---------------------------------------------------------------------------
+# Tests for configurable limits
+# ---------------------------------------------------------------------------
+class TestConfigurableLimits:
+    """Tests for instance-configurable limits."""
+
+    def test_custom_max_results_truncates(self, temp_workspace: Path) -> None:
+        """Verify custom max_results truncates at the specified limit."""
+        # Create more files than custom limit
+        for i in range(15):
+            create_file(temp_workspace, f"file_{i:02d}.md")
+
+        tool = GlobFileSearchTool(base_path=temp_workspace, max_results=5)
+        search_fn = tool.get_tool()
+
+        result = search_fn("*.md")
+        lines = result.strip().split("\n")
+
+        # Should show exactly 5 file paths
+        file_lines = [l for l in lines if not l.startswith("[")]
+        assert len(file_lines) == 5
+
+        # Should have summary for remaining 10 files
+        assert "[10 more files of type md]" in result
+
+    def test_custom_summary_max_ext_groups(self, temp_workspace: Path) -> None:
+        """Verify custom summary_max_ext_groups limits extension groups in summary."""
+        # Create files exceeding max_results with multiple extensions
+        for i in range(10):
+            create_file(temp_workspace, f"doc_{i}.md")
+            create_file(temp_workspace, f"diagram_{i}.mmd")
+
+        tool = GlobFileSearchTool(
+            base_path=temp_workspace,
+            max_results=5,
+            summary_max_ext_groups=1,
+            allowed_extensions={".md", ".mmd"},
+        )
+        search_fn = tool.get_tool()
+
+        result = search_fn("*")
+
+        # With max_groups=1, excess extensions should be grouped as "other types"
+        # The summary should show the most common extension and "other types"
+        assert "more files" in result
+
+    def test_default_max_results(self, temp_workspace: Path) -> None:
+        """Verify default max_results (50) allows many files."""
+        for i in range(45):
+            create_file(temp_workspace, f"file_{i:02d}.md")
+
+        tool = GlobFileSearchTool(base_path=temp_workspace)
+        search_fn = tool.get_tool()
+
+        result = search_fn("*.md")
+
+        # All 45 files should be shown (under default limit of 50)
+        assert "[" not in result  # No truncation summary
+        for i in range(45):
+            assert f"file_{i:02d}.md" in result
+
+
+# ---------------------------------------------------------------------------
+# Tests for custom allowed extensions
+# ---------------------------------------------------------------------------
+class TestCustomExtensions:
+    """Tests for custom allowed_extensions configuration."""
+
+    def test_custom_extension_py_allowed(self, temp_workspace: Path) -> None:
+        """Verify custom allowed_extensions enables .py files."""
+        create_file(temp_workspace, "script.py")
+        create_file(temp_workspace, "readme.md")
+
+        tool = GlobFileSearchTool(
+            base_path=temp_workspace,
+            allowed_extensions={".py"},
+        )
+        search_fn = tool.get_tool()
+
+        result = search_fn("*")
+
+        assert "script.py" in result
+        assert "readme.md" not in result
+
+    def test_custom_extension_multiple(self, temp_workspace: Path) -> None:
+        """Verify multiple custom extensions work together."""
+        create_file(temp_workspace, "script.py")
+        create_file(temp_workspace, "config.yaml")
+        create_file(temp_workspace, "readme.md")
+        create_file(temp_workspace, "data.json")
+
+        tool = GlobFileSearchTool(
+            base_path=temp_workspace,
+            allowed_extensions={".py", ".yaml"},
+        )
+        search_fn = tool.get_tool()
+
+        result = search_fn("*")
+
+        assert "script.py" in result
+        assert "config.yaml" in result
+        assert "readme.md" not in result
+        assert "data.json" not in result
+
+    def test_custom_extension_txt(self, temp_workspace: Path) -> None:
+        """Verify .txt can be allowed via custom extensions."""
+        create_file(temp_workspace, "notes.txt")
+        create_file(temp_workspace, "readme.md")
+
+        tool = GlobFileSearchTool(
+            base_path=temp_workspace,
+            allowed_extensions={".txt"},
+        )
+        search_fn = tool.get_tool()
+
+        result = search_fn("*")
+
+        assert "notes.txt" in result
+        assert "readme.md" not in result
+
+    def test_default_extensions_md_mmd(
+        self, temp_workspace: Path, search_fn: Callable
+    ) -> None:
+        """Verify default extensions are .md and .mmd only."""
+        create_file(temp_workspace, "readme.md")
+        create_file(temp_workspace, "diagram.mmd")
+        create_file(temp_workspace, "script.py")
+
+        result = search_fn("*")
+
+        assert "readme.md" in result
+        assert "diagram.mmd" in result
+        assert "script.py" not in result
