@@ -27,9 +27,9 @@
   - `limit` default is 100. Any provided value is clamped to a maximum of 100.
   - If `limit < 0`: return `ERROR: limit({value}) cannot be negative.`
   - If `limit` is non-integer: return `ERROR: limit({raw_value}) is not an integer.`
-  - If `offset > total_lines`: return exactly
+  - If `offset > total_lines` and `total_lines > 0`: return exactly
     `ERROR: offset({offset}) cannot be greater than total number of lines ({total}) in the file ({relative_posix_path}).`
-  - If `limit == 0`: return only the header line with `0-0` as the range and a trailing newline.
+  - If `limit == 0` or `total_lines == 0` (empty file): return only the header line with `0-0` as the range and a trailing newline.
 
 - **Buffered vs streaming modes**
   - If file size ≤ 2 MiB (configurable via `STREAMING_THRESHOLD_BYTES`): read whole file, then compute the slice.
@@ -240,6 +240,12 @@ class ReadFileTool:
                     return str(exc)
 
                 total_lines = len(all_lines)
+                
+                # Handle empty file: return header with 0-0 range
+                if total_lines == 0:
+                    header = _format_header(0, 0, 0, rel_posix)
+                    return header + "\n"
+                
                 if start_line > total_lines:
                     return (
                         f"ERROR: offset({start_line}) cannot be greater than total number of lines "
@@ -279,6 +285,11 @@ class ReadFileTool:
                         collected.append(line)
             except Exception as exc:
                 return str(exc)
+
+            # Handle empty file: return header with 0-0 range
+            if total_lines == 0:
+                header = _format_header(0, 0, 0, rel_posix)
+                return header + "\n"
 
             if start_line > total_lines:
                 return (
