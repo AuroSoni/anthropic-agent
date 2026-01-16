@@ -51,9 +51,9 @@ from __future__ import annotations
 
 from pathlib import Path
 from posixpath import normpath as _posix_normpath
-from typing import Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
-from ..tools.decorators import tool
+from ..tools.base import ConfigurableToolBase
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -83,17 +83,71 @@ def _format_header(start_line: int, end_line: int, total_lines: int, relative_po
 # ---------------------------------------------------------------------------
 # Class-based tool implementation
 # ---------------------------------------------------------------------------
-class ReadFileTool:
-    """Configurable read_file tool with a sandboxed base path.
+class ReadFileTool(ConfigurableToolBase):
+    """Configurable read_file tool with a sandboxed base path and templated docstrings.
     
     This class encapsulates the read_file functionality, allowing configuration
     of the base path at instantiation time. The tool returned by get_tool()
     can be registered with an AnthropicAgent.
     
+    The docstring uses {placeholder} syntax that gets replaced with actual
+    configured values at schema generation time.
+    
     Example:
-        >>> read_file_tool = ReadFileTool(base_path="/path/to/workspace")
+        >>> # Default usage - docstring reflects actual config
+        >>> read_file_tool = ReadFileTool(base_path="/path/to/workspace", max_lines=500)
         >>> agent = AnthropicAgent(tools=[read_file_tool.get_tool()])
+        >>> # Docstring will say "Max lines per read: 500"
+        
+        >>> # Custom docstring template
+        >>> read_file_tool = ReadFileTool(
+        ...     base_path="/workspace",
+        ...     docstring_template="Read files with {max_lines} line limit."
+        ... )
+        
+        >>> # Complete schema override
+        >>> read_file_tool = ReadFileTool(
+        ...     base_path="/workspace",
+        ...     schema_override={"name": "read_file", "description": "Custom", ...}
+        ... )
     """
+    
+    DOCSTRING_TEMPLATE = """Read lines from a text file.
+
+Use this tool to inspect file contents. Returns lines with a header showing
+the range and total line count.
+
+**Limits:**
+- Max lines per read: {max_lines}
+- Allowed extensions: {allowed_extensions_str}
+
+Args:
+    target_file: Path relative to workspace. Extension is optional - will
+        auto-resolve to allowed extensions if omitted.
+    start_line_one_indexed: 1-based line number to start from. Defaults to 1.
+        Values < 1 are treated as 1.
+    no_of_lines_to_read: Number of lines to return. Defaults to {max_lines}, max {max_lines}.
+        Values > {max_lines} are clamped.
+
+Returns:
+    Header line followed by file content:
+    ```
+    [lines 1-50 of 200 in docs/guide.md]
+    # Welcome to the Guide
+    ...content...
+    ```
+    
+    For pagination, check the header's total and call again with a higher start_line_one_indexed.
+
+Example:
+    read_file("docs/guide.md")  # First {max_lines} lines
+    read_file("docs/guide", start_line_one_indexed=101)  # Next {max_lines} lines
+
+**Error Recovery:**
+- "Path does not exist" -> Use glob_file_search to find similar files
+- "start_line_one_indexed > total lines" -> Check the file's total line count in header
+- "Path is a directory" -> Use list_dir instead, or specify a file within the directory
+"""
     
     def __init__(
         self,
@@ -101,6 +155,8 @@ class ReadFileTool:
         max_lines: int = 100,
         streaming_threshold_bytes: int = 2 * 1024 * 1024,
         allowed_extensions: set[str] | None = None,
+        docstring_template: str | None = None,
+        schema_override: dict | None = None,
     ):
         """Initialize the ReadFileTool with a base path and configurable limits.
         
@@ -111,11 +167,22 @@ class ReadFileTool:
             streaming_threshold_bytes: File size threshold for streaming mode. Defaults to 2MB.
             allowed_extensions: Set of allowed file extensions (with leading dot).
                                Defaults to {".md", ".mmd"} if None.
+            docstring_template: Optional custom docstring template with {placeholder} syntax.
+                               Available placeholders: {max_lines}, {allowed_extensions_str}.
+            schema_override: Optional complete Anthropic tool schema dict for full control.
         """
+        super().__init__(docstring_template=docstring_template, schema_override=schema_override)
         self.search_root: Path = Path(base_path).resolve()
         self.max_lines: int = max_lines
         self.streaming_threshold: int = streaming_threshold_bytes
         self.allowed_extensions: set[str] = allowed_extensions or {".md", ".mmd"}
+    
+    def _get_template_context(self) -> Dict[str, Any]:
+        """Return placeholder values for docstring template."""
+        return {
+            "max_lines": self.max_lines,
+            "allowed_extensions_str": ", ".join(sorted(self.allowed_extensions)),
+        }
     
     def _rel_posix_under_root(self, path: Path) -> str:
         """Convert a path to a POSIX-style path relative to search_root."""
@@ -177,52 +244,17 @@ class ReadFileTool:
         
         Returns:
             A decorated read_file function that operates within the configured base_path.
+            The docstring will reflect the actual configured limits.
         """
         # Capture self in closure for the inner function
         instance = self
         
-        @tool
         def read_file(
             target_file: str,
             start_line_one_indexed: Optional[int] = None,
             no_of_lines_to_read: Optional[int] = None
         ) -> str:
-            """Read lines from a text file.
-            
-            Use this tool to inspect file contents. Returns lines with a header showing
-            the range and total line count. Only `.md` and `.mmd` files are readable.
-            
-            **Limits:**
-            - Default/max lines per read: 100
-            - Files are read as UTF-8 with universal newline handling
-            
-            Args:
-                target_file: Path relative to workspace. Extension is optional - will
-                    auto-resolve to .md or .mmd if omitted.
-                start_line_one_indexed: 1-based line number to start from. Defaults to 1.
-                    Values < 1 are treated as 1.
-                no_of_lines_to_read: Number of lines to return. Defaults to 100, max 100.
-                    Values > 100 are clamped to 100.
-            
-            Returns:
-                Header line followed by file content:
-                ```
-                [lines 1-50 of 200 in docs/guide.md]
-                # Welcome to the Guide
-                ...content...
-                ```
-                
-                For pagination, check the header's total and call again with a higher start_line_one_indexed.
-            
-            Example:
-                read_file("docs/guide.md")  # First 100 lines
-                read_file("docs/guide", start_line_one_indexed=101)  # Next 100 lines
-            
-            **Error Recovery:**
-            - "Path does not exist" -> Use glob_file_search to find similar files
-            - "start_line_one_indexed > total lines" -> Check the file's total line count in header
-            - "Path is a directory" -> Use list_dir instead, or specify a file within the directory
-            """
+            """Placeholder docstring - replaced by template."""
             # Normalize parameters
             start_line = 1 if start_line_one_indexed is None else max(1, int(start_line_one_indexed))
             max_limit = instance.max_lines
@@ -341,4 +373,4 @@ class ReadFileTool:
             header = _format_header(start_line, shown_end_line, total_lines, rel_posix)
             return header + "\n" + "".join(collected)
         
-        return read_file
+        return self._apply_schema(read_file)

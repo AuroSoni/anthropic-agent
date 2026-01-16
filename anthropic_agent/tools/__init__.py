@@ -5,6 +5,7 @@ from .base import (
     ToolResult,
     ImageBlock,
     ToolResultContent,
+    ConfigurableToolBase,
 )
 from .decorators import tool, ExecutorType
 from .sample_tools import (
@@ -20,6 +21,8 @@ __all__ = [
     # Core interfaces
     'ToolExecutor',
     'ToolRegistry',
+    # Configurable tool base class
+    'ConfigurableToolBase',
     # Multimodal tool results
     'ToolResult',
     'ImageBlock',

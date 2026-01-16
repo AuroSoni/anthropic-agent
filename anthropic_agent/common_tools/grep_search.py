@@ -38,9 +38,9 @@ import subprocess
 from bisect import bisect_left
 from pathlib import Path
 from posixpath import normpath as _posix_normpath
-from typing import Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
-from ..tools.decorators import tool
+from ..tools.base import ConfigurableToolBase
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -87,17 +87,74 @@ def _byte_ranges_to_char_ranges(text: str, byte_ranges: List[Tuple[int, int]]) -
 # ---------------------------------------------------------------------------
 # Class-based tool implementation
 # ---------------------------------------------------------------------------
-class GrepSearchTool:
-    """Configurable grep_search tool with a sandboxed base path.
+class GrepSearchTool(ConfigurableToolBase):
+    """Configurable grep_search tool with a sandboxed base path and templated docstrings.
     
     This class encapsulates the grep_search functionality using ripgrep,
     allowing configuration of the base path at instantiation time. The tool
     returned by get_tool() can be registered with an AnthropicAgent.
     
+    The docstring uses {placeholder} syntax that gets replaced with actual
+    configured values at schema generation time.
+    
     Example:
-        >>> grep_tool = GrepSearchTool(base_path="/path/to/workspace")
+        >>> # Default usage - docstring reflects actual config
+        >>> grep_tool = GrepSearchTool(base_path="/path/to/workspace", max_match_lines=50)
         >>> agent = AnthropicAgent(tools=[grep_tool.get_tool()])
+        >>> # Docstring will say "Max matches shown: 50"
+        
+        >>> # Custom docstring template
+        >>> grep_tool = GrepSearchTool(
+        ...     base_path="/workspace",
+        ...     docstring_template="Search with {max_match_lines} match limit."
+        ... )
     """
+    
+    DOCSTRING_TEMPLATE = """Search file contents using regular expressions (powered by ripgrep).
+
+Use this tool to find text patterns across files. Returns matches with
+context lines before and after.
+
+**Limits:**
+- Max matches shown: {max_match_lines} (with count of omitted matches)
+- Context: {context_lines} lines before and after each match
+- Allowed extensions: {allowed_extensions_str}
+
+Args:
+    query: Regular expression to search for. Common patterns:
+        - "TODO" - literal text search
+        - "def \\\\w+\\\\(" - function definitions
+        - "import.*requests" - import statements
+        - "\\\\bword\\\\b" - whole word match
+    include_pattern: Optional glob to restrict which files to search (e.g., "docs/*.md").
+        When set, .gitignore rules are bypassed.
+    exclude_pattern: Optional glob to exclude files (e.g., "test_*.md").
+    case_sensitive: Whether to match case. Defaults to False (case-insensitive).
+
+Returns:
+    Results grouped by file with line numbers:
+    ```
+    docs/api.md:
+      10- context before
+      11: This line has a <match>TODO</match> marker
+      12- context after
+    
+    src/main.md:
+      25: Another <match>TODO</match> item
+    ```
+
+**Regex Tips:**
+- Escape special chars: \\\\. \\\\( \\\\) \\\\[ \\\\]
+- Word boundary: \\\\bword\\\\b
+- Any whitespace: \\\\s+
+- One or more: pattern+
+- Zero or more: pattern*
+
+**Error Recovery:**
+- "No matches found" -> Try case_sensitive=False, or broaden the pattern
+- "ripgrep failed" -> Check regex syntax, escape special characters
+- "pattern cannot be empty" -> Provide a non-empty search pattern
+"""
     
     def __init__(
         self,
@@ -105,6 +162,8 @@ class GrepSearchTool:
         max_match_lines: int = 20,
         context_lines: int = 2,
         allowed_extensions: set[str] | None = None,
+        docstring_template: str | None = None,
+        schema_override: dict | None = None,
     ):
         """Initialize the GrepSearchTool with a base path and configurable limits.
         
@@ -115,11 +174,23 @@ class GrepSearchTool:
             context_lines: Number of context lines before/after each match. Defaults to 2.
             allowed_extensions: Set of allowed file extensions (with leading dot).
                                Defaults to {".md", ".mmd"} if None.
+            docstring_template: Optional custom docstring template with {placeholder} syntax.
+                               Available placeholders: {max_match_lines}, {context_lines}, {allowed_extensions_str}.
+            schema_override: Optional complete Anthropic tool schema dict for full control.
         """
+        super().__init__(docstring_template=docstring_template, schema_override=schema_override)
         self.search_root: Path = Path(base_path).resolve()
         self.max_match_lines: int = max_match_lines
         self.context_lines: int = context_lines
         self.allowed_extensions: set[str] = allowed_extensions or {".md", ".mmd"}
+    
+    def _get_template_context(self) -> Dict[str, Any]:
+        """Return placeholder values for docstring template."""
+        return {
+            "max_match_lines": self.max_match_lines,
+            "context_lines": self.context_lines,
+            "allowed_extensions_str": ", ".join(sorted(self.allowed_extensions)),
+        }
     
     def _rel_posix(self, path_str: str) -> str:
         """Convert a path string to a POSIX-style path relative to search_root."""
@@ -136,62 +207,18 @@ class GrepSearchTool:
         
         Returns:
             A decorated grep_search function that operates within the configured base_path.
+            The docstring will reflect the actual configured limits.
         """
         # Capture self in closure for the inner function
         instance = self
         
-        @tool
         def grep_search(
             query: str,
             include_pattern: str | None = None,
             exclude_pattern: str | None = None,
             case_sensitive: bool = False,
         ) -> str:
-            """Search file contents using regular expressions (powered by ripgrep).
-            
-            Use this tool to find text patterns across files. Returns matches with
-            2 lines of context before and after. Only searches `.md` and `.mmd` files
-            by default.
-            
-            **Limits:**
-            - Max matches shown: 20 (with count of omitted matches)
-            - Context: 2 lines before and after each match
-            
-            Args:
-                query: Regular expression to search for. Common patterns:
-                    - "TODO" - literal text search
-                    - "def \\w+\\(" - function definitions
-                    - "import.*requests" - import statements
-                    - "\\bword\\b" - whole word match
-                include_pattern: Optional glob to restrict which files to search (e.g., "docs/*.md").
-                    When set, .gitignore rules are bypassed.
-                exclude_pattern: Optional glob to exclude files (e.g., "test_*.md").
-                case_sensitive: Whether to match case. Defaults to False (case-insensitive).
-            
-            Returns:
-                Results grouped by file with line numbers:
-                ```
-                docs/api.md:
-                  10- context before
-                  11: This line has a <match>TODO</match> marker
-                  12- context after
-                
-                src/main.md:
-                  25: Another <match>TODO</match> item
-                ```
-            
-            **Regex Tips:**
-            - Escape special chars: \\. \\( \\) \\[ \\]
-            - Word boundary: \\bword\\b
-            - Any whitespace: \\s+
-            - One or more: pattern+
-            - Zero or more: pattern*
-            
-            **Error Recovery:**
-            - "No matches found" -> Try case_sensitive=False, or broaden the pattern
-            - "ripgrep failed" -> Check regex syntax, escape special characters
-            - "pattern cannot be empty" -> Provide a non-empty search pattern
-            """
+            """Placeholder docstring - replaced by template."""
             if query is None or str(query) == "":
                 return "Query pattern cannot be empty. Provide a regex pattern to search for (e.g., 'TODO', 'def \\w+')."
 
@@ -365,4 +392,4 @@ class GrepSearchTool:
 
             return "\n".join(out_lines)
         
-        return grep_search
+        return self._apply_schema(grep_search)

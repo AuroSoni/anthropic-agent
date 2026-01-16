@@ -50,9 +50,9 @@ from __future__ import annotations
 from collections import Counter
 from pathlib import Path
 from posixpath import normpath as _posix_normpath
-from typing import Callable, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
-from ..tools.decorators import tool
+from ..tools.base import ConfigurableToolBase
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -120,17 +120,60 @@ def _is_within(child: Path, parent: Path) -> bool:
 # ---------------------------------------------------------------------------
 # Class-based tool implementation
 # ---------------------------------------------------------------------------
-class GlobFileSearchTool:
-    """Configurable glob_file_search tool with a sandboxed base path.
+class GlobFileSearchTool(ConfigurableToolBase):
+    """Configurable glob_file_search tool with a sandboxed base path and templated docstrings.
     
     This class encapsulates the glob_file_search functionality, allowing configuration
     of the base path at instantiation time. The tool returned by get_tool()
     can be registered with an AnthropicAgent.
     
+    The docstring uses {placeholder} syntax that gets replaced with actual
+    configured values at schema generation time.
+    
     Example:
-        >>> glob_tool = GlobFileSearchTool(base_path="/path/to/workspace")
+        >>> # Default usage - docstring reflects actual config
+        >>> glob_tool = GlobFileSearchTool(base_path="/path/to/workspace", max_results=100)
         >>> agent = AnthropicAgent(tools=[glob_tool.get_tool()])
+        >>> # Docstring will say "Max results: 100"
+        
+        >>> # Custom docstring template
+        >>> glob_tool = GlobFileSearchTool(
+        ...     base_path="/workspace",
+        ...     docstring_template="Find files with {max_results} result limit."
+        ... )
     """
+    
+    DOCSTRING_TEMPLATE = """Find files matching a glob pattern, sorted by modification time (newest first).
+
+Use this tool to discover files by name pattern. Searches recursively by default.
+
+**Limits:**
+- Max results: {max_results} (excess files are summarized by extension)
+- Allowed extensions: {allowed_extensions_str}
+
+Args:
+    glob_pattern: Glob pattern to match. Auto-prepends "**/" for recursive search.
+        Examples:
+        - "*.md" -> finds all .md files recursively
+        - "README*" -> finds all README files
+        - "docs/*.md" -> finds .md files in any docs/ directory
+        - "**/*.mmd" -> explicit recursive search
+    target_directory: Optional subdirectory to search within. Defaults to workspace root.
+
+Returns:
+    Newline-separated file paths (newest first):
+    ```
+    docs/api/endpoints.md
+    docs/getting-started.md
+    README.md
+    [12 more files of type md, 3 more files of type mmd]
+    ```
+
+**Error Recovery:**
+- "No matches found" -> Try a broader pattern (e.g., "*.md" instead of "specific*.md")
+- "Path does not exist" -> Check the directory path with list_dir first
+- "Path is not a directory" -> Remove the file name, search in its parent directory
+"""
     
     def __init__(
         self,
@@ -138,6 +181,8 @@ class GlobFileSearchTool:
         max_results: int = 50,
         summary_max_ext_groups: int = 3,
         allowed_extensions: set[str] | None = None,
+        docstring_template: str | None = None,
+        schema_override: dict | None = None,
     ):
         """Initialize the GlobFileSearchTool with a base path and configurable limits.
         
@@ -148,54 +193,35 @@ class GlobFileSearchTool:
             summary_max_ext_groups: Maximum extension groups to show in summary. Defaults to 3.
             allowed_extensions: Set of allowed file extensions (with leading dot).
                                Defaults to {".md", ".mmd"} if None.
+            docstring_template: Optional custom docstring template with {placeholder} syntax.
+                               Available placeholders: {max_results}, {allowed_extensions_str}.
+            schema_override: Optional complete Anthropic tool schema dict for full control.
         """
+        super().__init__(docstring_template=docstring_template, schema_override=schema_override)
         self.search_root: Path = Path(base_path).resolve()
         self.max_results: int = max_results
         self.summary_max_ext_groups: int = summary_max_ext_groups
         self.allowed_extensions: set[str] = allowed_extensions or {".md", ".mmd"}
+    
+    def _get_template_context(self) -> Dict[str, Any]:
+        """Return placeholder values for docstring template."""
+        return {
+            "max_results": self.max_results,
+            "allowed_extensions_str": ", ".join(sorted(self.allowed_extensions)),
+        }
     
     def get_tool(self) -> Callable:
         """Return a @tool decorated function for use with AnthropicAgent.
         
         Returns:
             A decorated glob_file_search function that operates within the configured base_path.
+            The docstring will reflect the actual configured limits.
         """
         # Capture self in closure for the inner function
         instance = self
         
-        @tool
         def glob_file_search(glob_pattern: str, target_directory: str | None = None) -> str:
-            """Find files matching a glob pattern, sorted by modification time (newest first).
-            
-            Use this tool to discover files by name pattern. Searches recursively by default.
-            Only returns `.md` and `.mmd` files.
-            
-            **Limits:**
-            - Max results: 50 (excess files are summarized by extension)
-            
-            Args:
-                glob_pattern: Glob pattern to match. Auto-prepends "**/" for recursive search.
-                    Examples:
-                    - "*.md" -> finds all .md files recursively
-                    - "README*" -> finds all README files
-                    - "docs/*.md" -> finds .md files in any docs/ directory
-                    - "**/*.mmd" -> explicit recursive search
-                target_directory: Optional subdirectory to search within. Defaults to workspace root.
-            
-            Returns:
-                Newline-separated file paths (newest first):
-                ```
-                docs/api/endpoints.md
-                docs/getting-started.md
-                README.md
-                [12 more files of type md, 3 more files of type mmd]
-                ```
-            
-            **Error Recovery:**
-            - "No matches found" -> Try a broader pattern (e.g., "*.md" instead of "specific*.md")
-            - "Path does not exist" -> Check the directory path with list_dir first
-            - "Path is not a directory" -> Remove the file name, search in its parent directory
-            """
+            """Placeholder docstring - replaced by template."""
             base: Path = instance.search_root if target_directory is None else (instance.search_root / target_directory)
 
             # Prepare a relative path string for error messages
@@ -280,4 +306,4 @@ class GlobFileSearchTool:
 
             return "\n".join(lines)
         
-        return glob_file_search
+        return self._apply_schema(glob_file_search)

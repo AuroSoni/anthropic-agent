@@ -3,6 +3,11 @@
 This module provides configurable tools for file operations within sandboxed
 directories. Each tool class can be instantiated with custom limits and
 extension filters.
+
+All tool classes inherit from ConfigurableToolBase, which provides:
+- Templated docstrings with {placeholder} syntax for dynamic values
+- Optional custom docstring templates via docstring_template parameter
+- Optional complete schema override via schema_override parameter
 """
 from __future__ import annotations
 
@@ -82,6 +87,7 @@ def get_extensions(preset: Union[str, Set[str]]) -> set[str]:
 # ---------------------------------------------------------------------------
 # Tool class exports
 # ---------------------------------------------------------------------------
+from ..tools.base import ConfigurableToolBase
 from .read_file import ReadFileTool
 from .apply_patch import ApplyPatchTool
 from .glob_file_search import GlobFileSearchTool
@@ -92,6 +98,8 @@ __all__ = [
     # Extension utilities
     "EXTENSION_PRESETS",
     "get_extensions",
+    # Base class
+    "ConfigurableToolBase",
     # Tool classes
     "ReadFileTool",
     "ApplyPatchTool",

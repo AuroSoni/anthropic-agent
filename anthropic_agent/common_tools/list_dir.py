@@ -60,9 +60,9 @@ from __future__ import annotations
 from collections import Counter
 from pathlib import Path, PurePosixPath
 from posixpath import normpath as _posix_normpath
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
-from ..tools.decorators import tool
+from ..tools.base import ConfigurableToolBase
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -138,17 +138,67 @@ def format_ext_groups(counts: Dict[str, int], max_groups: Optional[int] = None) 
 # ---------------------------------------------------------------------------
 # Class-based tool implementation
 # ---------------------------------------------------------------------------
-class ListDirTool:
-    """Configurable list_dir tool with a sandboxed base path.
+class ListDirTool(ConfigurableToolBase):
+    """Configurable list_dir tool with a sandboxed base path and templated docstrings.
     
     This class encapsulates the list_dir functionality, allowing configuration
     of the base path at instantiation time. The tool returned by get_tool()
     can be registered with an AnthropicAgent.
     
+    The docstring uses {placeholder} syntax that gets replaced with actual
+    configured values at schema generation time.
+    
     Example:
-        >>> list_dir_tool = ListDirTool(base_path="/path/to/workspace")
+        >>> # Default usage - docstring reflects actual config
+        >>> list_dir_tool = ListDirTool(base_path="/path/to/workspace", max_depth=10)
         >>> agent = AnthropicAgent(tools=[list_dir_tool.get_tool()])
+        >>> # Docstring will say "Max depth: 10 levels"
+        
+        >>> # Custom docstring template
+        >>> list_dir_tool = ListDirTool(
+        ...     base_path="/workspace",
+        ...     docstring_template="List dirs with {max_depth} depth limit."
+        ... )
     """
+    
+    DOCSTRING_TEMPLATE = """List the contents of a directory as an ASCII tree.
+
+Use this tool to explore the structure of a codebase. Shows directories before files,
+sorted alphabetically. Hidden files are included. Symlinked directories are shown
+but not traversed.
+
+**Limits:**
+- Max depth: {max_depth} levels (deeper directories show a summary count)
+- Large directories (>{large_dir_threshold} entries): Shows first {large_dir_show_dirs} subdirs + {large_dir_show_files} files with summaries
+- Allowed extensions: {allowed_extensions_str}
+
+Args:
+    target_directory: Path relative to the workspace root. Use "." for the root.
+    ignore_globs: Glob patterns to exclude. Examples:
+        - "**/node_modules/**" - hide node_modules and all contents anywhere
+        - "**/__pycache__/**" - hide Python cache directories
+        - "*.log" - hide all .log files
+        - "name/**" - show directory 'name' but hide its contents
+
+Returns:
+    ASCII tree with "- " bullets. Directories end with "/".
+    Example output:
+    ```
+    my_project/
+       - src/
+          - main.py
+          - utils.py
+       - tests/
+       - README.md
+    ```
+    
+    On depth/size limits: "[depth limit reached; 42 files (py: 30, md: 12), 5 subdirectories]"
+
+**Error Recovery:**
+- "Path does not exist" -> Check the parent directory with list_dir first
+- "Path is not a directory" -> Use read_file to view the file contents instead
+- "[permission denied]" -> Try a different directory or check file permissions
+"""
     
     def __init__(
         self,
@@ -158,6 +208,8 @@ class ListDirTool:
         large_dir_show_files: int = 5,
         large_dir_show_dirs: int = 5,
         allowed_extensions: set[str] | None = None,
+        docstring_template: str | None = None,
+        schema_override: dict | None = None,
     ):
         """Initialize the ListDirTool with a base path and configurable limits.
         
@@ -170,7 +222,12 @@ class ListDirTool:
             large_dir_show_dirs: Number of directories to show in large directories. Defaults to 5.
             allowed_extensions: Set of allowed file extensions (with leading dot).
                                Defaults to {".md", ".mmd"} if None.
+            docstring_template: Optional custom docstring template with {placeholder} syntax.
+                               Available placeholders: {max_depth}, {large_dir_threshold},
+                               {large_dir_show_files}, {large_dir_show_dirs}, {allowed_extensions_str}.
+            schema_override: Optional complete Anthropic tool schema dict for full control.
         """
+        super().__init__(docstring_template=docstring_template, schema_override=schema_override)
         self.search_root: Path = Path(base_path).resolve()
         self.max_depth: int = max_depth
         self.large_dir_threshold: int = large_dir_threshold
@@ -179,6 +236,16 @@ class ListDirTool:
         self.allowed_extensions: set[str] = allowed_extensions or {".md", ".mmd"}
         self._allowed_cache: Dict[Path, bool] = {}
         self._patterns: List[str] = []
+    
+    def _get_template_context(self) -> Dict[str, Any]:
+        """Return placeholder values for docstring template."""
+        return {
+            "max_depth": self.max_depth,
+            "large_dir_threshold": self.large_dir_threshold,
+            "large_dir_show_files": self.large_dir_show_files,
+            "large_dir_show_dirs": self.large_dir_show_dirs,
+            "allowed_extensions_str": ", ".join(sorted(self.allowed_extensions)),
+        }
     
     def _is_ignored(self, path: Path) -> bool:
         """Check if a path should be ignored based on current patterns."""
@@ -408,49 +475,13 @@ class ListDirTool:
         
         Returns:
             A decorated list_dir function that operates within the configured base_path.
+            The docstring will reflect the actual configured limits.
         """
         # Capture self in closure for the inner function
         instance = self
         
-        @tool
         def list_dir(target_directory: str, ignore_globs: List[str] | None = None) -> str:
-            """List the contents of a directory as an ASCII tree.
-            
-            Use this tool to explore the structure of a codebase. Shows directories before files,
-            sorted alphabetically. Hidden files are included. Symlinked directories are shown
-            but not traversed.
-            
-            **Limits:**
-            - Max depth: 5 levels (deeper directories show a summary count)
-            - Large directories (>50 entries): Shows first 5 subdirs + 5 files with summaries
-            
-            Args:
-                target_directory: Path relative to the workspace root. Use "." for the root.
-                ignore_globs: Glob patterns to exclude. Examples:
-                    - "**/node_modules/**" - hide node_modules and all contents anywhere
-                    - "**/__pycache__/**" - hide Python cache directories
-                    - "*.log" - hide all .log files
-                    - "name/**" - show directory 'name' but hide its contents
-            
-            Returns:
-                ASCII tree with "- " bullets. Directories end with "/".
-                Example output:
-                ```
-                my_project/
-                   - src/
-                      - main.py
-                      - utils.py
-                   - tests/
-                   - README.md
-                ```
-                
-                On depth/size limits: "[depth limit reached; 42 files (py: 30, md: 12), 5 subdirectories]"
-            
-            **Error Recovery:**
-            - "Path does not exist" -> Check the parent directory with list_dir first
-            - "Path is not a directory" -> Use read_file to view the file contents instead
-            - "[permission denied]" -> Try a different directory or check file permissions
-            """
+            """Placeholder docstring - replaced by template."""
             base = instance.search_root / target_directory
             rel_arg = _posix_normpath(str(target_directory).replace("\\", "/"))
             if not _is_within(base, instance.search_root):
@@ -469,4 +500,4 @@ class ListDirTool:
             instance._render_directory(base, 0, lines)
             return "\n".join(lines)
         
-        return list_dir
+        return self._apply_schema(list_dir)

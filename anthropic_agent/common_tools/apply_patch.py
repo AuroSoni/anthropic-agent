@@ -92,9 +92,9 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from posixpath import normpath as _posix_normpath
-from typing import Callable, List, Literal, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, NamedTuple, Optional, Tuple
 
-from ..tools.decorators import tool
+from ..tools.base import ConfigurableToolBase
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -923,51 +923,30 @@ def _apply_hunks(content: str, hunks: List[Hunk], file_path: str) -> Tuple[str, 
 # ---------------------------------------------------------------------------
 # Class-based tool implementation
 # ---------------------------------------------------------------------------
-class ApplyPatchTool:
-    """Configurable apply_patch tool with a sandboxed base path.
+class ApplyPatchTool(ConfigurableToolBase):
+    """Configurable apply_patch tool with a sandboxed base path and templated docstrings.
     
     This class encapsulates the apply_patch functionality, allowing configuration
     of the base path at instantiation time. The tool returned by get_tool()
     can be registered with an AnthropicAgent.
     
+    The docstring uses {placeholder} syntax that gets replaced with actual
+    configured values at schema generation time.
+    
     Example:
+        >>> # Default usage - docstring reflects actual config
         >>> patch_tool = ApplyPatchTool(base_path="/path/to/workspace")
         >>> agent = AnthropicAgent(tools=[patch_tool.get_tool()])
+        
+        >>> # Custom limits
+        >>> patch_tool = ApplyPatchTool(
+        ...     base_path="/workspace",
+        ...     max_patch_size_bytes=2 * 1024 * 1024,  # 2MB
+        ...     max_file_size_bytes=20 * 1024 * 1024,  # 20MB
+        ... )
     """
     
-    def __init__(
-        self,
-        base_path: str | Path,
-        max_patch_size_bytes: int = 1 * 1024 * 1024,
-        max_file_size_bytes: int = 10 * 1024 * 1024,
-        allowed_extensions: set[str] | None = None,
-    ):
-        """Initialize the ApplyPatchTool with a base path and configurable limits.
-        
-        Args:
-            base_path: The root directory that apply_patch operates within.
-                       All file paths in patches must be relative to this directory.
-            max_patch_size_bytes: Maximum size of a single patch. Defaults to 1MB.
-            max_file_size_bytes: Maximum file size after patch application. Defaults to 10MB.
-            allowed_extensions: Set of allowed file extensions (with leading dot).
-                               Defaults to a comprehensive set of text/code extensions if None.
-        """
-        self.base_path: Path = Path(base_path).resolve()
-        self.max_patch_size: int = max_patch_size_bytes
-        self.max_file_size: int = max_file_size_bytes
-        self.allowed_extensions: set[str] = allowed_extensions or ALLOWED_EXTENSIONS
-    
-    def get_tool(self) -> Callable:
-        """Return a @tool decorated function for use with AnthropicAgent.
-        
-        Returns:
-            A decorated apply_patch function that operates within the configured base_path.
-        """
-        instance = self
-        
-        @tool
-        def apply_patch(patch: str, dry_run: bool = False, strict: bool = True) -> str:
-            """Apply changes to a file using a patch format.
+    DOCSTRING_TEMPLATE = """Apply changes to a file using a patch format.
             
             Use this tool to create, modify, or delete files. Supports fuzzy matching
             to tolerate minor whitespace differences when locating context.
@@ -1006,8 +985,8 @@ class ApplyPatchTool:
             
             Returns:
                 JSON with result:
-                - Success: `{"status": "ok", "op": "update", "path": "...", "hunks_applied": 2, ...}`
-                - Error: `{"status": "error", "error": "...", "hint": "..."}`
+                - Success: `{{"status": "ok", "op": "update", "path": "...", "hunks_applied": 2, ...}}`
+                - Error: `{{"status": "error", "error": "...", "hint": "..."}}`
             
             **Error Recovery:**
             - "could not find matching context" -> Re-read the file with read_file, the content may have changed
@@ -1015,7 +994,54 @@ class ApplyPatchTool:
             - "File does not exist" -> Use `*** Add File:` instead of `*** Update File:`
             - "Invalid hunk line" -> Ensure all lines start with space, +, or -
             - "scope signature not found" -> Check function/class name spelling, re-read file
-            """
+"""
+    
+    def __init__(
+        self,
+        base_path: str | Path,
+        max_patch_size_bytes: int = 1 * 1024 * 1024,
+        max_file_size_bytes: int = 10 * 1024 * 1024,
+        allowed_extensions: set[str] | None = None,
+        docstring_template: str | None = None,
+        schema_override: dict | None = None,
+    ):
+        """Initialize the ApplyPatchTool with a base path and configurable limits.
+        
+        Args:
+            base_path: The root directory that apply_patch operates within.
+                       All file paths in patches must be relative to this directory.
+            max_patch_size_bytes: Maximum size of a single patch. Defaults to 1MB.
+            max_file_size_bytes: Maximum file size after patch application. Defaults to 10MB.
+            allowed_extensions: Set of allowed file extensions (with leading dot).
+                               Defaults to a comprehensive set of text/code extensions if None.
+            docstring_template: Optional custom docstring template with {placeholder} syntax.
+                               Available placeholders: {max_patch_size_mb}, {max_file_size_mb}.
+            schema_override: Optional complete Anthropic tool schema dict for full control.
+        """
+        super().__init__(docstring_template=docstring_template, schema_override=schema_override)
+        self.base_path: Path = Path(base_path).resolve()
+        self.max_patch_size: int = max_patch_size_bytes
+        self.max_file_size: int = max_file_size_bytes
+        self.allowed_extensions: set[str] = allowed_extensions or ALLOWED_EXTENSIONS
+    
+    def _get_template_context(self) -> Dict[str, Any]:
+        """Return placeholder values for docstring template."""
+        return {
+            "max_patch_size_mb": self.max_patch_size // 1024 // 1024,
+            "max_file_size_mb": self.max_file_size // 1024 // 1024,
+        }
+    
+    def get_tool(self) -> Callable:
+        """Return a @tool decorated function for use with AnthropicAgent.
+        
+        Returns:
+            A decorated apply_patch function that operates within the configured base_path.
+            The docstring will reflect the actual configured limits.
+        """
+        instance = self
+        
+        def apply_patch(patch: str, dry_run: bool = False, strict: bool = True) -> str:
+            """Placeholder docstring - replaced by template."""
             # Check patch size
             if len(patch.encode("utf-8")) > instance.max_patch_size:
                 return _make_error_response(
@@ -1243,4 +1269,4 @@ class ApplyPatchTool:
                 moved_from=moved_from,
             )
         
-        return apply_patch
+        return self._apply_schema(apply_patch)

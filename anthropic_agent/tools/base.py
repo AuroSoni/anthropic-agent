@@ -1,16 +1,20 @@
 """Base interfaces and utilities for tool execution."""
+from __future__ import annotations
+
 import base64
 import uuid
+import warnings
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Protocol, Dict, Any, Callable, Literal, TYPE_CHECKING
+from typing import Protocol, Dict, Any, Callable, Literal, Optional, TYPE_CHECKING
+
+from .decorators import tool
 
 if TYPE_CHECKING:
     from anthropic_agent.file_backends.backends import FileStorageBackend
 
-
 # Type alias for tool result content that can be sent to Anthropic API
 ToolResultContent = str | list[dict[str, Any]]
-
 
 @dataclass
 class ImageBlock:
@@ -22,7 +26,6 @@ class ImageBlock:
     """
     data: bytes
     media_type: Literal["image/png", "image/jpeg", "image/gif", "image/webp"]
-
 
 @dataclass
 class ToolResult:
@@ -150,7 +153,6 @@ class ToolResult:
         
         return api_blocks, image_refs
 
-
 class ToolExecutor(Protocol):
     """Protocol for tool executor implementations.
     
@@ -169,7 +171,6 @@ class ToolExecutor(Protocol):
             String result from tool execution
         """
         ...
-
 
 class ToolRegistry:
     """Registry for managing tool functions and their schemas.
@@ -299,3 +300,157 @@ class ToolRegistry:
         
         raise ValueError(f"Unsupported schema_type '{schema_type}'. Expected 'anthropic' or 'openai'.")
 
+class ConfigurableToolBase(ABC):
+    """Abstract base class for tools with templated docstrings.
+    
+    This class provides a pattern for creating tools where:
+    - Docstrings use {placeholder} syntax that gets replaced with actual
+      instance values at schema generation time
+    - Library callers can provide custom docstring templates
+    - Library callers can provide complete schema overrides for full control
+    
+    Subclasses should:
+    1. Define DOCSTRING_TEMPLATE as a class attribute with {placeholder} syntax
+    2. Override _get_template_context() to provide placeholder values
+    3. Implement get_tool() and call self._apply_schema(func) on the inner function
+    
+    Example:
+        >>> class MyTool(ConfigurableToolBase):
+        ...     DOCSTRING_TEMPLATE = '''Do something with {max_items} items.
+        ...     
+        ...     Args:
+        ...         input: The input to process.
+        ...     '''
+        ...     
+        ...     def __init__(self, max_items: int = 10, **kwargs):
+        ...         super().__init__(**kwargs)
+        ...         self.max_items = max_items
+        ...     
+        ...     def _get_template_context(self) -> Dict[str, Any]:
+        ...         return {"max_items": self.max_items}
+        ...     
+        ...     def get_tool(self) -> Callable:
+        ...         def my_tool(input: str) -> str:
+        ...             '''Placeholder'''
+        ...             return input
+        ...         return self._apply_schema(my_tool)
+    """
+    
+    # Class-level docstring template with {placeholder} syntax
+    # Subclasses should override this with their specific template
+    DOCSTRING_TEMPLATE: str = ""
+    
+    def __init__(
+        self,
+        docstring_template: Optional[str] = None,
+        schema_override: Optional[dict] = None,
+    ):
+        """Initialize the configurable tool base.
+        
+        Args:
+            docstring_template: Optional custom docstring template with {placeholder}
+                syntax. If provided, overrides the class-level DOCSTRING_TEMPLATE.
+                Placeholders are replaced using values from _get_template_context().
+            schema_override: Optional complete Anthropic tool schema dict. If provided,
+                bypasses all docstring processing and uses this schema directly.
+                Must include 'name', 'description', and 'input_schema' keys.
+        """
+        self._docstring_template = docstring_template
+        self._schema_override = schema_override
+    
+    def _get_template_context(self) -> Dict[str, Any]:
+        """Return a dict of {placeholder: value} for docstring template substitution.
+        
+        Override this method in subclasses to provide tool-specific placeholder values.
+        Keys should match the {placeholder} names used in DOCSTRING_TEMPLATE.
+        
+        Returns:
+            Dict mapping placeholder names to their values. Values are converted
+            to strings during template rendering.
+        
+        Example:
+            >>> def _get_template_context(self) -> Dict[str, Any]:
+            ...     return {
+            ...         "max_lines": self.max_lines,
+            ...         "allowed_extensions_str": ", ".join(sorted(self.allowed_extensions)),
+            ...     }
+        """
+        return {}
+    
+    def _render_docstring(self) -> str:
+        """Render the docstring template by replacing {placeholders} with actual values.
+        
+        Uses the custom docstring_template if provided, otherwise falls back to
+        the class-level DOCSTRING_TEMPLATE. Placeholders are replaced with values
+        from _get_template_context().
+        
+        Returns:
+            The rendered docstring with all placeholders replaced.
+        
+        Note:
+            If a placeholder in the template is not found in the context,
+            a warning is issued and the template is returned with that
+            placeholder intact.
+        """
+        template = self._docstring_template or self.DOCSTRING_TEMPLATE
+        
+        if not template:
+            return ""
+        
+        context = self._get_template_context()
+        
+        try:
+            return template.format(**context)
+        except KeyError as e:
+            warnings.warn(
+                f"{self.__class__.__name__}: Unknown docstring placeholder {e}. "
+                f"Available placeholders: {list(context.keys())}",
+                stacklevel=2
+            )
+            # Return template as-is if substitution fails
+            return template
+    
+    def _apply_schema(self, func: Callable) -> Callable:
+        """Apply schema to function - either override or generated from docstring.
+        
+        This method should be called in get_tool() on the inner function before
+        returning it. It handles:
+        1. Using schema_override directly if provided
+        2. Otherwise, rendering the docstring template and applying @tool decorator
+        
+        Args:
+            func: The inner tool function to apply schema to.
+        
+        Returns:
+            The function with __tool_schema__ and __tool_executor__ attributes set.
+        
+        Example:
+            >>> def get_tool(self) -> Callable:
+            ...     def my_tool(input: str) -> str:
+            ...         '''Placeholder'''
+            ...         return input
+            ...     return self._apply_schema(my_tool)
+        """
+        # Option 1: User provided complete schema - use it directly
+        if self._schema_override is not None:
+            func.__tool_schema__ = self._schema_override
+            func.__tool_executor__ = "backend"
+            return func
+        
+        # Option 2: Render templated docstring, then apply @tool decorator
+        func.__doc__ = self._render_docstring()
+        return tool(func)
+    
+    @abstractmethod
+    def get_tool(self) -> Callable:
+        """Return a @tool decorated function for use with AnthropicAgent.
+        
+        Subclasses must implement this method. The implementation should:
+        1. Define the inner tool function with proper type hints
+        2. Call self._apply_schema(func) on the inner function
+        3. Return the result
+        
+        Returns:
+            A decorated function with __tool_schema__ attribute.
+        """
+        ...
