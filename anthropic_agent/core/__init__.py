@@ -5,9 +5,12 @@ from .retry import anthropic_stream_with_backoff
 from .compaction import (
     CompactorType,
     get_compactor,
+    get_default_compactor,
+    get_model_token_limit,
     Compactor,
     NoOpCompactor,
     ToolResultRemovalCompactor,
+    SlidingWindowCompactor,
     estimate_tokens,
 )
 
@@ -17,9 +20,12 @@ __all__ = [
     'anthropic_stream_with_backoff',
     'CompactorType',
     'get_compactor',
+    'get_default_compactor',
+    'get_model_token_limit',
     'Compactor',
     'NoOpCompactor',
     'ToolResultRemovalCompactor',
+    'SlidingWindowCompactor',
     'estimate_tokens',
 ]
 

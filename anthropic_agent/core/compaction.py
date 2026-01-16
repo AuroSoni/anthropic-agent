@@ -7,12 +7,48 @@ and assistant turns.
 
 import json
 import copy
+import logging
 from typing import Protocol, Literal, Any
 from datetime import datetime
 
+logger = logging.getLogger(__name__)
 
 # Type alias for compactor names
-CompactorType = Literal["tool_result_removal", "none"]
+CompactorType = Literal["sliding_window", "tool_result_removal", "none"]
+
+# Default token thresholds for different models
+# These are set at ~80% of the model's context window to leave room for output
+MODEL_TOKEN_LIMITS: dict[str, int] = {
+    "claude-sonnet-4-5": 160_000,      # 200k context
+    "claude-opus-4": 160_000,          # 200k context
+    "claude-3-5-sonnet": 160_000,      # 200k context
+    "claude-3-opus": 160_000,          # 200k context  
+    "claude-3-sonnet": 160_000,        # 200k context
+    "claude-3-haiku": 160_000,         # 200k context
+    "claude-3-5-haiku": 160_000,       # 200k context
+    "default": 160_000,                # Safe default
+}
+
+
+def get_model_token_limit(model: str) -> int:
+    """Get the token limit threshold for a given model.
+    
+    Args:
+        model: Model name string
+        
+    Returns:
+        Token threshold for compaction (typically 80% of context window)
+    """
+    # Check for exact match first
+    if model in MODEL_TOKEN_LIMITS:
+        return MODEL_TOKEN_LIMITS[model]
+    
+    # Check for partial matches (e.g., "claude-sonnet-4-5-20250514")
+    for model_key, limit in MODEL_TOKEN_LIMITS.items():
+        if model_key in model.lower():
+            return limit
+    
+    return MODEL_TOKEN_LIMITS["default"]
 
 
 def estimate_tokens(messages: list[dict]) -> int:
@@ -294,22 +330,359 @@ class ToolResultRemovalCompactor:
         return filtered_messages, messages_removed
 
 
+class SlidingWindowCompactor:
+    """Progressive compactor that applies multiple strategies until under threshold.
+    
+    This is the recommended default compactor for production use. It applies
+    increasingly aggressive compaction strategies in order:
+    
+    1. Remove thinking blocks (extended thinking can be very large)
+    2. Truncate long tool results to max_result_chars
+    3. Replace old tool results with placeholders  
+    4. Remove entire old assistant/user turn pairs (keeping recent N turns)
+    
+    The compactor is progressive - it stops as soon as the token count is
+    under the threshold, preserving as much context as possible.
+    
+    Always preserves:
+    - First user message (original intent)
+    - Most recent messages (configurable via keep_recent_turns)
+    """
+    
+    PLACEHOLDER_TEXT = "[Content removed during compaction]"
+    TRUNCATION_SUFFIX = "\n\n[... truncated ...]"
+    
+    def __init__(
+        self,
+        threshold: int | None = None,
+        keep_recent_turns: int = 10,
+        max_result_chars: int = 2000,
+        remove_thinking: bool = True,
+    ):
+        """Initialize the sliding window compactor.
+        
+        Args:
+            threshold: Token count threshold to trigger compaction. If None,
+                uses model-specific defaults from MODEL_TOKEN_LIMITS.
+            keep_recent_turns: Minimum number of recent turn pairs to preserve.
+                A "turn" is an assistant message + its tool results (if any).
+            max_result_chars: Maximum characters to keep in tool results during
+                truncation phase. Results longer than this are truncated.
+            remove_thinking: Whether to remove thinking blocks from OLD assistant
+                messages. Recent messages (based on keep_recent_turns) retain their
+                thinking blocks. Recommended True as thinking can be very large.
+        """
+        self.threshold = threshold
+        self.keep_recent_turns = keep_recent_turns
+        self.max_result_chars = max_result_chars
+        self.remove_thinking = remove_thinking
+    
+    def _get_threshold(self, model: str) -> int:
+        """Get effective threshold, using model default if not explicitly set."""
+        if self.threshold is not None:
+            return self.threshold
+        return get_model_token_limit(model)
+    
+    def compact(
+        self, 
+        messages: list[dict], 
+        model: str,
+        estimated_tokens: int | None = None
+    ) -> tuple[list[dict], dict[str, Any]]:
+        """Apply progressive compaction until under threshold.
+        
+        Args:
+            messages: List of message dictionaries to compact
+            model: Model name being used
+            estimated_tokens: Optional estimated token count from previous API response
+            
+        Returns:
+            Tuple of (compacted_messages, metadata)
+        """
+        threshold = self._get_threshold(model)
+        original_tokens = estimated_tokens if estimated_tokens is not None else estimate_tokens(messages)
+        
+        # Track what was done
+        metadata: dict[str, Any] = {
+            "compaction_applied": False,
+            "original_token_estimate": original_tokens,
+            "threshold": threshold,
+            "model": model,
+            "phases_applied": [],
+            "thinking_blocks_removed": 0,
+            "tool_results_truncated": 0,
+            "tool_results_replaced": 0,
+            "messages_removed": 0,
+        }
+        
+        # Check if compaction is needed
+        if original_tokens <= threshold:
+            metadata["reason"] = "below_threshold"
+            return messages, metadata
+        
+        if len(messages) <= 1:
+            metadata["reason"] = "insufficient_messages"
+            return messages, metadata
+        
+        # Deep copy to avoid modifying original
+        compacted = copy.deepcopy(messages)
+        current_tokens = original_tokens
+        
+        # Phase 1: Remove thinking blocks
+        if self.remove_thinking:
+            compacted, thinking_removed = self._remove_thinking_blocks(compacted)
+            if thinking_removed > 0:
+                metadata["phases_applied"].append("remove_thinking")
+                metadata["thinking_blocks_removed"] = thinking_removed
+                current_tokens = estimate_tokens(compacted)
+                logger.info(f"Compaction phase 1: Removed {thinking_removed} thinking blocks, tokens: {current_tokens}")
+                
+                if current_tokens <= threshold:
+                    metadata["compaction_applied"] = True
+                    metadata["final_token_estimate"] = current_tokens
+                    metadata["estimated_tokens_saved"] = original_tokens - current_tokens
+                    metadata["timestamp"] = datetime.now().isoformat()
+                    return compacted, metadata
+        
+        # Phase 2: Truncate long tool results
+        compacted, truncated_count = self._truncate_tool_results(compacted)
+        if truncated_count > 0:
+            metadata["phases_applied"].append("truncate_results")
+            metadata["tool_results_truncated"] = truncated_count
+            current_tokens = estimate_tokens(compacted)
+            logger.info(f"Compaction phase 2: Truncated {truncated_count} tool results, tokens: {current_tokens}")
+            
+            if current_tokens <= threshold:
+                metadata["compaction_applied"] = True
+                metadata["final_token_estimate"] = current_tokens
+                metadata["estimated_tokens_saved"] = original_tokens - current_tokens
+                metadata["timestamp"] = datetime.now().isoformat()
+                return compacted, metadata
+        
+        # Phase 3: Replace old tool results with placeholders
+        compacted, replaced_count = self._replace_old_tool_results(compacted)
+        if replaced_count > 0:
+            metadata["phases_applied"].append("replace_results")
+            metadata["tool_results_replaced"] = replaced_count
+            current_tokens = estimate_tokens(compacted)
+            logger.info(f"Compaction phase 3: Replaced {replaced_count} tool results, tokens: {current_tokens}")
+            
+            if current_tokens <= threshold:
+                metadata["compaction_applied"] = True
+                metadata["final_token_estimate"] = current_tokens
+                metadata["estimated_tokens_saved"] = original_tokens - current_tokens
+                metadata["timestamp"] = datetime.now().isoformat()
+                return compacted, metadata
+        
+        # Phase 4: Remove old turns (sliding window)
+        compacted, removed_count = self._remove_old_turns(compacted, threshold)
+        if removed_count > 0:
+            metadata["phases_applied"].append("remove_turns")
+            metadata["messages_removed"] = removed_count
+            current_tokens = estimate_tokens(compacted)
+            logger.info(f"Compaction phase 4: Removed {removed_count} messages, tokens: {current_tokens}")
+        
+        metadata["compaction_applied"] = True
+        metadata["final_token_estimate"] = current_tokens
+        metadata["estimated_tokens_saved"] = original_tokens - current_tokens
+        metadata["timestamp"] = datetime.now().isoformat()
+        
+        # Warn if still over threshold after all phases
+        if current_tokens > threshold:
+            logger.warning(
+                f"Compaction complete but still over threshold: {current_tokens} > {threshold}. "
+                f"Consider increasing keep_recent_turns or reducing message sizes."
+            )
+            metadata["warning"] = "still_over_threshold"
+        
+        return compacted, metadata
+    
+    def _remove_thinking_blocks(self, messages: list[dict]) -> tuple[list[dict], int]:
+        """Remove thinking blocks from old assistant messages.
+        
+        Preserves thinking blocks in the most recent assistant messages
+        (based on keep_recent_turns), only removing from older messages.
+        
+        Args:
+            messages: List of message dictionaries
+            
+        Returns:
+            Tuple of (modified_messages, count_of_removed_blocks)
+        """
+        removed_count = 0
+        
+        # Find indices of assistant messages
+        assistant_indices = [
+            i for i, msg in enumerate(messages) 
+            if msg.get("role") == "assistant"
+        ]
+        
+        # Keep thinking in the most recent N assistant messages
+        indices_to_process = assistant_indices[:-self.keep_recent_turns] if len(assistant_indices) > self.keep_recent_turns else []
+        
+        for i in indices_to_process:
+            msg = messages[i]
+            content = msg.get("content", [])
+            if not isinstance(content, list):
+                continue
+            
+            # Filter out thinking blocks from old messages
+            new_content = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "thinking":
+                    removed_count += 1
+                else:
+                    new_content.append(block)
+            
+            msg["content"] = new_content
+        
+        return messages, removed_count
+    
+    def _truncate_tool_results(self, messages: list[dict]) -> tuple[list[dict], int]:
+        """Truncate long tool result content to max_result_chars.
+        
+        Works on all tool results except the most recent ones.
+        
+        Args:
+            messages: List of message dictionaries
+            
+        Returns:
+            Tuple of (modified_messages, count_of_truncated_results)
+        """
+        truncated_count = 0
+        
+        # Find indices of user messages with tool results
+        tool_result_indices = []
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "user" and isinstance(msg.get("content"), list):
+                has_tool_result = any(
+                    isinstance(b, dict) and b.get("type") == "tool_result"
+                    for b in msg["content"]
+                )
+                if has_tool_result:
+                    tool_result_indices.append(i)
+        
+        # Keep recent tool results intact
+        indices_to_truncate = tool_result_indices[:-self.keep_recent_turns] if len(tool_result_indices) > self.keep_recent_turns else []
+        
+        for i in indices_to_truncate:
+            msg = messages[i]
+            for block in msg["content"]:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    content = block.get("content", "")
+                    if isinstance(content, str) and len(content) > self.max_result_chars:
+                        block["content"] = content[:self.max_result_chars] + self.TRUNCATION_SUFFIX
+                        truncated_count += 1
+                    elif isinstance(content, list):
+                        # Handle content that's a list of blocks
+                        for inner_block in content:
+                            if isinstance(inner_block, dict) and inner_block.get("type") == "text":
+                                text = inner_block.get("text", "")
+                                if len(text) > self.max_result_chars:
+                                    inner_block["text"] = text[:self.max_result_chars] + self.TRUNCATION_SUFFIX
+                                    truncated_count += 1
+        
+        return messages, truncated_count
+    
+    def _replace_old_tool_results(self, messages: list[dict]) -> tuple[list[dict], int]:
+        """Replace old tool result content with placeholders.
+        
+        Keeps recent tool results intact based on keep_recent_turns.
+        
+        Args:
+            messages: List of message dictionaries
+            
+        Returns:
+            Tuple of (modified_messages, count_of_replaced_results)
+        """
+        replaced_count = 0
+        
+        # Find indices of user messages with tool results
+        tool_result_indices = []
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "user" and isinstance(msg.get("content"), list):
+                has_tool_result = any(
+                    isinstance(b, dict) and b.get("type") == "tool_result"
+                    for b in msg["content"]
+                )
+                if has_tool_result:
+                    tool_result_indices.append(i)
+        
+        # Replace all but the most recent keep_recent_turns tool results
+        indices_to_replace = tool_result_indices[:-self.keep_recent_turns] if len(tool_result_indices) > self.keep_recent_turns else []
+        
+        for i in indices_to_replace:
+            msg = messages[i]
+            for block in msg["content"]:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    if block.get("content") != self.PLACEHOLDER_TEXT:
+                        block["content"] = self.PLACEHOLDER_TEXT
+                        replaced_count += 1
+        
+        return messages, replaced_count
+    
+    def _remove_old_turns(self, messages: list[dict], threshold: int) -> tuple[list[dict], int]:
+        """Remove old assistant/user turn pairs until under threshold.
+        
+        Preserves:
+        - First user message (index 0)
+        - Most recent keep_recent_turns pairs
+        
+        Args:
+            messages: List of message dictionaries
+            threshold: Target token threshold
+            
+        Returns:
+            Tuple of (filtered_messages, count_of_removed_messages)
+        """
+        if len(messages) <= 2:
+            return messages, 0
+        
+        # Always keep first message
+        first_message = messages[0]
+        remaining = messages[1:]
+        
+        # Calculate how many messages we need to keep for minimum recent turns
+        # Each "turn" is roughly 2 messages (assistant + user with tool result)
+        min_keep = self.keep_recent_turns * 2
+        
+        # Keep removing oldest messages until under threshold or at minimum
+        removed_count = 0
+        while len(remaining) > min_keep:
+            current_messages = [first_message] + remaining
+            current_tokens = estimate_tokens(current_messages)
+            
+            if current_tokens <= threshold:
+                break
+            
+            # Remove the oldest message (first in remaining)
+            remaining = remaining[1:]
+            removed_count += 1
+        
+        return [first_message] + remaining, removed_count
+
+
 # Compactor registry mapping string names to compactor classes
 COMPACTORS: dict[str, type[Compactor]] = {
+    "sliding_window": SlidingWindowCompactor,
     "tool_result_removal": ToolResultRemovalCompactor,
     "none": NoOpCompactor,
 }
+
+# Default compactor for production use
+DEFAULT_COMPACTOR: CompactorType = "sliding_window"
 
 
 def get_compactor(name: CompactorType, threshold: int | None = None, **kwargs) -> Compactor:
     """Get a compactor instance by name.
     
     Args:
-        name: Compactor name ("tool_result_removal" or "none")
+        name: Compactor name ("sliding_window", "tool_result_removal", or "none")
         threshold: Token count threshold for compaction. The compactor uses this to decide
-            when to compact. If None, the compactor may not perform any compaction.
+            when to compact. If None, model-specific defaults are used (for sliding_window)
+            or compaction is disabled (for other compactors).
         **kwargs: Additional arguments to pass to the compactor constructor
-            (e.g., aggressive=True for ToolResultRemovalCompactor)
+            (e.g., keep_recent_turns=10 for SlidingWindowCompactor)
         
     Returns:
         An instance of the requested compactor
@@ -324,4 +697,28 @@ def get_compactor(name: CompactorType, threshold: int | None = None, **kwargs) -
     
     compactor_class = COMPACTORS[name]
     return compactor_class(threshold=threshold, **kwargs)
+
+
+def get_default_compactor(threshold: int | None = None) -> Compactor:
+    """Get the default compactor instance for production use.
+    
+    This returns a SlidingWindowCompactor with sensible defaults:
+    - Uses model-specific token thresholds (or provided threshold)
+    - Keeps 10 recent turns
+    - Truncates tool results > 2000 chars
+    - Removes thinking blocks
+    
+    Args:
+        threshold: Optional override for token threshold. If None, uses
+            model-specific defaults (~160k for Claude models).
+            
+    Returns:
+        A configured SlidingWindowCompactor instance
+    """
+    return SlidingWindowCompactor(
+        threshold=threshold,
+        keep_recent_turns=10,
+        max_result_chars=2000,
+        remove_thinking=True,
+    )
 

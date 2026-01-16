@@ -16,7 +16,7 @@ from .retry import anthropic_stream_with_backoff, retry_with_backoff
 from .title_generator import generate_title
 from ..tools.base import ToolRegistry, ToolResultContent
 from ..streaming import FormatterType
-from .compaction import CompactorType, get_compactor, Compactor
+from .compaction import CompactorType, get_compactor, get_default_compactor, Compactor
 from ..memory import MemoryStoreType, get_memory_store, MemoryStore
 from ..database import DBBackendType, get_db_backend, DatabaseBackend
 from ..file_backends import FileBackendType, get_file_backend, FileStorageBackend
@@ -90,10 +90,12 @@ class AnthropicAgent:
             enable_cache_control: Enable cache_control injection for message content blocks
                 (default: True). When enabled, adds cache_control to supported content block
                 types (text, image, document) in both user and assistant messages.
-            compactor: Either a compactor name ("tool_result_removal", "none") or a pre-configured
-                Compactor instance. If a string is provided, a compactor is created with default
-                settings (no threshold). For custom threshold, create and pass a Compactor instance.
-                Example: get_compactor("tool_result_removal", threshold=50000)
+            compactor: Either a compactor name ("sliding_window", "tool_result_removal", "none") 
+                or a pre-configured Compactor instance. Default: SlidingWindowCompactor with 
+                model-aware thresholds (~160k tokens for Claude models). Pass "none" to disable.
+                The default compactor progressively: 1) removes thinking blocks, 2) truncates 
+                long tool results, 3) replaces old results with placeholders, 4) removes old turns.
+                Example: get_compactor("sliding_window", threshold=150000, keep_recent_turns=5)
             memory_store: Either a memory store name ("placeholder", "none") or a pre-configured
                 MemoryStore instance. Memory stores retrieve relevant context for injection and
                 integrate with the compaction lifecycle to preserve important information.
@@ -281,12 +283,17 @@ class AnthropicAgent:
             if api_kwargs
             else db_config.get("api_kwargs", {})
         )
-        # Context compaction
+        # Context compaction - enabled by default with SlidingWindowCompactor
+        # Pass compactor="none" to explicitly disable compaction
         if compactor is None:
-            self.compactor: Optional[Compactor] = None
+            # Default: Enable compaction with model-aware thresholds
+            self.compactor: Optional[Compactor] = get_default_compactor()
         elif isinstance(compactor, str):
-            # String name provided - create compactor with default settings (no threshold)
-            self.compactor = get_compactor(compactor)
+            if compactor == "none":
+                self.compactor = None
+            else:
+                # String name provided - create compactor with default settings
+                self.compactor = get_compactor(compactor)
         else:
             # Pre-configured Compactor instance provided
             self.compactor = compactor
