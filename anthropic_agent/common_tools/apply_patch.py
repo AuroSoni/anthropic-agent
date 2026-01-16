@@ -2,102 +2,28 @@
 ### Spec for `apply_patch` in `anthropic_agent/common_tools/apply_patch.py`
 
 - **Signature**
-  - `def apply_patch(patch: str, dry_run: bool = False) -> str`
+  - `def apply_patch(patch: str, dry_run: bool = False, strict: bool = True) -> str`
 
 - **Purpose**
-  - Apply a Cursor-style patch envelope to a single file under the configured base path.
-  - Supports three operations: adding a new file, updating an existing file, or deleting a file.
-  - Supports renaming/moving files during update operations.
+  - Apply changes to files using a patch format. Supports create, modify, delete, and rename.
 
-- **Patch envelope format (Cursor-style)**
-  ```
-  *** Begin Patch
-  *** Add File: relative/path/to/file.py
-  +line 1
-  +line 2
-  *** End Patch
-  ```
-  
-  For updates:
-  ```
-  *** Begin Patch
-  *** Update File: relative/path/to/file.py
-  @@ optional hunk header
-   context line (space prefix)
-  -removed line (minus prefix)
-  +added line (plus prefix)
-   context line
-  *** End Patch
-  ```
-  
-  For updates with scope lines (narrow search to specific function/class):
-  ```
-  *** Begin Patch
-  *** Update File: relative/path/to/file.py
-  @@ def function_name
-   context line
-  -old line
-  +new line
-  *** End Patch
-  ```
-  
-  For updates with nested scope (class method):
-  ```
-  *** Begin Patch
-  *** Update File: relative/path/to/file.py
-  @@ class ClassName
-  @@ def method_name
-   context line
-  -old line
-  +new line
-  *** End Patch
-  ```
-  
-  For updates targeting end of file:
-  ```
-  *** Begin Patch
-  *** Update File: relative/path/to/file.py
-  @@
-   last context line
-  +new line at end
-  *** End of File
-  *** End Patch
-  ```
-  
-  For updates with rename/move:
-  ```
-  *** Begin Patch
-  *** Update File: old/path/to/file.py
-  *** Move to: new/path/to/file.py
-  @@ optional hunk header
-   context line
-  -old line
-  +new line
-  *** End Patch
-  ```
-  
-  For deletes:
-  ```
-  *** Begin Patch
-  *** Delete File: relative/path/to/file.py
-  *** End Patch
-  ```
+- **Operations**
+  - `*** Add File: path` - Create new file (all lines start with +)
+  - `*** Update File: path` - Modify existing file (use @@ hunks)
+  - `*** Delete File: path` - Remove file (no body content)
+  - `*** Move to: new_path` - Rename/move during update
 
-- **Patch grammar rules**
-  - Must start with `*** Begin Patch` and end with `*** End Patch`.
-  - Exactly one file operation header: `*** Add File:`, `*** Update File:`, or `*** Delete File:`.
-  - For `Add File`: all content lines must start with `+`.
-  - For `Update File`: hunks start with `@@` (optional header text after @@).
-  - For `Update File`: optional `*** Move to: <path>` can follow to rename/move the file.
-  - For `Delete File`: no body content is allowed.
-  - Hunk lines must start with ` ` (context), `+` (add), or `-` (remove).
-  - Empty lines within hunks should also have the appropriate prefix (or can be blank).
-  - Scope lines: Text after `@@` (e.g., `@@ def func_name`) narrows context search.
-  - Nested scopes: Multiple consecutive `@@` lines define nested scopes (e.g., class then method).
-  - EOF marker: `*** End of File` after hunk content prioritizes end-of-file matching.
+- **Hunk Prefixes**
+  - ` ` (space) - Context line that must match
+  - `-` - Line to remove
+  - `+` - Line to add
 
-- **Path sandboxing**
-  - File paths are relative to `base_path` (POSIX-style).
+- **Error Recovery Guidance**
+  - "could not find matching context" -> Re-read file with read_file, content may have changed
+  - "File already exists" -> Use Update File instead of Add File
+  - "File does not exist" -> Use Add File instead of Update File
+  - "scope signature not found" -> Check function/class name, re-read file
+
   - Paths escaping via `..` or absolute paths are rejected.
   - All output paths are normalized.
 
@@ -1041,36 +967,54 @@ class ApplyPatchTool:
         
         @tool
         def apply_patch(patch: str, dry_run: bool = False, strict: bool = True) -> str:
-            """Apply a Cursor-style patch to a single file under the configured base path.
-
-            The patch must be enclosed in `*** Begin Patch` and `*** End Patch` markers,
-            with exactly one file operation:
-            - `*** Add File: <path>` - Create a new file
-            - `*** Update File: <path>` - Modify an existing file
-            - `*** Delete File: <path>` - Remove a file
+            """Apply changes to a file using a patch format.
             
-            For updates, an optional `*** Move to: <new_path>` can follow the Update File
-            header to rename/move the file while applying changes.
+            Use this tool to create, modify, or delete files. Supports fuzzy matching
+            to tolerate minor whitespace differences when locating context.
             
-            Update changes are specified in `@@` hunks with ` ` (context),
-            `+` (add), and `-` (remove) prefixed lines. Fuzzy matching is used to
-            tolerate whitespace differences when locating context.
-
+            **Patch Format:**
+            ```
+            *** Begin Patch
+            *** Update File: path/to/file.py
+            @@ def function_name
+             context line (unchanged, space prefix)
+            -line to remove
+            +line to add
+             more context
+            *** End Patch
+            ```
+            
+            **Operations:**
+            - `*** Add File: path` - Create new file (all lines must start with +)
+            - `*** Update File: path` - Modify existing file (use @@ hunks)
+            - `*** Delete File: path` - Remove file (no body content allowed)
+            - `*** Move to: new_path` - Rename/move during update (optional, after Update File)
+            
+            **Hunk Prefixes:**
+            - ` ` (space) - Context line that must match the file
+            - `-` - Line to remove from the file
+            - `+` - Line to add to the file
+            
+            **Scope Lines (narrow search):**
+            - `@@ def function_name` - Search within this function
+            - `@@ class ClassName` then `@@ def method` - Nested scope
+            
             Args:
-                patch: The full patch text in Cursor-style envelope format.
-                dry_run: If True, validate and compute changes without writing.
-                    Defaults to False.
-                strict: If True (default), require Begin/End Patch sentinels.
-                    If False, attempt to parse patch-like content without sentinels.
-
+                patch: Complete patch text with Begin/End markers.
+                dry_run: If True, validate without writing. Useful for testing patches.
+                strict: If False, allows patches without Begin/End markers.
+            
             Returns:
-                JSON string with operation result. On success:
-                    `{"status": "ok", "op": "add"|"update"|"delete", "path": "...",
-                      "hunks_applied": N, "lines_added": A, "lines_removed": R,
-                      "dry_run": bool, "fuzz_level": F, "moved_from": "..."|null}`
-                    (fuzz_level only present if >0, moved_from only if file was moved)
-                On error:
-                    `{"status": "error", "error": "...", "path": "..."|null, "hint": "..."|null}`
+                JSON with result:
+                - Success: `{"status": "ok", "op": "update", "path": "...", "hunks_applied": 2, ...}`
+                - Error: `{"status": "error", "error": "...", "hint": "..."}`
+            
+            **Error Recovery:**
+            - "could not find matching context" -> Re-read the file with read_file, the content may have changed
+            - "File already exists" -> Use `*** Update File:` instead of `*** Add File:`
+            - "File does not exist" -> Use `*** Add File:` instead of `*** Update File:`
+            - "Invalid hunk line" -> Ensure all lines start with space, +, or -
+            - "scope signature not found" -> Check function/class name spelling, re-read file
             """
             # Check patch size
             if len(patch.encode("utf-8")) > instance.max_patch_size:

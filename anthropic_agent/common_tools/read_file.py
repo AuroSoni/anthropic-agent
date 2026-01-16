@@ -1,16 +1,19 @@
 """
-### Spec for `read_file` in `src/tools/read_file.py`
+### Spec for `read_file` in `anthropic_agent/common_tools/read_file.py`
 
 - **Signature**
-  - `def read_file(target_file: str, offset: int | None = None, limit: int | None = None) -> str`
+  - `def read_file(target_file: str, start_line_one_indexed: int | None = None, no_of_lines_to_read: int | None = None) -> str`
 
 - **Purpose**
   - Read a text file located under the configured base path and return a slice of its lines with a header.
 
-- **Search root and path handling**
-  - Uses configurable `base_path` provided at tool instantiation.
-  - `target_file` is a path relative to `base_path`.
-  - Accepts targets with or without an extension; internally strips any extension and resolves to an existing `.md` or `.mmd` file (in that order).
+- **Parameters**
+  - `target_file`: Path relative to workspace. Extension optional - auto-resolves to .md or .mmd.
+  - `start_line_one_indexed`: 1-based line number to start from. Defaults to 1. Values < 1 treated as 1.
+  - `no_of_lines_to_read`: Number of lines to return. Defaults to 100, max 100. Values > 100 clamped.
+
+- **Limits**
+  - Default/max lines per read: 100
   - Only `.md` and `.mmd` files are readable.
   - Reject paths that resolve outside `base_path` (e.g., via `..` or absolute paths):
     - `Base path escapes search root: {absolute_candidate_path}`
@@ -37,10 +40,12 @@
 
 - **Output format**
   - First line: `[lines X-Y of TOTAL in RELATIVE_POSIX_PATH]`
-  - Followed by the exact requested slice of content (possibly empty if `limit == 0`).
+  - Followed by the requested slice of content.
 
-- **Limits**
-  - Effective limit (explicit or default) cannot exceed 100.
+- **Error Recovery Guidance**
+  - "Path does not exist" -> Use glob_file_search to find similar files
+  - "start_line_one_indexed > total lines" -> Check the file's total line count
+  - "Path is a directory" -> Use list_dir instead
 """
 from __future__ import annotations
 
@@ -177,44 +182,60 @@ class ReadFileTool:
         instance = self
         
         @tool
-        def read_file(target_file: str, offset: Optional[int] = None, limit: Optional[int] = None) -> str:
-            """Read a UTF-8 text file under the configured base path and return a slice of its lines with a header.
-
-            Paths must remain within the base path. Files up to STREAMING_THRESHOLD_BYTES are read whole; larger
-            files are streamed. Line endings are normalized to '\\n'. Only `.md`/`.mmd` files are readable.
-            The `target_file` may omit the extension; the function will resolve to `.md` or `.mmd`.
-
+        def read_file(
+            target_file: str,
+            start_line_one_indexed: Optional[int] = None,
+            no_of_lines_to_read: Optional[int] = None
+        ) -> str:
+            """Read lines from a text file.
+            
+            Use this tool to inspect file contents. Returns lines with a header showing
+            the range and total line count. Only `.md` and `.mmd` files are readable.
+            
+            **Limits:**
+            - Default/max lines per read: 100
+            - Files are read as UTF-8 with universal newline handling
+            
             Args:
-                target_file: File path relative to the configured base path.
-                offset: 1-based starting line number. Values < 1 are treated as 1.
-                    Defaults to 1 when None.
-                limit: Number of lines to return. Defaults to MAX_LIMIT when None.
-                    Values > MAX_LIMIT are clamped; negative values yield an error; non-integers yield an error.
-
+                target_file: Path relative to workspace. Extension is optional - will
+                    auto-resolve to .md or .mmd if omitted.
+                start_line_one_indexed: 1-based line number to start from. Defaults to 1.
+                    Values < 1 are treated as 1.
+                no_of_lines_to_read: Number of lines to return. Defaults to 100, max 100.
+                    Values > 100 are clamped to 100.
+            
             Returns:
-                A string starting with a header line:
-                    "[lines X-Y of TOTAL in RELATIVE_POSIX_PATH]"
-                    followed by the requested slice. If limit == 0, only the header and a trailing newline
-                    are returned. On errors, returns a one-line message, e.g.:
-                    - "Base path escapes search root: …"
-                    - "Path does not exist: …"
-                    - "Path is a directory: …"
-                    - "ERROR: offset(…) cannot be greater than total number of lines (…)"
-                    - "ERROR: limit(…) is not an integer." or "ERROR: limit(…) cannot be negative."
+                Header line followed by file content:
+                ```
+                [lines 1-50 of 200 in docs/guide.md]
+                # Welcome to the Guide
+                ...content...
+                ```
+                
+                For pagination, check the header's total and call again with a higher start_line_one_indexed.
+            
+            Example:
+                read_file("docs/guide.md")  # First 100 lines
+                read_file("docs/guide", start_line_one_indexed=101)  # Next 100 lines
+            
+            **Error Recovery:**
+            - "Path does not exist" -> Use glob_file_search to find similar files
+            - "start_line_one_indexed > total lines" -> Check the file's total line count in header
+            - "Path is a directory" -> Use list_dir instead, or specify a file within the directory
             """
             # Normalize parameters
-            start_line = 1 if offset is None else max(1, int(offset))
+            start_line = 1 if start_line_one_indexed is None else max(1, int(start_line_one_indexed))
             max_limit = instance.max_lines
 
-            if limit is None:
+            if no_of_lines_to_read is None:
                 requested_limit = max_limit
             else:
                 try:
-                    requested_limit = int(limit)
+                    requested_limit = int(no_of_lines_to_read)
                 except Exception:
-                    return f"ERROR: limit({limit}) is not an integer."
+                    return f"ERROR: no_of_lines_to_read({no_of_lines_to_read}) is not an integer. Provide a positive integer."
                 if requested_limit < 0:
-                    return f"ERROR: limit({requested_limit}) cannot be negative."
+                    return f"ERROR: no_of_lines_to_read({requested_limit}) cannot be negative. Use a positive integer or 0."
                 if requested_limit > max_limit:
                     requested_limit = max_limit
 
@@ -226,13 +247,13 @@ class ReadFileTool:
 
             # If the raw path is an existing directory, report as such
             if raw_candidate_path.exists() and raw_candidate_path.is_dir():
-                return f"Path is a directory: {target_file}"
+                return f"Path is a directory: {target_file}. Use list_dir to explore its contents, or specify a file within it."
 
             # Resolve to an allowed file (md/mmd) by stripping any extension
             candidate_path = instance._resolve_allowed_target(target_file)
 
             if candidate_path is None:
-                return f"Path does not exist: {target_file}"
+                return f"Path does not exist: {target_file}. Use glob_file_search to find files matching a pattern."
 
             rel_posix = instance._rel_posix_under_root(candidate_path)
 
@@ -263,8 +284,8 @@ class ReadFileTool:
                 
                 if start_line > total_lines:
                     return (
-                        f"ERROR: offset({start_line}) cannot be greater than total number of lines "
-                        f"({total_lines}) in the file ({rel_posix})."
+                        f"ERROR: start_line_one_indexed({start_line}) cannot be greater than total number of lines "
+                        f"({total_lines}) in the file ({rel_posix}). Try start_line_one_indexed=1 to read from the beginning."
                     )
 
                 if zero_limit:
@@ -308,8 +329,8 @@ class ReadFileTool:
 
             if start_line > total_lines:
                 return (
-                    f"ERROR: offset({start_line}) cannot be greater than total number of lines "
-                    f"({total_lines}) in the file ({rel_posix})."
+                    f"ERROR: start_line_one_indexed({start_line}) cannot be greater than total number of lines "
+                    f"({total_lines}) in the file ({rel_posix}). Try start_line_one_indexed=1 to read from the beginning."
                 )
 
             if zero_limit:

@@ -1,11 +1,11 @@
 """
-### Spec for `list_dir` in `src/tools/list_dir.py`
+### Spec for `list_dir` in `anthropic_agent/common_tools/list_dir.py`
 
 - **Signature**
   - `def list_dir(target_directory: str, ignore_globs: list[str] | None = None) -> str`
 
 - **Purpose**
-  - Returns a pretty-printed, concise, user-readable ASCII tree of the entire folder hierarchy (subject to limits below).
+  - List the contents of a directory as an ASCII tree for exploring codebase structure.
 
 - **Output format**
   - Root shown as the basename of `target_directory`; root line has no leading bullet.
@@ -414,38 +414,51 @@ class ListDirTool:
         
         @tool
         def list_dir(target_directory: str, ignore_globs: List[str] | None = None) -> str:
-            """Render a concise ASCII tree of a directory with depth and size-aware summarization.
-
-            Directories are listed before files, alphabetically (case-insensitive). Hidden files are shown.
-            Symlinked directories are displayed but not traversed. Recursion is capped at MAX_DEPTH, with a
-            summary when the cap is reached. Large directories (> LARGE_DIR_ENTRY_THRESHOLD entries) show only
-            the first LARGE_DIR_SHOW_DIRS subdirectories and LARGE_DIR_SHOW_FILES files, followed by summaries.
-
+            """List the contents of a directory as an ASCII tree.
+            
+            Use this tool to explore the structure of a codebase. Shows directories before files,
+            sorted alphabetically. Hidden files are included. Symlinked directories are shown
+            but not traversed.
+            
+            **Limits:**
+            - Max depth: 5 levels (deeper directories show a summary count)
+            - Large directories (>50 entries): Shows first 5 subdirs + 5 files with summaries
+            
             Args:
-                target_directory: Path to the root directory to render, relative to the configured base path.
-                ignore_globs: Optional list of POSIX-style glob patterns relative to
-                    target_directory. Supports '**' and subtree forms:
-                    - '**/name/**' to hide any directory named 'name' and all of its children anywhere
-                    - 'name/**' to print the directory line but hide all of its children
-
+                target_directory: Path relative to the workspace root. Use "." for the root.
+                ignore_globs: Glob patterns to exclude. Examples:
+                    - "**/node_modules/**" - hide node_modules and all contents anywhere
+                    - "**/__pycache__/**" - hide Python cache directories
+                    - "*.log" - hide all .log files
+                    - "name/**" - show directory 'name' but hide its contents
+            
             Returns:
-                An ASCII tree using '- ' bullets, directories with trailing '/', and summary lines:
-                    - "[K more subdirectories]" for elided subdirectories in large directories
-                    - "[N more files of type ext1, M of type ext2, ...]" for elided files (grouped by ext)
-                    - "[depth limit reached; X files (ext1: n1, ...), Y subdirectories]" at depth cap
-                    On errors, returns a one-line message such as:
-                    - "Path does not exist: …"
-                    - "Path is not a directory: …"
-                    - "[permission denied]"
+                ASCII tree with "- " bullets. Directories end with "/".
+                Example output:
+                ```
+                my_project/
+                   - src/
+                      - main.py
+                      - utils.py
+                   - tests/
+                   - README.md
+                ```
+                
+                On depth/size limits: "[depth limit reached; 42 files (py: 30, md: 12), 5 subdirectories]"
+            
+            **Error Recovery:**
+            - "Path does not exist" -> Check the parent directory with list_dir first
+            - "Path is not a directory" -> Use read_file to view the file contents instead
+            - "[permission denied]" -> Try a different directory or check file permissions
             """
             base = instance.search_root / target_directory
             rel_arg = _posix_normpath(str(target_directory).replace("\\", "/"))
             if not _is_within(base, instance.search_root):
-                return f"Base path escapes search root: {rel_arg}"
+                return f"Base path escapes search root: {rel_arg}. Use paths relative to the workspace root without '..' components."
             if not base.exists():
-                return f"Path does not exist: {rel_arg}"
+                return f"Path does not exist: {rel_arg}. Try list_dir on the parent directory to see available paths."
             if not base.is_dir():
-                return f"Path is not a directory: {rel_arg}"
+                return f"Path is not a directory: {rel_arg}. Use read_file to view the file contents instead."
 
             # Reset instance state for this invocation
             instance._patterns = ignore_globs or []

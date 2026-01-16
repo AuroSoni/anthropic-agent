@@ -1,12 +1,11 @@
 """
-### Spec for `glob_file_search` in `src/tools/glob_file_search.py`
+### Spec for `glob_file_search` in `anthropic_agent/common_tools/glob_file_search.py`
 
 - **Signature**
   - `def glob_file_search(glob_pattern: str, target_directory: str | None = None) -> str`
 
-- **Module-level constants**
-  - `MAX_RESULTS = 50`
-  - `SUMMARY_MAX_EXT_GROUPS = 3`
+- **Purpose**
+  - Find files matching a glob pattern, sorted by modification time (newest first).
 
 - **Search base and path handling**
   - Uses configurable `base_path` provided at tool instantiation.
@@ -166,26 +165,36 @@ class GlobFileSearchTool:
         
         @tool
         def glob_file_search(glob_pattern: str, target_directory: str | None = None) -> str:
-            """Recursively search for `.md` and `.mmd` files matching a glob pattern under the configured base path.
-
-            Matches are sorted by modification time (newest first), then by path for stability. If the
-            pattern does not start with '**/', it is automatically prepended for recursive matching.
-            Output paths are POSIX-style and relative to the base path. Results
-            are truncated to MAX_RESULTS with summaries for the remainder.
-
+            """Find files matching a glob pattern, sorted by modification time (newest first).
+            
+            Use this tool to discover files by name pattern. Searches recursively by default.
+            Only returns `.md` and `.mmd` files.
+            
+            **Limits:**
+            - Max results: 50 (excess files are summarized by extension)
+            
             Args:
-                glob_pattern: Glob expression to match files. If it does not start
-                    with '**/', it is automatically prepended.
-                target_directory: Optional base directory (relative to base path) to
-                    scope the search. Defaults to the base path.
-
+                glob_pattern: Glob pattern to match. Auto-prepends "**/" for recursive search.
+                    Examples:
+                    - "*.md" -> finds all .md files recursively
+                    - "README*" -> finds all README files
+                    - "docs/*.md" -> finds .md files in any docs/ directory
+                    - "**/*.mmd" -> explicit recursive search
+                target_directory: Optional subdirectory to search within. Defaults to workspace root.
+            
             Returns:
-                Newline-separated list of relative POSIX paths. If more than MAX_RESULTS are found,
-                    summary lines are appended:
-                    - "[N more files of type ext1, M more files of type ext2, ...]" for remaining files
-                    - "[K more directories]" for remaining directories
-                    Returns "No matches found." when there are no matches, or a one-line error if the base
-                    path escapes the search root, does not exist, or is not a directory.
+                Newline-separated file paths (newest first):
+                ```
+                docs/api/endpoints.md
+                docs/getting-started.md
+                README.md
+                [12 more files of type md, 3 more files of type mmd]
+                ```
+            
+            **Error Recovery:**
+            - "No matches found" -> Try a broader pattern (e.g., "*.md" instead of "specific*.md")
+            - "Path does not exist" -> Check the directory path with list_dir first
+            - "Path is not a directory" -> Remove the file name, search in its parent directory
             """
             base: Path = instance.search_root if target_directory is None else (instance.search_root / target_directory)
 
@@ -193,11 +202,11 @@ class GlobFileSearchTool:
             rel_arg = "." if target_directory is None else _posix_normpath(str(target_directory).replace("\\", "/"))
 
             if not _is_within(base, instance.search_root):
-                return f"Base path escapes search root: {rel_arg}"
+                return f"Base path escapes search root: {rel_arg}. Use paths relative to the workspace root without '..' components."
             if not base.exists():
-                return f"Path does not exist: {rel_arg}"
+                return f"Path does not exist: {rel_arg}. Use list_dir to explore available directories first."
             if not base.is_dir():
-                return f"Path is not a directory: {rel_arg}"
+                return f"Path is not a directory: {rel_arg}. Remove the file name and search in its parent directory instead."
 
             pattern = _normalize_pattern(glob_pattern)
 
@@ -218,7 +227,7 @@ class GlobFileSearchTool:
                 matches_with_mtime.append((p, mtime))
 
             if not matches_with_mtime:
-                return "No matches found."
+                return f"No matches found for pattern '{glob_pattern}'. Try a broader pattern (e.g., '*.md') or check the directory with list_dir."
 
             # Sort by mtime desc, then by path name (case-insensitive) for stability
             matches_with_mtime.sort(key=lambda item: (-item[1], item[0].as_posix().casefold()))
@@ -239,7 +248,7 @@ class GlobFileSearchTool:
                 rel_matches.append(rel)
 
             if not rel_matches:
-                return "No matches found."
+                return f"No matches found for pattern '{glob_pattern}'. Try a broader pattern (e.g., '*.md') or check the directory with list_dir."
 
             # Truncate and summarize
             shown_paths = rel_matches[:instance.max_results]

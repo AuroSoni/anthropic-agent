@@ -1,11 +1,11 @@
 """
-### Spec for `grep_search` in `src/tools/grep_search.py`
+### Spec for `grep_search` in `anthropic_agent/common_tools/grep_search.py`
 
 - **Signature**
   - `def grep_search(query: str, include_pattern: str | None = None, exclude_pattern: str | None = None, case_sensitive: bool = False) -> str`
 
 - **Purpose**
-  - Execute a ripgrep search under the shared search root, including match lines and 2 context lines before and after each match, and return a pretty-printed string.
+  - Search file contents using regular expressions (powered by ripgrep).
 
 - **Search root**
   - Uses configurable `base_path` provided at tool instantiation.
@@ -147,32 +147,53 @@ class GrepSearchTool:
             exclude_pattern: str | None = None,
             case_sensitive: bool = False,
         ) -> str:
-            """Search for a regex using ripgrep under the configured base path and pretty-print results with context.
-
-            Each match is shown with 2 lines of context before and after. Output is grouped by file and
-            formatted with:
-              - "NNN:" for matched lines (with <match>…</match> tags around matches)
-              - "NNN-" for context lines
-            At most MAX_MATCH_LINES match events are shown; trailing after-context for the final shown
-            match is included, and an omission indicator is appended if more matches exist.
-
+            """Search file contents using regular expressions (powered by ripgrep).
+            
+            Use this tool to find text patterns across files. Returns matches with
+            2 lines of context before and after. Only searches `.md` and `.mmd` files
+            by default.
+            
+            **Limits:**
+            - Max matches shown: 20 (with count of omitted matches)
+            - Context: 2 lines before and after each match
+            
             Args:
-                query: Regular expression to search for.
-                include_pattern: Optional POSIX-style glob to include files. When set,
-                    ignore rules are disabled and the glob is passed via '--glob'.
-                exclude_pattern: Optional POSIX-style glob to exclude files, applied as
-                    a negated '--glob' (e.g., '!pattern').
-                case_sensitive: Whether the regex match is case-sensitive. Defaults to False.
-
+                query: Regular expression to search for. Common patterns:
+                    - "TODO" - literal text search
+                    - "def \\w+\\(" - function definitions
+                    - "import.*requests" - import statements
+                    - "\\bword\\b" - whole word match
+                include_pattern: Optional glob to restrict which files to search (e.g., "docs/*.md").
+                    When set, .gitignore rules are bypassed.
+                exclude_pattern: Optional glob to exclude files (e.g., "test_*.md").
+                case_sensitive: Whether to match case. Defaults to False (case-insensitive).
+            
             Returns:
-                A formatted, multi-file result. Each file section starts with "relative/path:" and
-                    contains interleaved match/context lines as described above. Returns:
-                    - "No matches found." when there are no results
-                    - "ripgrep (rg) is not installed or not found in PATH." if rg is missing
-                    - ripgrep's stderr text if the command fails (e.g., bad regex)
+                Results grouped by file with line numbers:
+                ```
+                docs/api.md:
+                  10- context before
+                  11: This line has a <match>TODO</match> marker
+                  12- context after
+                
+                src/main.md:
+                  25: Another <match>TODO</match> item
+                ```
+            
+            **Regex Tips:**
+            - Escape special chars: \\. \\( \\) \\[ \\]
+            - Word boundary: \\bword\\b
+            - Any whitespace: \\s+
+            - One or more: pattern+
+            - Zero or more: pattern*
+            
+            **Error Recovery:**
+            - "No matches found" -> Try case_sensitive=False, or broaden the pattern
+            - "ripgrep failed" -> Check regex syntax, escape special characters
+            - "pattern cannot be empty" -> Provide a non-empty search pattern
             """
             if query is None or str(query) == "":
-                return "pattern cannot be empty"
+                return "Query pattern cannot be empty. Provide a regex pattern to search for (e.g., 'TODO', 'def \\w+')."
 
             cmd: List[str] = [
                 "rg",
@@ -223,7 +244,7 @@ class GrepSearchTool:
                     check=False,
                 )
             except FileNotFoundError:
-                return "ripgrep (rg) is not installed or not found in PATH."
+                return "ripgrep (rg) is not installed or not found in PATH. Install ripgrep to use this tool."
             except Exception as exc:
                 return str(exc)
 
@@ -326,8 +347,8 @@ class GrepSearchTool:
             # Interpret ripgrep return codes: 0 (matches), 1 (no matches), >1 (error)
             if printed_match_events == 0:
                 if proc.returncode in (0, 1):
-                    return "No matches found."
-                return stderr or "ripgrep failed."
+                    return f"No matches found for pattern '{query}'. Try case_sensitive=False, broaden the pattern, or check if files exist with glob_file_search."
+                return stderr or "ripgrep failed. Check regex syntax - special characters like ( ) [ ] . need escaping with \\."
 
             # Build final formatted output
             out_lines: List[str] = []
