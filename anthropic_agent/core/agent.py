@@ -182,6 +182,14 @@ class AnthropicAgent:
         # (called automatically in run() or explicitly by caller)
         self.agent_uuid = agent_uuid or str(uuid.uuid4())
         
+        # Inject agent_uuid into tools that support it (have __tool_instance__ with set_agent_uuid)
+        if tools:
+            for tool_fn in tools:
+                if hasattr(tool_fn, '__tool_instance__'):
+                    tool_instance = tool_fn.__tool_instance__
+                    if hasattr(tool_instance, 'set_agent_uuid'):
+                        tool_instance.set_agent_uuid(self.agent_uuid)
+        
         # db_config is empty at construction - state is loaded asynchronously via initialize()
         db_config: dict[str, Any] = {}
         

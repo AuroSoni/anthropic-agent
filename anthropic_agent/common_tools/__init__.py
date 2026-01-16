@@ -87,6 +87,8 @@ from .apply_patch import ApplyPatchTool
 from .glob_file_search import GlobFileSearchTool
 from .grep_search import GrepSearchTool
 from .list_dir import ListDirTool
+from .create_plan import CreatePlanTool
+from .todo_write import TodoWriteTool, TodoItem, TodoStatus
 
 __all__ = [
     # Extension utilities
@@ -98,4 +100,9 @@ __all__ = [
     "GlobFileSearchTool",
     "GrepSearchTool",
     "ListDirTool",
+    "CreatePlanTool",
+    "TodoWriteTool",
+    # Types
+    "TodoItem",
+    "TodoStatus",
 ]
