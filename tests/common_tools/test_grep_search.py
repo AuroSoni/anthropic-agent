@@ -827,3 +827,165 @@ class TestErrorHandling:
         result = search_fn("pattern")
 
         assert result == "ripgrep failed."
+
+
+# ---------------------------------------------------------------------------
+# Tests for configurable limits
+# ---------------------------------------------------------------------------
+class TestConfigurableLimits:
+    """Tests for instance-configurable limits."""
+
+    @patch("anthropic_agent.common_tools.grep_search.subprocess.run")
+    def test_custom_max_match_lines_truncates(
+        self, mock_run: MagicMock, temp_workspace: Path
+    ) -> None:
+        """Verify custom max_match_lines truncates at the specified limit."""
+        # Create 10 matches
+        lines = [
+            make_rg_match("./file.md", i, f"match line {i}", [(0, 5)])
+            for i in range(1, 11)
+        ]
+        stdout = "\n".join(lines)
+        mock_run.return_value = make_mock_proc(stdout=stdout, returncode=0)
+
+        # Create tool with custom limit of 3
+        tool = GrepSearchTool(base_path=temp_workspace, max_match_lines=3)
+        search_fn = tool.get_tool()
+        result = search_fn("match")
+
+        # Should show exactly 3 matches
+        match_count = result.count(": <match>")
+        assert match_count == 3
+
+        # Should have omission message for remaining 7
+        assert "[... 7 more matches omitted]" in result
+
+    @patch("anthropic_agent.common_tools.grep_search.subprocess.run")
+    def test_custom_context_lines_in_command(
+        self, mock_run: MagicMock, temp_workspace: Path
+    ) -> None:
+        """Verify custom context_lines is passed to ripgrep command."""
+        mock_run.return_value = make_mock_proc(returncode=1)
+
+        tool = GrepSearchTool(base_path=temp_workspace, context_lines=5)
+        search_fn = tool.get_tool()
+        search_fn("pattern")
+
+        cmd = mock_run.call_args[0][0]
+        # Find -C flag and verify its value
+        c_idx = cmd.index("-C")
+        assert cmd[c_idx + 1] == "5"
+
+    @patch("anthropic_agent.common_tools.grep_search.subprocess.run")
+    def test_zero_context_lines(
+        self, mock_run: MagicMock, temp_workspace: Path
+    ) -> None:
+        """Verify context_lines=0 shows no context."""
+        mock_run.return_value = make_mock_proc(returncode=1)
+
+        tool = GrepSearchTool(base_path=temp_workspace, context_lines=0)
+        search_fn = tool.get_tool()
+        search_fn("pattern")
+
+        cmd = mock_run.call_args[0][0]
+        c_idx = cmd.index("-C")
+        assert cmd[c_idx + 1] == "0"
+
+    @patch("anthropic_agent.common_tools.grep_search.subprocess.run")
+    def test_default_limits(
+        self, mock_run: MagicMock, temp_workspace: Path
+    ) -> None:
+        """Verify default limits use module constants."""
+        mock_run.return_value = make_mock_proc(returncode=1)
+
+        tool = GrepSearchTool(base_path=temp_workspace)
+        search_fn = tool.get_tool()
+        search_fn("pattern")
+
+        cmd = mock_run.call_args[0][0]
+        c_idx = cmd.index("-C")
+        assert cmd[c_idx + 1] == str(CONTEXT_LINES)
+
+
+# ---------------------------------------------------------------------------
+# Tests for custom allowed extensions
+# ---------------------------------------------------------------------------
+class TestCustomExtensions:
+    """Tests for custom allowed_extensions configuration."""
+
+    @patch("anthropic_agent.common_tools.grep_search.subprocess.run")
+    def test_custom_extension_py_in_globs(
+        self, mock_run: MagicMock, temp_workspace: Path
+    ) -> None:
+        """Verify custom allowed_extensions adds correct globs for .py."""
+        mock_run.return_value = make_mock_proc(returncode=1)
+
+        tool = GrepSearchTool(
+            base_path=temp_workspace,
+            allowed_extensions={".py"},
+        )
+        search_fn = tool.get_tool()
+        search_fn("pattern")
+
+        cmd = mock_run.call_args[0][0]
+        # Should have glob for .py
+        assert "**/*.py" in cmd
+        # Should NOT have default .md glob
+        assert "**/*.md" not in cmd
+
+    @patch("anthropic_agent.common_tools.grep_search.subprocess.run")
+    def test_custom_extension_multiple_globs(
+        self, mock_run: MagicMock, temp_workspace: Path
+    ) -> None:
+        """Verify multiple custom extensions create multiple globs."""
+        mock_run.return_value = make_mock_proc(returncode=1)
+
+        tool = GrepSearchTool(
+            base_path=temp_workspace,
+            allowed_extensions={".py", ".js", ".ts"},
+        )
+        search_fn = tool.get_tool()
+        search_fn("pattern")
+
+        cmd = mock_run.call_args[0][0]
+        assert "**/*.py" in cmd
+        assert "**/*.js" in cmd
+        assert "**/*.ts" in cmd
+
+    @patch("anthropic_agent.common_tools.grep_search.subprocess.run")
+    def test_custom_extension_filters_results(
+        self, mock_run: MagicMock, temp_workspace: Path
+    ) -> None:
+        """Verify custom extensions filter results from ripgrep output."""
+        # Simulate ripgrep returning matches from multiple file types
+        lines = [
+            make_rg_match("./allowed.py", 1, "match", [(0, 5)]),
+            make_rg_match("./disallowed.txt", 1, "match", [(0, 5)]),
+        ]
+        stdout = "\n".join(lines)
+        mock_run.return_value = make_mock_proc(stdout=stdout, returncode=0)
+
+        tool = GrepSearchTool(
+            base_path=temp_workspace,
+            allowed_extensions={".py"},
+        )
+        search_fn = tool.get_tool()
+        result = search_fn("match")
+
+        assert "allowed.py:" in result
+        assert "disallowed.txt" not in result
+
+    @patch("anthropic_agent.common_tools.grep_search.subprocess.run")
+    def test_default_extensions_md_mmd(
+        self, mock_run: MagicMock, temp_workspace: Path
+    ) -> None:
+        """Verify default extensions are .md and .mmd."""
+        mock_run.return_value = make_mock_proc(returncode=1)
+
+        tool = GrepSearchTool(base_path=temp_workspace)
+        search_fn = tool.get_tool()
+        search_fn("pattern")
+
+        cmd = mock_run.call_args[0][0]
+        assert "**/*.md" in cmd
+        assert "**/*.mmd" in cmd

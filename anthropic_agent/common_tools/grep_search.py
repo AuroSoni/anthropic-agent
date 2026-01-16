@@ -99,14 +99,27 @@ class GrepSearchTool:
         >>> agent = AnthropicAgent(tools=[grep_tool.get_tool()])
     """
     
-    def __init__(self, base_path: str | Path):
-        """Initialize the GrepSearchTool with a base path.
+    def __init__(
+        self,
+        base_path: str | Path,
+        max_match_lines: int = 20,
+        context_lines: int = 2,
+        allowed_extensions: set[str] | None = None,
+    ):
+        """Initialize the GrepSearchTool with a base path and configurable limits.
         
         Args:
             base_path: The root directory that grep_search operates within.
                        All searches are executed relative to this directory.
+            max_match_lines: Maximum number of match lines to show. Defaults to 20.
+            context_lines: Number of context lines before/after each match. Defaults to 2.
+            allowed_extensions: Set of allowed file extensions (with leading dot).
+                               Defaults to {".md", ".mmd"} if None.
         """
         self.search_root: Path = Path(base_path).resolve()
+        self.max_match_lines: int = max_match_lines
+        self.context_lines: int = context_lines
+        self.allowed_extensions: set[str] = allowed_extensions or {".md", ".mmd"}
     
     def _rel_posix(self, path_str: str) -> str:
         """Convert a path string to a POSIX-style path relative to search_root."""
@@ -166,7 +179,7 @@ class GrepSearchTool:
                 "--json",
                 "-n",
                 "-C",
-                str(CONTEXT_LINES),
+                str(instance.context_lines),
             ]
 
             # Case sensitivity
@@ -183,7 +196,8 @@ class GrepSearchTool:
                 cmd.extend(["--glob", norm_inc])
             else:
                 # Default restriction to allowed extensions
-                cmd.extend(["--glob", "**/*.md", "--glob", "**/*.mmd"])
+                for ext in sorted(instance.allowed_extensions):
+                    cmd.extend(["--glob", f"**/*{ext}"])
 
             if exclude_pattern:
                 norm_exc = _posix_normpath(str(exclude_pattern).replace("\\", "/"))
@@ -249,7 +263,7 @@ class GrepSearchTool:
                 rel_path = instance._rel_posix(path_text)
 
                 # Enforce allowed extension filter even when include_pattern is broad
-                if Path(rel_path).suffix.lower() not in ALLOWED_EXTS:
+                if Path(rel_path).suffix.lower() not in instance.allowed_extensions:
                     # Skip any non-allowed file from output
                     continue
 
@@ -276,7 +290,7 @@ class GrepSearchTool:
                         remaining_after_context -= 1
                         # Do not count as printed match; it is part of context drain
                         continue
-                    if printed_match_events < MAX_MATCH_LINES:
+                    if printed_match_events < instance.max_match_lines:
                         # Highlight submatch ranges
                         submatches = data.get("submatches", [])
                         byte_ranges: List[Tuple[int, int]] = []
@@ -289,11 +303,11 @@ class GrepSearchTool:
                         file_to_lines[header_rel].append(f"  {line_number}: {highlighted}")
                         printed_match_events += 1
                         # Prepare to drain after-context if we just hit the cap
-                        if printed_match_events == MAX_MATCH_LINES:
+                        if printed_match_events == instance.max_match_lines:
                             draining_after_context = True
                             drain_file = header_rel
                             last_match_line_no = int(line_number)
-                            remaining_after_context = CONTEXT_LINES
+                            remaining_after_context = instance.context_lines
                     # Do not collect further matches when at/over cap; keep counting
                     continue
 

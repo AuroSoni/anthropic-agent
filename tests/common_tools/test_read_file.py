@@ -145,6 +145,122 @@ class TestToolInitialization:
         assert hasattr(read_file_fn, "__name__")
         assert read_file_fn.__name__ == "read_file"
 
+    def test_init_with_custom_max_lines(self, temp_workspace: Path) -> None:
+        """Initialize with custom max_lines limit."""
+        tool = ReadFileTool(base_path=temp_workspace, max_lines=50)
+        assert tool.max_lines == 50
+
+    def test_init_with_custom_streaming_threshold(self, temp_workspace: Path) -> None:
+        """Initialize with custom streaming threshold."""
+        tool = ReadFileTool(base_path=temp_workspace, streaming_threshold_bytes=1024)
+        assert tool.streaming_threshold == 1024
+
+    def test_init_with_custom_extensions(self, temp_workspace: Path) -> None:
+        """Initialize with custom allowed extensions."""
+        custom_exts = {".txt", ".py"}
+        tool = ReadFileTool(base_path=temp_workspace, allowed_extensions=custom_exts)
+        assert tool.allowed_extensions == custom_exts
+
+    def test_default_extensions(self, read_file_tool: ReadFileTool) -> None:
+        """Default allowed extensions should be .md and .mmd."""
+        assert read_file_tool.allowed_extensions == {".md", ".mmd"}
+
+
+class TestCustomExtensions:
+    """Tests for custom allowed_extensions configuration."""
+
+    def test_custom_extension_txt_allowed(self, temp_workspace: Path) -> None:
+        """Custom extensions should allow reading .txt files."""
+        tool = ReadFileTool(
+            base_path=temp_workspace,
+            allowed_extensions={".txt"}
+        )
+        fn = tool.get_tool()
+        
+        # Create a .txt file
+        txt_file = temp_workspace / "notes.txt"
+        txt_file.write_text("Text content\n")
+        
+        result = fn("notes.txt")
+        assert "Text content" in result
+        assert "[lines 1-1 of 1 in notes.txt]" in result
+
+    def test_custom_extension_md_not_allowed(self, temp_workspace: Path) -> None:
+        """When .md not in allowed_extensions, .md files should not be found."""
+        tool = ReadFileTool(
+            base_path=temp_workspace,
+            allowed_extensions={".txt"}
+        )
+        fn = tool.get_tool()
+        
+        # Create a .md file
+        md_file = temp_workspace / "doc.md"
+        md_file.write_text("Markdown content\n")
+        
+        result = fn("doc.md")
+        assert "Path does not exist" in result
+
+    def test_custom_extension_py_allowed(self, temp_workspace: Path) -> None:
+        """Custom extensions should allow reading .py files."""
+        tool = ReadFileTool(
+            base_path=temp_workspace,
+            allowed_extensions={".py", ".md"}
+        )
+        fn = tool.get_tool()
+        
+        # Create a .py file
+        py_file = temp_workspace / "script.py"
+        py_file.write_text("print('hello')\n")
+        
+        result = fn("script.py")
+        assert "print('hello')" in result
+
+    def test_implicit_extension_uses_custom_extensions(self, temp_workspace: Path) -> None:
+        """Extension resolution should use custom allowed extensions."""
+        tool = ReadFileTool(
+            base_path=temp_workspace,
+            allowed_extensions={".txt", ".rst"}
+        )
+        fn = tool.get_tool()
+        
+        # Create files with different extensions
+        (temp_workspace / "doc.txt").write_text("TXT content\n")
+        (temp_workspace / "doc.rst").write_text("RST content\n")
+        
+        # Request without extension should find one of the allowed extensions
+        result = fn("doc")
+        assert "content" in result
+
+
+class TestCustomMaxLines:
+    """Tests for custom max_lines configuration."""
+
+    def test_custom_max_lines_clamping(self, temp_workspace: Path) -> None:
+        """Limit should be clamped to custom max_lines."""
+        tool = ReadFileTool(base_path=temp_workspace, max_lines=10)
+        fn = tool.get_tool()
+        
+        # Create file with 20 lines
+        lines = [f"line{i}\n" for i in range(1, 21)]
+        (temp_workspace / "test.md").write_text("".join(lines))
+        
+        result = fn("test.md", limit=50)  # Request more than max
+        # Should only get 10 lines
+        assert "[lines 1-10 of 20 in test.md]" in result
+
+    def test_custom_max_lines_default_behavior(self, temp_workspace: Path) -> None:
+        """Default limit should use custom max_lines."""
+        tool = ReadFileTool(base_path=temp_workspace, max_lines=5)
+        fn = tool.get_tool()
+        
+        # Create file with 10 lines
+        lines = [f"line{i}\n" for i in range(1, 11)]
+        (temp_workspace / "test.md").write_text("".join(lines))
+        
+        result = fn("test.md")  # No limit specified
+        # Should use custom default of 5
+        assert "[lines 1-5 of 10 in test.md]" in result
+
 
 # ---------------------------------------------------------------------------
 # Tests for path resolution and security

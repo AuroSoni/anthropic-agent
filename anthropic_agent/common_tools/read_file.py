@@ -90,14 +90,27 @@ class ReadFileTool:
         >>> agent = AnthropicAgent(tools=[read_file_tool.get_tool()])
     """
     
-    def __init__(self, base_path: str | Path):
-        """Initialize the ReadFileTool with a base path.
+    def __init__(
+        self,
+        base_path: str | Path,
+        max_lines: int = 100,
+        streaming_threshold_bytes: int = 2 * 1024 * 1024,
+        allowed_extensions: set[str] | None = None,
+    ):
+        """Initialize the ReadFileTool with a base path and configurable limits.
         
         Args:
             base_path: The root directory that read_file operates within.
                        All target_file paths will be relative to this.
+            max_lines: Maximum number of lines to return per read. Defaults to 100.
+            streaming_threshold_bytes: File size threshold for streaming mode. Defaults to 2MB.
+            allowed_extensions: Set of allowed file extensions (with leading dot).
+                               Defaults to {".md", ".mmd"} if None.
         """
         self.search_root: Path = Path(base_path).resolve()
+        self.max_lines: int = max_lines
+        self.streaming_threshold: int = streaming_threshold_bytes
+        self.allowed_extensions: set[str] = allowed_extensions or {".md", ".mmd"}
     
     def _rel_posix_under_root(self, path: Path) -> str:
         """Convert a path to a POSIX-style path relative to search_root."""
@@ -112,7 +125,7 @@ class ReadFileTool:
         """Resolve a target (with or without extension) to an existing allowed file under search_root.
 
         The resolution first checks for a direct match with an allowed extension. If that fails,
-        it strips any given extension and probes for `.md` then `.mmd` in that order.
+        it strips any given extension and probes for allowed extensions in order.
         Returns the resolved Path if found; otherwise None.
         """
         # Normalize slashes but keep relative semantics
@@ -122,7 +135,7 @@ class ReadFileTool:
         # 1. First, check if the provided path is a direct match with an allowed extension
         # Check if the filename ends with one of the allowed extensions
         filename = base_candidate.name
-        has_allowed_ext = any(filename.lower().endswith(ext) for ext in ALLOWED_EXTS)
+        has_allowed_ext = any(filename.lower().endswith(ext) for ext in self.allowed_extensions)
         
         if has_allowed_ext:
             try:
@@ -137,14 +150,15 @@ class ReadFileTool:
         stem_path = base_candidate
         
         # Remove any existing allowed extension from the end
-        for ext in ALLOWED_EXTS:
+        for ext in self.allowed_extensions:
             if filename.lower().endswith(ext):
                 # Create stem by removing the extension from the full path
                 stem_path = base_candidate.parent / filename[:-len(ext)]
                 break
         
         # If no extension was removed, use the original path as stem
-        for ext in (".md", ".mmd"):
+        # Probe extensions in sorted order for determinism
+        for ext in sorted(self.allowed_extensions):
             candidate = Path(str(stem_path) + ext)
             try:
                 if candidate.exists() and candidate.is_file():
@@ -190,9 +204,10 @@ class ReadFileTool:
             """
             # Normalize parameters
             start_line = 1 if offset is None else max(1, int(offset))
+            max_limit = instance.max_lines
 
             if limit is None:
-                requested_limit = MAX_LIMIT
+                requested_limit = max_limit
             else:
                 try:
                     requested_limit = int(limit)
@@ -200,8 +215,8 @@ class ReadFileTool:
                     return f"ERROR: limit({limit}) is not an integer."
                 if requested_limit < 0:
                     return f"ERROR: limit({requested_limit}) cannot be negative."
-                if requested_limit > MAX_LIMIT:
-                    requested_limit = MAX_LIMIT
+                if requested_limit > max_limit:
+                    requested_limit = max_limit
 
             # Security checks on the raw target (before resolution)
             raw_candidate_path = (instance.search_root / target_file)
@@ -226,12 +241,12 @@ class ReadFileTool:
                 file_size_bytes = candidate_path.stat().st_size
             except Exception:
                 # If we cannot stat the file size, fall back to streaming path
-                file_size_bytes = STREAMING_THRESHOLD_BYTES + 1
+                file_size_bytes = instance.streaming_threshold + 1
 
             # Special handling for zero-limit: still compute total lines for header
             zero_limit = requested_limit == 0
 
-            if file_size_bytes <= STREAMING_THRESHOLD_BYTES:
+            if file_size_bytes <= instance.streaming_threshold:
                 # Read whole file
                 try:
                     with candidate_path.open("r", encoding="utf-8", errors="replace") as fh:

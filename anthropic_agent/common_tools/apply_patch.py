@@ -283,17 +283,17 @@ def _normalize_path(raw_path: str) -> str:
     return _posix_normpath(cleaned)
 
 
-def _has_allowed_extension(path: str) -> bool:
+def _has_allowed_extension(path: str, allowed_exts: set[str]) -> bool:
     """Check if the file has an allowed extension."""
     p = Path(path)
     # Check for compound extensions like .env.local
     name = p.name.lower()
-    for ext in ALLOWED_EXTENSIONS:
+    for ext in allowed_exts:
         if name.endswith(ext):
             return True
     # Check standard suffix
     suffix = p.suffix.lower()
-    return suffix in ALLOWED_EXTENSIONS
+    return suffix in allowed_exts
 
 
 def _contains_null_bytes(content: str) -> bool:
@@ -404,56 +404,73 @@ def _find_context(
     return -1, 0
 
 
-def _find_scope(
+def _find_single_scope(
     lines: List[str],
-    scope_lines: List[str],
+    scope_pattern: str,
     start: int,
 ) -> Tuple[int, int]:
-    """Find scope signature in file and return position after it.
-    
-    Scope lines narrow the search context to within a specific function/class.
-    This helps when the same context appears multiple times in a file.
+    """Find a single scope signature in file and return position after it.
     
     Args:
         lines: The file content split into lines.
-        scope_lines: The scope signature lines to search for (e.g., ["def func_name"]).
+        scope_pattern: The scope signature to search for (e.g., "def func_name").
         start: The starting index for the search.
         
     Returns:
         Tuple of (index_after_scope, fuzz_level) where index_after_scope is the
         position immediately after the scope signature, or (-1, 0) if not found.
     """
+    scope_stripped = scope_pattern.strip()
+    
+    # Level 0: Match at line start (after stripping leading whitespace)
+    for i in range(start, len(lines)):
+        line_stripped = lines[i].lstrip()
+        if line_stripped.startswith(scope_stripped):
+            return i + 1, 0
+    
+    # Level 1: Fallback to substring match with fuzz penalty
+    for i in range(start, len(lines)):
+        if scope_stripped in lines[i]:
+            return i + 1, 1
+    
+    return -1, 0
+
+
+def _find_scope(
+    lines: List[str],
+    scope_lines: List[str],
+    start: int,
+) -> Tuple[int, int]:
+    """Find scope signatures in file and return position after the last one.
+    
+    Scope lines narrow the search context to within a specific function/class.
+    For nested scopes (e.g., class then method), each scope is searched
+    sequentially from the position after the previous scope was found.
+    
+    Args:
+        lines: The file content split into lines.
+        scope_lines: The scope signature lines to search for (e.g., ["class Foo", "def bar"]).
+        start: The starting index for the search.
+        
+    Returns:
+        Tuple of (index_after_scope, fuzz_level) where index_after_scope is the
+        position immediately after the last scope signature, or (-1, 0) if not found.
+    """
     if not scope_lines:
         return start, 0
     
-    n = len(scope_lines)
+    current_pos = start
+    total_fuzz = 0
     
-    # Level 0: Match at line start (after stripping leading whitespace)
-    # This prevents matching comments like "# def foo" when looking for "def foo"
-    for i in range(start, len(lines) - n + 1):
-        match = True
-        for j, scope_line in enumerate(scope_lines):
-            line_stripped = lines[i + j].lstrip()
-            scope_stripped = scope_line.strip()
-            # Match if line starts with scope signature
-            if not line_stripped.startswith(scope_stripped):
-                match = False
-                break
-        if match:
-            return i + n, 0
+    # Find each scope line sequentially, starting from where the previous one was found
+    for scope_pattern in scope_lines:
+        pos, fuzz = _find_single_scope(lines, scope_pattern, current_pos)
+        if pos == -1:
+            return -1, 0
+        current_pos = pos
+        total_fuzz += fuzz
     
-    # Level 1: Fallback to substring match with fuzz penalty
-    # More lenient matching when startswith fails
-    for i in range(start, len(lines) - n + 1):
-        match = True
-        for j, scope_line in enumerate(scope_lines):
-            if scope_line.strip() not in lines[i + j]:
-                match = False
-                break
-        if match:
-            return i + n, 1
-    
-    return -1, 0
+    return current_pos, total_fuzz
 
 
 def _format_context_mismatch(
@@ -992,14 +1009,27 @@ class ApplyPatchTool:
         >>> agent = AnthropicAgent(tools=[patch_tool.get_tool()])
     """
     
-    def __init__(self, base_path: str | Path):
-        """Initialize the ApplyPatchTool with a base path.
+    def __init__(
+        self,
+        base_path: str | Path,
+        max_patch_size_bytes: int = 1 * 1024 * 1024,
+        max_file_size_bytes: int = 10 * 1024 * 1024,
+        allowed_extensions: set[str] | None = None,
+    ):
+        """Initialize the ApplyPatchTool with a base path and configurable limits.
         
         Args:
             base_path: The root directory that apply_patch operates within.
                        All file paths in patches must be relative to this directory.
+            max_patch_size_bytes: Maximum size of a single patch. Defaults to 1MB.
+            max_file_size_bytes: Maximum file size after patch application. Defaults to 10MB.
+            allowed_extensions: Set of allowed file extensions (with leading dot).
+                               Defaults to a comprehensive set of text/code extensions if None.
         """
         self.base_path: Path = Path(base_path).resolve()
+        self.max_patch_size: int = max_patch_size_bytes
+        self.max_file_size: int = max_file_size_bytes
+        self.allowed_extensions: set[str] = allowed_extensions or ALLOWED_EXTENSIONS
     
     def get_tool(self) -> Callable:
         """Return a @tool decorated function for use with AnthropicAgent.
@@ -1043,9 +1073,9 @@ class ApplyPatchTool:
                     `{"status": "error", "error": "...", "path": "..."|null, "hint": "..."|null}`
             """
             # Check patch size
-            if len(patch.encode("utf-8")) > MAX_PATCH_SIZE_BYTES:
+            if len(patch.encode("utf-8")) > instance.max_patch_size:
                 return _make_error_response(
-                    f"Patch exceeds maximum size ({MAX_PATCH_SIZE_BYTES // 1024 // 1024} MB)",
+                    f"Patch exceeds maximum size ({instance.max_patch_size // 1024 // 1024} MB)",
                     hint="Split into smaller patches"
                 )
             
@@ -1082,7 +1112,7 @@ class ApplyPatchTool:
                 )
             
             # Check file extension
-            if not _has_allowed_extension(file_path):
+            if not _has_allowed_extension(file_path, instance.allowed_extensions):
                 return _make_error_response(
                     f"File extension not allowed for editing",
                     path=file_path,
@@ -1101,9 +1131,9 @@ class ApplyPatchTool:
                 content = parsed.add_content or ""
                 
                 # Check content size
-                if len(content.encode("utf-8")) > MAX_FILE_SIZE_BYTES:
+                if len(content.encode("utf-8")) > instance.max_file_size:
                     return _make_error_response(
-                        f"Content exceeds maximum file size ({MAX_FILE_SIZE_BYTES // 1024 // 1024} MB)",
+                        f"Content exceeds maximum file size ({instance.max_file_size // 1024 // 1024} MB)",
                         path=file_path
                     )
                 
@@ -1194,9 +1224,9 @@ class ApplyPatchTool:
                 return _make_error_response(e.error, e.path, e.hint)
             
             # Check result size
-            if len(new_content.encode("utf-8")) > MAX_FILE_SIZE_BYTES:
+            if len(new_content.encode("utf-8")) > instance.max_file_size:
                 return _make_error_response(
-                    f"Result exceeds maximum file size ({MAX_FILE_SIZE_BYTES // 1024 // 1024} MB)",
+                    f"Result exceeds maximum file size ({instance.max_file_size // 1024 // 1024} MB)",
                     path=file_path
                 )
             
@@ -1228,7 +1258,7 @@ class ApplyPatchTool:
                         hint="Path cannot use '..' to escape the workspace"
                     )
                 
-                if not _has_allowed_extension(move_to_path):
+                if not _has_allowed_extension(move_to_path, instance.allowed_extensions):
                     return _make_error_response(
                         "Move target file extension not allowed",
                         path=move_to_path,
