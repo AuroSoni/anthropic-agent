@@ -6,6 +6,7 @@ import anthropic
 import logging
 import uuid
 import warnings
+import yaml
 from datetime import datetime
 from typing import Optional, Callable, Any, Awaitable
 from collections.abc import Mapping, Sequence
@@ -1975,6 +1976,36 @@ class AnthropicAgent:
             "tools": tool_names,
         }
         return json.dumps(config_snapshot, indent=2)
+    
+    def export_agent_view_yaml(self) -> str:
+        """Return YAML string with system prompt and consolidated tool schemas.
+        
+        This mirrors the exact view the agent sends to the Anthropic API,
+        combining tool_schemas (client), frontend_tool_schemas, and server_tools.
+        
+        Returns:
+            YAML-formatted string containing:
+            - system_prompt: The raw system prompt string
+            - tools: Merged list of all tool schemas (client + frontend + server)
+        """
+        combined_tools: list[dict[str, Any]] = []
+        if self.tool_schemas:
+            combined_tools.extend(self.tool_schemas)
+        if self.frontend_tool_schemas:
+            combined_tools.extend(self.frontend_tool_schemas)
+        if self.server_tools:
+            combined_tools.extend(self.server_tools)
+        
+        agent_view = {
+            "system_prompt": self.system_prompt,
+            "tools": combined_tools,
+        }
+        return yaml.safe_dump(
+            agent_view,
+            sort_keys=False,
+            allow_unicode=True,
+            default_flow_style=False,
+        )
     
     def _restore_state_from_config(self, config: dict[str, Any]) -> None:
         """Restore agent state from a loaded configuration dict.

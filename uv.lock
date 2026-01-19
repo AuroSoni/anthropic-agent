@@ -202,6 +202,7 @@ dependencies = [
     { name = "boto3" },
     { name = "litellm" },
     { name = "python-dotenv" },
+    { name = "pyyaml" },
 ]
 
 [package.dev-dependencies]
@@ -217,6 +218,7 @@ requires-dist = [
     { name = "boto3", specifier = ">=1.40.46" },
     { name = "litellm", specifier = ">=1.80.11" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
+    { name = "pyyaml", specifier = ">=6.0.3" },
 ]
 
 [package.metadata.requires-dev]
