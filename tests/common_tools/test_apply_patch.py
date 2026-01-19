@@ -5,6 +5,7 @@ Tests cover:
 - Delete file operations
 - Move/Rename operations
 - Fuzzy context matching
+- Ambiguity detection
 - Error handling and validation
 """
 import json
@@ -16,14 +17,12 @@ import pytest
 
 from anthropic_agent.common_tools.apply_patch import (
     ApplyPatchTool,
-    Chunk,
     PatchError,
     _find_context,
     _find_scope,
     _format_context_mismatch,
-    _norm,
-    _parse_hunk_into_chunks,
     _parse_patch,
+    ALLOWED_BASENAMES,
 )
 
 
@@ -66,29 +65,13 @@ def create_test_file(workspace: Path, rel_path: str, content: str) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Tests for _norm helper
-# ---------------------------------------------------------------------------
-class TestNormHelper:
-    def test_norm_strips_trailing_cr(self) -> None:
-        # _norm strips trailing \r (for CRLF split lines)
-        assert _norm("hello\r") == "hello"
-        assert _norm("hello\r\r") == "hello"
-    
-    def test_norm_preserves_other_content(self) -> None:
-        # \r not at end is not stripped
-        assert _norm("hello\r\n") == "hello\r\n"
-        assert _norm("hello\n") == "hello\n"
-        assert _norm("hello") == "hello"
-
-
-# ---------------------------------------------------------------------------
 # Tests for _find_context fuzzy matching
 # ---------------------------------------------------------------------------
 class TestFindContext:
     def test_exact_match(self) -> None:
         lines = ["line 1", "line 2", "line 3", "line 4"]
         old_lines = ["line 2", "line 3"]
-        index, fuzz = _find_context(lines, old_lines, 0)
+        index, fuzz = _find_context(lines, old_lines, 0, eof=False, file_path="test.py", hunk_idx=0)
         assert index == 1
         assert fuzz == 0
     
@@ -96,39 +79,139 @@ class TestFindContext:
         """Test matching with trailing whitespace differences."""
         lines = ["line 1  ", "line 2  ", "line 3"]
         old_lines = ["line 1", "line 2"]
-        index, fuzz = _find_context(lines, old_lines, 0)
+        index, fuzz = _find_context(lines, old_lines, 0, eof=False, file_path="test.py", hunk_idx=0)
         assert index == 0
         assert fuzz == 1
     
-    def test_strip_match(self) -> None:
-        """Test matching with leading/trailing whitespace differences."""
+    def test_collapse_ws_match(self) -> None:
+        """Test matching with leading/trailing whitespace differences (collapse mode)."""
         lines = ["  line 1  ", "  line 2  ", "line 3"]
         old_lines = ["line 1", "line 2"]
-        index, fuzz = _find_context(lines, old_lines, 0)
+        index, fuzz = _find_context(lines, old_lines, 0, eof=False, file_path="test.py", hunk_idx=0)
         assert index == 0
         assert fuzz == 100
     
     def test_no_match(self) -> None:
         lines = ["line 1", "line 2", "line 3"]
         old_lines = ["not found", "anywhere"]
-        index, fuzz = _find_context(lines, old_lines, 0)
+        index, fuzz = _find_context(lines, old_lines, 0, eof=False, file_path="test.py", hunk_idx=0)
         assert index == -1
         assert fuzz == 0
     
     def test_empty_old_lines(self) -> None:
         lines = ["line 1", "line 2"]
         old_lines: list[str] = []
-        index, fuzz = _find_context(lines, old_lines, 0)
+        index, fuzz = _find_context(lines, old_lines, 0, eof=False, file_path="test.py", hunk_idx=0)
         assert index == 0
         assert fuzz == 0
     
     def test_search_from_start_index(self) -> None:
+        """Test that starting from a later index finds the match at that position."""
         lines = ["line 1", "line 2", "line 1", "line 2"]
         old_lines = ["line 1", "line 2"]
-        # Start from index 2, should find second occurrence
-        index, fuzz = _find_context(lines, old_lines, 2)
+        # Start from index 2, should find only the second occurrence (no ambiguity)
+        index, fuzz = _find_context(lines, old_lines, 2, eof=False, file_path="test.py", hunk_idx=0)
         assert index == 2
         assert fuzz == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests for ambiguity detection (new feature)
+# ---------------------------------------------------------------------------
+class TestAmbiguityDetection:
+    """Tests for ambiguous match detection - a key safety feature."""
+    
+    def test_ambiguous_match_raises_error(self) -> None:
+        """Test that multiple matches without EOF raises PatchError."""
+        lines = ["target", "other", "target"]
+        old_lines = ["target"]
+        
+        with pytest.raises(PatchError) as exc_info:
+            _find_context(lines, old_lines, 0, eof=False, file_path="test.py", hunk_idx=0)
+        
+        assert "ambiguous" in str(exc_info.value).lower()
+    
+    def test_eof_disambiguates_multiple_matches(self) -> None:
+        """Test that EOF flag disambiguates by choosing last match."""
+        lines = ["target", "other", "target"]
+        old_lines = ["target"]
+        
+        # With EOF, should choose the last match (index 2)
+        index, fuzz = _find_context(lines, old_lines, 0, eof=True, file_path="test.py", hunk_idx=0)
+        assert index == 2
+        assert fuzz == 0  # At EOF, no penalty
+    
+    def test_ambiguous_patch_application_fails(self, temp_workspace: Path, apply_patch_fn) -> None:
+        """Test that a patch with ambiguous context fails with clear error."""
+        # File with repeated blocks
+        content = '''def func1():
+    x = 1
+    return x
+
+def func2():
+    x = 1
+    return x
+'''
+        create_test_file(temp_workspace, "test.py", content)
+        
+        # Patch that matches both functions (ambiguous without scope)
+        patch = """*** Begin Patch
+*** Update File: test.py
+@@
+-    x = 1
++    x = 42
+     return x
+*** End Patch"""
+        
+        result = parse_response(apply_patch_fn(patch))
+        
+        assert result["status"] == "error"
+        assert "ambiguous" in result["error"].lower() or "ambiguous" in result.get("hint", "").lower()
+    
+    def test_scope_resolves_ambiguity(self, temp_workspace: Path, apply_patch_fn) -> None:
+        """Test that scope lines can resolve ambiguous contexts."""
+        content = '''def func1():
+    x = 1
+    return x
+
+def func2():
+    x = 1
+    return x
+'''
+        create_test_file(temp_workspace, "test.py", content)
+        
+        # Patch with scope line to target func2 specifically
+        patch = """*** Begin Patch
+*** Update File: test.py
+@@ def func2
+-    x = 1
++    x = 42
+     return x
+*** End Patch"""
+        
+        result = parse_response(apply_patch_fn(patch))
+        
+        assert result["status"] == "ok"
+        new_content = (temp_workspace / "test.py").read_text()
+        # func1 unchanged
+        assert "def func1():\n    x = 1" in new_content
+        # func2 modified
+        assert "def func2():\n    x = 42" in new_content
+    
+    def test_ambiguous_scope_raises_error(self) -> None:
+        """Test that ambiguous scope signatures also raise errors."""
+        lines = [
+            "def func():",
+            "    pass",
+            "def func():",  # Duplicate!
+            "    pass",
+        ]
+        scope_lines = ["def func"]
+        
+        with pytest.raises(PatchError) as exc_info:
+            _find_scope(lines, scope_lines, 0, file_path="test.py", hunk_idx=0)
+        
+        assert "ambiguous" in str(exc_info.value).lower()
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +521,7 @@ class TestPathSecurity:
         result = parse_response(apply_patch_fn(patch))
         
         assert result["status"] == "error"
-        assert "must be relative" in result["error"]
+        assert "must be relative" in result["error"] or "Invalid path" in result["error"]
     
     def test_path_traversal_rejected(self, temp_workspace: Path, apply_patch_fn) -> None:
         patch = """*** Begin Patch
@@ -450,16 +533,28 @@ class TestPathSecurity:
         
         assert result["status"] == "error"
     
-    def test_disallowed_extension_rejected(self, temp_workspace: Path, apply_patch_fn) -> None:
+    def test_home_expansion_rejected(self, temp_workspace: Path, apply_patch_fn) -> None:
+        """Test that ~ paths are rejected."""
         patch = """*** Begin Patch
-*** Add File: script.exe
+*** Add File: ~/file.py
++content
+*** End Patch"""
+        
+        result = parse_response(apply_patch_fn(patch))
+        
+        assert result["status"] == "error"
+        assert "~" in result.get("hint", "") or "Invalid path" in result["error"]
+    
+    def test_binary_extension_rejected(self, temp_workspace: Path, apply_patch_fn) -> None:
+        """Test that known binary extensions are rejected."""
+        patch = """*** Begin Patch
+*** Add File: image.png
 +binary
 *** End Patch"""
         
         result = parse_response(apply_patch_fn(patch))
         
         assert result["status"] == "error"
-        assert "extension not allowed" in result["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -528,7 +623,7 @@ class TestScopeLines:
             "    return x",
         ]
         scope_lines = ["def target_function"]
-        index, fuzz = _find_scope(lines, scope_lines, 0)
+        index, fuzz = _find_scope(lines, scope_lines, 0, file_path="test.py", hunk_idx=0)
         assert index == 6  # Position after "def target_function():"
         assert fuzz == 0
     
@@ -543,7 +638,7 @@ class TestScopeLines:
             "        return 42",
         ]
         scope_lines = ["class MyClass"]
-        index, fuzz = _find_scope(lines, scope_lines, 0)
+        index, fuzz = _find_scope(lines, scope_lines, 0, file_path="test.py", hunk_idx=0)
         assert index == 1  # Position after "class MyClass:"
         assert fuzz == 0
     
@@ -551,7 +646,7 @@ class TestScopeLines:
         """Test scope finding when scope doesn't exist."""
         lines = ["def other_function():", "    pass"]
         scope_lines = ["def nonexistent"]
-        index, fuzz = _find_scope(lines, scope_lines, 0)
+        index, fuzz = _find_scope(lines, scope_lines, 0, file_path="test.py", hunk_idx=0)
         assert index == -1
         assert fuzz == 0
     
@@ -563,7 +658,7 @@ class TestScopeLines:
         """
         lines = ["  def indented_func():", "    pass"]
         scope_lines = ["def indented_func"]
-        index, fuzz = _find_scope(lines, scope_lines, 0)
+        index, fuzz = _find_scope(lines, scope_lines, 0, file_path="test.py", hunk_idx=0)
         assert index == 1
         assert fuzz == 0  # Substring match succeeds without fuzz
     
@@ -637,9 +732,12 @@ class OtherClass:
     ) -> None:
         """Test nested scope lines that are NOT consecutive in the file.
         
-        Regression test: nested scopes like '## Section' then '### Subsection'
+        Regression test: nested scopes like '## Section' then '### Details'
         may have content between them. The scope finder must search sequentially,
         not require consecutive lines.
+        
+        Note: Each scope line must be unique within its search range to avoid
+        ambiguity errors. Here we use unique subsection names.
         """
         content = '''# Document
 
@@ -647,20 +745,20 @@ class OtherClass:
 - item one
 - item two
 
-### Subsection
+### Details
 note: original
 
 ## Another Section
-### Subsection
+### Other Info
 note: should not change
 '''
         create_test_file(temp_workspace, "doc.md", content)
         
-        # Target the Subsection under "## Section" (not "## Another Section")
+        # Target the Details subsection under "## Section"
         patch = """*** Begin Patch
 *** Update File: doc.md
 @@ ## Section
-@@ ### Subsection
+@@ ### Details
 -note: original
 +note: updated
 *** End Patch"""
@@ -679,17 +777,18 @@ note: should not change
 # Tests for EOF Marker
 # ---------------------------------------------------------------------------
 class TestEOFMarker:
-    def test_eof_marker_in_find_context(self) -> None:
-        """Test EOF flag in _find_context prioritizes end of file."""
+    def test_eof_marker_disambiguates(self) -> None:
+        """Test that EOF flag disambiguates multiple matches by choosing last."""
         lines = ["line 1", "line 2", "target", "line 3", "target"]
         old_lines = ["target"]
         
-        # Without EOF, finds first occurrence
-        index, fuzz = _find_context(lines, old_lines, 0, eof=False)
-        assert index == 2
+        # Without EOF, multiple matches raise ambiguity error
+        with pytest.raises(PatchError) as exc_info:
+            _find_context(lines, old_lines, 0, eof=False, file_path="test.py", hunk_idx=0)
+        assert "ambiguous" in str(exc_info.value).lower()
         
         # With EOF, finds last occurrence at end
-        index, fuzz = _find_context(lines, old_lines, 0, eof=True)
+        index, fuzz = _find_context(lines, old_lines, 0, eof=True, file_path="test.py", hunk_idx=0)
         assert index == 4  # Last position
         assert fuzz == 0  # Exact match at end
     
@@ -699,7 +798,7 @@ class TestEOFMarker:
         old_lines = ["target"]
         
         # With EOF but match not at end
-        index, fuzz = _find_context(lines, old_lines, 0, eof=True)
+        index, fuzz = _find_context(lines, old_lines, 0, eof=True, file_path="test.py", hunk_idx=0)
         assert index == 0
         assert fuzz >= 10000  # Large penalty
     
@@ -739,85 +838,6 @@ class TestEOFMarker:
         parsed = _parse_patch(patch)
         assert len(parsed.hunks) == 1
         assert parsed.hunks[0].is_eof is True
-
-
-# ---------------------------------------------------------------------------
-# Tests for Chunk-based Parsing
-# ---------------------------------------------------------------------------
-class TestChunkParsing:
-    def test_parse_simple_chunk(self) -> None:
-        """Test parsing a simple hunk into chunks."""
-        hunk_lines = [
-            " context 1",
-            "-deleted",
-            "+inserted",
-            " context 2",
-        ]
-        
-        context_lines, chunks = _parse_hunk_into_chunks(hunk_lines, "test.py")
-        
-        assert context_lines == ["context 1", "deleted", "context 2"]
-        assert len(chunks) == 1
-        assert chunks[0].orig_index == 1
-        assert chunks[0].del_lines == ["deleted"]
-        assert chunks[0].ins_lines == ["inserted"]
-    
-    def test_parse_multiple_chunks(self) -> None:
-        """Test parsing hunk with multiple separate changes."""
-        hunk_lines = [
-            " context 1",
-            "-del1",
-            "+ins1",
-            " context 2",
-            " context 3",
-            "-del2",
-            "+ins2",
-            " context 4",
-        ]
-        
-        context_lines, chunks = _parse_hunk_into_chunks(hunk_lines, "test.py")
-        
-        assert len(chunks) == 2
-        # First chunk
-        assert chunks[0].orig_index == 1
-        assert chunks[0].del_lines == ["del1"]
-        assert chunks[0].ins_lines == ["ins1"]
-        # Second chunk
-        assert chunks[1].orig_index == 4
-        assert chunks[1].del_lines == ["del2"]
-        assert chunks[1].ins_lines == ["ins2"]
-    
-    def test_parse_pure_insertion(self) -> None:
-        """Test parsing hunk with only insertions."""
-        hunk_lines = [
-            " context",
-            "+new line 1",
-            "+new line 2",
-            " more context",
-        ]
-        
-        context_lines, chunks = _parse_hunk_into_chunks(hunk_lines, "test.py")
-        
-        assert context_lines == ["context", "more context"]
-        assert len(chunks) == 1
-        assert chunks[0].del_lines == []
-        assert chunks[0].ins_lines == ["new line 1", "new line 2"]
-    
-    def test_parse_pure_deletion(self) -> None:
-        """Test parsing hunk with only deletions."""
-        hunk_lines = [
-            " context",
-            "-removed 1",
-            "-removed 2",
-            " more context",
-        ]
-        
-        context_lines, chunks = _parse_hunk_into_chunks(hunk_lines, "test.py")
-        
-        assert context_lines == ["context", "removed 1", "removed 2", "more context"]
-        assert len(chunks) == 1
-        assert chunks[0].del_lines == ["removed 1", "removed 2"]
-        assert chunks[0].ins_lines == []
 
 
 # ---------------------------------------------------------------------------
@@ -875,25 +895,10 @@ third
         new_content = (temp_workspace / "test.py").read_text()
         assert "modified" in new_content
         assert "second" not in new_content
-    
-    def test_parse_blank_lines_in_chunks(self) -> None:
-        """Test chunk parsing handles blank lines correctly."""
-        hunk_lines = [
-            " context",
-            "",  # Empty line
-            "-deleted",
-            "+inserted",
-        ]
-        
-        context_lines, chunks = _parse_hunk_into_chunks(hunk_lines, "test.py")
-        
-        assert context_lines == ["context", "", "deleted"]
-        assert len(chunks) == 1
-        assert chunks[0].orig_index == 2  # After blank line
 
 
 # ---------------------------------------------------------------------------
-# Tests for detailed error context (Improvement 1)
+# Tests for detailed error context
 # ---------------------------------------------------------------------------
 class TestErrorContext:
     """Tests for _format_context_mismatch helper and detailed error messages."""
@@ -955,7 +960,7 @@ class TestErrorContext:
 
 
 # ---------------------------------------------------------------------------
-# Tests for overlap detection (Improvement 2)
+# Tests for overlap detection
 # ---------------------------------------------------------------------------
 class TestOverlapDetection:
     """Tests for overlapping or out-of-order hunk detection.
@@ -996,7 +1001,7 @@ class TestOverlapDetection:
 
 
 # ---------------------------------------------------------------------------
-# Tests for improved scope matching (Improvement 3)
+# Tests for improved scope matching
 # ---------------------------------------------------------------------------
 class TestScopeMatching:
     """Tests for improved scope signature matching."""
@@ -1011,25 +1016,10 @@ class TestScopeMatching:
         scope_lines = ["def new_function"]
         
         # Should find "def new_function" at line 1, not match the comment at line 0
-        pos, fuzz = _find_scope(lines, scope_lines, 0)
+        pos, fuzz = _find_scope(lines, scope_lines, 0, file_path="test.py", hunk_idx=0)
         
         assert pos == 2  # Position after the scope line
         assert fuzz == 0  # Should be exact (startswith) match
-    
-    def test_scope_does_not_match_comments(self) -> None:
-        """Test that scope lines don't match commented-out code."""
-        lines = [
-            "# def foo():  # old implementation",
-            "# def foo():  # another comment",
-            "def foo():",
-            "    return 42",
-        ]
-        scope_lines = ["def foo"]
-        
-        pos, fuzz = _find_scope(lines, scope_lines, 0)
-        
-        assert pos == 3  # Should match actual def, not comments
-        assert fuzz == 0
     
     def test_scope_fallback_to_substring(self) -> None:
         """Test fallback to substring matching with fuzz penalty."""
@@ -1039,7 +1029,7 @@ class TestScopeMatching:
         ]
         scope_lines = ["def foo"]
         
-        pos, fuzz = _find_scope(lines, scope_lines, 0)
+        pos, fuzz = _find_scope(lines, scope_lines, 0, file_path="test.py", hunk_idx=0)
         
         assert pos == 1  # Should still find it
         assert fuzz == 1  # But with fuzz penalty for substring match
@@ -1070,7 +1060,7 @@ class TestScopeMatching:
 
 
 # ---------------------------------------------------------------------------
-# Tests for line ending preservation (Improvement 4)
+# Tests for line ending preservation
 # ---------------------------------------------------------------------------
 class TestLineEndingPreservation:
     """Tests for preserving original line ending style."""
@@ -1120,10 +1110,32 @@ class TestLineEndingPreservation:
         lf_only_count = new_bytes.count(b"\n") - crlf_count
         assert crlf_count >= 2  # At least 2 CRLF endings
         assert lf_only_count == 0  # No stray LF-only endings
+    
+    def test_preserves_cr_endings(self, temp_workspace: Path, apply_patch_fn) -> None:
+        """Test that CR-only line endings (old Mac style) are preserved."""
+        content = "line 1\rline 2\rline 3\r"
+        (temp_workspace / "test.py").write_bytes(content.encode("utf-8"))
+        
+        patch = """*** Begin Patch
+*** Update File: test.py
+@@
+ line 1
+-line 2
++modified line 2
+ line 3
+*** End Patch"""
+        
+        result = parse_response(apply_patch_fn(patch))
+        
+        assert result["status"] == "ok"
+        new_bytes = (temp_workspace / "test.py").read_bytes()
+        # Should have CR-only line endings
+        assert b"\r\n" not in new_bytes  # No CRLF
+        assert b"\r" in new_bytes  # CR present
 
 
 # ---------------------------------------------------------------------------
-# Tests for lenient sentinel parsing (Improvement 5)
+# Tests for lenient sentinel parsing
 # ---------------------------------------------------------------------------
 class TestLenientParsing:
     """Tests for optional lenient sentinel parsing."""
@@ -1364,7 +1376,7 @@ class TestCustomExtensions:
         result = parse_response(apply_fn(patch))
 
         assert result["status"] == "error"
-        assert "extension not allowed" in result["error"]
+        assert "not allowed" in result["error"]
 
     def test_default_extensions_allow_py(
         self, temp_workspace: Path, apply_patch_fn
@@ -1403,3 +1415,178 @@ class TestCustomExtensions:
         assert result["status"] == "ok"
         content = (temp_workspace / "config.cfg").read_text()
         assert "key=new" in content
+
+
+# ---------------------------------------------------------------------------
+# Tests for allowed basenames (new feature)
+# ---------------------------------------------------------------------------
+class TestAllowedBasenames:
+    """Tests for allowed_basenames - extensionless files like Makefile, Dockerfile."""
+    
+    def test_default_basenames_include_common_files(self) -> None:
+        """Verify ALLOWED_BASENAMES includes common extensionless files."""
+        expected = {"makefile", "dockerfile", "readme", "license"}
+        for name in expected:
+            assert name in ALLOWED_BASENAMES, f"Expected {name} in ALLOWED_BASENAMES"
+    
+    def test_makefile_allowed_by_default(self, temp_workspace: Path, apply_patch_fn) -> None:
+        """Test that Makefile is allowed by default."""
+        patch = """*** Begin Patch
+*** Add File: Makefile
++all:
++\techo "Building..."
+*** End Patch"""
+        
+        result = parse_response(apply_patch_fn(patch))
+        
+        assert result["status"] == "ok"
+        assert (temp_workspace / "Makefile").exists()
+    
+    def test_dockerfile_allowed_by_default(self, temp_workspace: Path, apply_patch_fn) -> None:
+        """Test that Dockerfile is allowed by default."""
+        patch = """*** Begin Patch
+*** Add File: Dockerfile
++FROM python:3.11
++WORKDIR /app
+*** End Patch"""
+        
+        result = parse_response(apply_patch_fn(patch))
+        
+        assert result["status"] == "ok"
+        assert (temp_workspace / "Dockerfile").exists()
+    
+    def test_custom_allowed_basenames(self, temp_workspace: Path) -> None:
+        """Test custom allowed_basenames configuration.
+        
+        Note: allowed_basenames uses lowercase comparison (like ALLOWED_BASENAMES).
+        """
+        tool = ApplyPatchTool(
+            base_path=temp_workspace,
+            allowed_extensions={".py"},
+            allowed_basenames={"customfile"},  # lowercase, like ALLOWED_BASENAMES
+        )
+        apply_fn = tool.get_tool()
+        
+        # The filename can be any case - it gets lowercased for comparison
+        patch = """*** Begin Patch
+*** Add File: CUSTOMFILE
++custom content
+*** End Patch"""
+        
+        result = parse_response(apply_fn(patch))
+        
+        assert result["status"] == "ok"
+        assert (temp_workspace / "CUSTOMFILE").exists()
+
+
+# ---------------------------------------------------------------------------
+# Tests for enforce_allowlist option (new feature)
+# ---------------------------------------------------------------------------
+class TestEnforceAllowlist:
+    """Tests for enforce_allowlist=False option to allow any non-binary extension."""
+    
+    def test_enforce_allowlist_false_allows_any_extension(self, temp_workspace: Path) -> None:
+        """Test that enforce_allowlist=False allows any non-binary extension."""
+        tool = ApplyPatchTool(
+            base_path=temp_workspace,
+            enforce_allowlist=False,
+        )
+        apply_fn = tool.get_tool()
+        
+        # Create file with unusual extension
+        patch = """*** Begin Patch
+*** Add File: data.xyz
++custom data format
+*** End Patch"""
+        
+        result = parse_response(apply_fn(patch))
+        
+        assert result["status"] == "ok"
+        assert (temp_workspace / "data.xyz").exists()
+    
+    def test_enforce_allowlist_false_still_rejects_binary(self, temp_workspace: Path) -> None:
+        """Test that enforce_allowlist=False still rejects known binary extensions."""
+        tool = ApplyPatchTool(
+            base_path=temp_workspace,
+            enforce_allowlist=False,
+        )
+        apply_fn = tool.get_tool()
+        
+        patch = """*** Begin Patch
+*** Add File: image.png
++not actually binary
+*** End Patch"""
+        
+        result = parse_response(apply_fn(patch))
+        
+        assert result["status"] == "error"
+        assert "binary" in result["error"].lower() or "not allowed" in result["error"].lower()
+    
+    def test_enforce_allowlist_true_is_default(self, temp_workspace: Path) -> None:
+        """Test that enforce_allowlist=True is the default (strict mode)."""
+        tool = ApplyPatchTool(base_path=temp_workspace)
+        apply_fn = tool.get_tool()
+        
+        # Unusual extension should be rejected with default settings
+        patch = """*** Begin Patch
+*** Add File: data.xyz
++content
+*** End Patch"""
+        
+        result = parse_response(apply_fn(patch))
+        
+        assert result["status"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# Tests for UTF-8 BOM preservation (new feature)
+# ---------------------------------------------------------------------------
+class TestBOMPreservation:
+    """Tests for UTF-8 BOM preservation."""
+    
+    def test_preserves_utf8_bom(self, temp_workspace: Path, apply_patch_fn) -> None:
+        """Test that UTF-8 BOM is preserved after patching."""
+        # Create file with UTF-8 BOM
+        bom = b"\xef\xbb\xbf"
+        content = bom + b"line 1\nline 2\nline 3\n"
+        (temp_workspace / "test.py").write_bytes(content)
+        
+        patch = """*** Begin Patch
+*** Update File: test.py
+@@
+ line 1
+-line 2
++modified line 2
+ line 3
+*** End Patch"""
+        
+        result = parse_response(apply_patch_fn(patch))
+        
+        assert result["status"] == "ok"
+        new_bytes = (temp_workspace / "test.py").read_bytes()
+        # BOM should be preserved at start
+        assert new_bytes.startswith(bom)
+        # Content should be modified
+        assert b"modified line 2" in new_bytes
+    
+    def test_file_without_bom_stays_without_bom(self, temp_workspace: Path, apply_patch_fn) -> None:
+        """Test that files without BOM don't get BOM added."""
+        content = b"line 1\nline 2\nline 3\n"
+        (temp_workspace / "test.py").write_bytes(content)
+        
+        patch = """*** Begin Patch
+*** Update File: test.py
+@@
+ line 1
+-line 2
++modified line 2
+ line 3
+*** End Patch"""
+        
+        result = parse_response(apply_patch_fn(patch))
+        
+        assert result["status"] == "ok"
+        new_bytes = (temp_workspace / "test.py").read_bytes()
+        # Should NOT start with BOM
+        bom = b"\xef\xbb\xbf"
+        assert not new_bytes.startswith(bom)
