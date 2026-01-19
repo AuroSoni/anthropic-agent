@@ -17,6 +17,7 @@ async def anthropic_stream_with_backoff(
     max_retries: int = 5,
     base_delay: float = 5.0,
     formatter: FormatterType = "xml",
+    stream_tool_results: bool = True,
 ) -> BetaMessage:
     """Execute Anthropic streaming with exponential backoff for transient failures.
     
@@ -45,6 +46,8 @@ async def anthropic_stream_with_backoff(
         max_retries: Maximum number of retry attempts (default: 5)
         base_delay: Base delay in seconds for exponential backoff (default: 5.0)
         formatter: Formatter to use for stream output ("xml" or "raw", default: "xml")
+        stream_tool_results: Whether to stream tool results to the queue (default: True).
+            When False, server tool results are not streamed to reduce output volume.
         
     Returns:
         The final accumulated message from stream.get_final_message()
@@ -89,7 +92,9 @@ async def anthropic_stream_with_backoff(
                 if queue:
                     # Use render_stream for formatted output with specified formatter
                     formatter_fn = get_formatter(formatter)
-                    accumulated_message = await render_stream(stream, queue, formatter=formatter_fn)
+                    accumulated_message = await render_stream(
+                        stream, queue, formatter=formatter_fn, stream_tool_results=stream_tool_results
+                    )
                 else:
                     # Simple iteration without queue
                     async for event in stream:

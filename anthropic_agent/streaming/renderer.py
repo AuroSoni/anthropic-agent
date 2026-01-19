@@ -8,7 +8,8 @@ from .formatters import xml_formatter
 async def render_stream(
     stream: BetaAsyncMessageStream,
     queue: asyncio.Queue,
-    formatter: Callable[[BetaAsyncMessageStream, asyncio.Queue], Awaitable[BetaMessage]] = xml_formatter
+    formatter: Callable[..., Awaitable[BetaMessage]] = xml_formatter,
+    stream_tool_results: bool = True
 ) -> BetaMessage:
     """Render Anthropic streaming response with configurable formatting.
     
@@ -19,7 +20,9 @@ async def render_stream(
         stream: Anthropic async message stream (from inside async with context)
         queue: Async queue to send formatted output chunks
         formatter: Async function that formats the stream (default: xml_formatter)
-                  Signature: async def formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) -> BetaMessage
+                  Signature: async def formatter(stream, queue, stream_tool_results) -> BetaMessage
+        stream_tool_results: Whether to stream tool results to the queue (default: True).
+            When False, server tool results are not streamed to reduce output volume.
         
     Returns:
         The final accumulated message from stream.get_final_message()
@@ -40,4 +43,4 @@ async def render_stream(
         - The default xml_formatter provides the original XML-based formatting
         - Custom formatters can be provided for different output formats
     """
-    return await formatter(stream, queue)
+    return await formatter(stream, queue, stream_tool_results=stream_tool_results)

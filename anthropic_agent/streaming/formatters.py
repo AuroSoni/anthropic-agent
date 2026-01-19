@@ -62,7 +62,11 @@ async def stream_xml_to_aqueue(chunk: Any, queue: asyncio.Queue) -> None:
     await queue.put(chunk)
 
 
-async def xml_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) -> BetaMessage:
+async def xml_formatter(
+    stream: BetaAsyncMessageStream,
+    queue: asyncio.Queue,
+    stream_tool_results: bool = True
+) -> BetaMessage:
     """Format Anthropic streaming response with custom XML tags.
     
     This formatter wraps different content types in custom XML tags:
@@ -95,6 +99,7 @@ async def xml_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) ->
     Args:
         stream: Anthropic streaming context manager
         queue: Async queue to send formatted output chunks
+        stream_tool_results: Whether to stream server tool results (default: True)
         
     Returns:
         The final accumulated message from stream.get_final_message()
@@ -318,23 +323,25 @@ async def xml_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) ->
             
             # Stream server tool result (handles all *_tool_result types)
             elif block_type.endswith("_tool_result") and block_info["tool_data"]:
-                tool_data = block_info["tool_data"]
-                tool_use_id = escape_xml_attr(tool_data["tool_use_id"])
-                result_name = escape_xml_attr(block_type)  # Use block type as name
-                
-                # Serialize content to string for CDATA
-                content = tool_data.get("content")
-                if content is None:
-                    content_str = ""
-                elif isinstance(content, str):
-                    content_str = content
-                else:
-                    content_str = json.dumps(content, default=str)
-                
-                await stream_xml_to_aqueue(
-                    f'<content-block-server_tool_result id="{tool_use_id}" name="{result_name}"><![CDATA[{content_str}]]></content-block-server_tool_result>',
-                    queue
-                )
+                # Only stream tool results if stream_tool_results is True
+                if stream_tool_results:
+                    tool_data = block_info["tool_data"]
+                    tool_use_id = escape_xml_attr(tool_data["tool_use_id"])
+                    result_name = escape_xml_attr(block_type)  # Use block type as name
+                    
+                    # Serialize content to string for CDATA
+                    content = tool_data.get("content")
+                    if content is None:
+                        content_str = ""
+                    elif isinstance(content, str):
+                        content_str = content
+                    else:
+                        content_str = json.dumps(content, default=str)
+                    
+                    await stream_xml_to_aqueue(
+                        f'<content-block-server_tool_result id="{tool_use_id}" name="{result_name}"><![CDATA[{content_str}]]></content-block-server_tool_result>',
+                        queue
+                    )
         
         # Handle unknown event types gracefully (per Anthropic versioning policy)
         else:
@@ -354,25 +361,63 @@ async def xml_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) ->
     return await stream.get_final_message()
 
 
-async def raw_formatter(stream: BetaAsyncMessageStream, queue: asyncio.Queue) -> BetaMessage:
+async def raw_formatter(
+    stream: BetaAsyncMessageStream,
+    queue: asyncio.Queue,
+    stream_tool_results: bool = True
+) -> BetaMessage:
     """Format Anthropic streaming response with raw/minimal formatting.
     
-    This is a placeholder formatter that streams content with minimal processing.
-    Implement this formatter based on your specific needs.
+    This formatter streams raw Anthropic events with minimal processing.
+    When stream_tool_results is False, all events related to *_tool_result blocks
+    are filtered out (content_block_start, content_block_delta, content_block_stop).
     
     Args:
         stream: Anthropic streaming context manager
         queue: Async queue to send formatted output chunks
+        stream_tool_results: Whether to stream tool results (default: True).
+            When False, content_block events for *_tool_result types are skipped.
         
     Returns:
         The final accumulated message from stream.get_final_message()
     """
+    # Track block indices that are tool results (to skip their deltas and stops)
+    tool_result_block_indices: set[int] = set()
     
     async for event in stream:
-        # event_str = json.dumps(event, default=str)
-        if event.type in ['message_start', 'message_delta', 'message_stop', 'content_block_start', 'content_block_delta', 'content_block_stop']:
-            event_str = event.model_dump_json(warnings=False)
-            await stream_to_aqueue(event_str, queue)
+        event_type = event.type
+        
+        # Only process relevant event types
+        if event_type not in ['message_start', 'message_delta', 'message_stop', 
+                              'content_block_start', 'content_block_delta', 'content_block_stop']:
+            continue
+        
+        # Handle tool result filtering when stream_tool_results is False
+        if not stream_tool_results:
+            if event_type == 'content_block_start':
+                idx = getattr(event, 'index', None)
+                block_type = getattr(event.content_block, 'type', '')
+                # Track this block if it's a tool result type
+                if block_type.endswith('_tool_result'):
+                    if idx is not None:
+                        tool_result_block_indices.add(idx)
+                    continue  # Skip streaming this event
+            
+            elif event_type == 'content_block_delta':
+                idx = getattr(event, 'index', None)
+                if idx in tool_result_block_indices:
+                    continue  # Skip deltas for tool result blocks
+            
+            elif event_type == 'content_block_stop':
+                idx = getattr(event, 'index', None)
+                if idx in tool_result_block_indices:
+                    # Clean up tracking and skip this event
+                    tool_result_block_indices.discard(idx)
+                    continue
+        
+        # Stream the event
+        event_str = event.model_dump_json(warnings=False)
+        await stream_to_aqueue(event_str, queue)
 
     # Return final message
     return await stream.get_final_message()

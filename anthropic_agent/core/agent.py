@@ -494,13 +494,15 @@ class AnthropicAgent:
         
         # Emit meta_init tag to signal stream format and provide metadata
         if queue is not None:
-            meta_init = {
+            meta_init: dict[str, Any] = {
                 "format": formatter if formatter is not None else self.formatter,
                 "user_query": prompt if isinstance(prompt, str) else json.dumps(prompt),
-                "message_history": self.conversation_history,
                 "agent_uuid": self.agent_uuid,
                 "model": self.model,
             }
+            # Only include message_history when stream_meta_history_and_tool_results is True
+            if self.stream_meta_history_and_tool_results:
+                meta_init["message_history"] = self.conversation_history
             escaped_json = html.escape(json.dumps(meta_init), quote=True)
             await queue.put(f'<meta_init data="{escaped_json}"></meta_init>')
         
@@ -554,6 +556,7 @@ class AnthropicAgent:
                 max_retries=self.max_retries,
                 base_delay=self.base_delay,
                 formatter=formatter if formatter is not None else self.formatter,
+                stream_tool_results=self.stream_meta_history_and_tool_results,
             )
             
             # Track token usage from API response
@@ -835,6 +838,9 @@ class AnthropicAgent:
 
             # Save run data asynchronously with complete file registry snapshot
             self._save_run_data_async(result, all_files_metadata)
+            
+            # Emit meta_final tag at end of run (only if stream_meta_history_and_tool_results is True)
+            await self._emit_meta_final(queue, result)
             
             return result
 
@@ -1133,8 +1139,8 @@ class AnthropicAgent:
             for r in frontend_results
         ]
         
-        # Stream frontend tool results to queue
-        if queue is not None:
+        # Stream frontend tool results to queue (only if stream_meta_history_and_tool_results is True)
+        if queue is not None and self.stream_meta_history_and_tool_results:
             for r in frontend_results:
                 tool_use_id = html.escape(str(r["tool_use_id"]), quote=True)
                 # Find the tool name from pending tools
@@ -1213,6 +1219,7 @@ class AnthropicAgent:
                 max_retries=self.max_retries,
                 base_delay=self.base_delay,
                 formatter=formatter if formatter is not None else self.formatter,
+                stream_tool_results=self.stream_meta_history_and_tool_results,
             )
             
             # Track token usage from API response
@@ -1455,6 +1462,9 @@ class AnthropicAgent:
             result.generated_files = all_files_metadata
             self._save_run_data_async(result, all_files_metadata)
             
+            # Emit meta_final tag at end of run (only if stream_meta_history_and_tool_results is True)
+            await self._emit_meta_final(queue, result)
+            
             return result
 
         # Max steps reached
@@ -1543,6 +1553,33 @@ class AnthropicAgent:
                 full_text.append(block.text)
         
         return "".join(full_text)
+    
+    async def _emit_meta_final(
+        self,
+        queue: Optional[asyncio.Queue],
+        result: AgentResult
+    ) -> None:
+        """Emit meta_final tag at end of run when stream_meta_history_and_tool_results is True.
+        
+        This method emits the final conversation history and run metadata to the stream
+        at the completion of an agent run. It should NOT be called for partial returns
+        (e.g., awaiting_frontend_tools).
+        
+        Args:
+            queue: Optional async queue to emit the meta_final tag to
+            result: The AgentResult containing final run data
+        """
+        if queue is None or not self.stream_meta_history_and_tool_results:
+            return
+        
+        meta_final: dict[str, Any] = {
+            "conversation_history": result.conversation_history,
+            "stop_reason": result.stop_reason,
+            "total_steps": result.total_steps,
+            "generated_files": result.generated_files,
+        }
+        escaped_json = html.escape(json.dumps(meta_final), quote=True)
+        await queue.put(f'<meta_final data="{escaped_json}"></meta_final>')
 
     async def _generate_final_summary(
         self,
@@ -1618,6 +1655,7 @@ class AnthropicAgent:
             max_retries=self.max_retries,
             base_delay=self.base_delay,
             formatter=formatter if formatter is not None else self.formatter,
+            stream_tool_results=self.stream_meta_history_and_tool_results,
         )
         
         # Track token usage from API response
@@ -1700,6 +1738,9 @@ class AnthropicAgent:
 
         # Save run data asynchronously with complete file registry snapshot
         self._save_run_data_async(result, all_files_metadata)
+        
+        # Emit meta_final tag at end of run (only if stream_meta_history_and_tool_results is True)
+        await self._emit_meta_final(queue, result)
         
         # Return AgentResult with final summary
         return result
