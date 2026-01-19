@@ -145,13 +145,17 @@ class TestBoundaries:
 # ---------------------------------------------------------------------------
 class TestComplexLogic:
     def test_multiple_identical_contexts(self, rigorous_env, patch_tool_rigorous):
-        """Test ambiguity when context appears multiple times."""
+        """Test that ambiguous context is correctly rejected.
+        
+        The new apply_patch implementation rejects patches with ambiguous context
+        (context that matches multiple locations) as a safety feature.
+        """
         workspace, _ = rigorous_env
         file_path = workspace / "repeat.py"
         file_path.write_text("context\nmatch\n\ncontext\nmatch\n", encoding="utf-8")
         
         # Try to replace 'match' with 'replacement'
-        # With standard matching, it should find the FIRST occurrence
+        # With ambiguity detection, this should FAIL because context matches twice
         patch = """*** Begin Patch
 *** Update File: repeat.py
 @@
@@ -161,17 +165,40 @@ class TestComplexLogic:
 *** End Patch"""
         
         result = parse_res(patch_tool_rigorous(patch))
+        # New behavior: ambiguous matches are rejected
+        assert result["status"] == "error"
+        assert "ambiguous" in result["error"].lower() or "ambiguous" in result.get("hint", "").lower()
+    
+    def test_multiple_identical_contexts_with_scope(self, rigorous_env, patch_tool_rigorous):
+        """Test that scope can disambiguate identical contexts."""
+        workspace, _ = rigorous_env
+        file_path = workspace / "repeat_scope.py"
+        file_path.write_text("def func1():\n    context\n    match\n\ndef func2():\n    context\n    match\n", encoding="utf-8")
+        
+        # Use scope to target second function specifically
+        patch = """*** Begin Patch
+*** Update File: repeat_scope.py
+@@ def func2
+     context
+-    match
++    replacement
+*** End Patch"""
+        
+        result = parse_res(patch_tool_rigorous(patch))
         assert result["status"] == "ok"
         
         content = file_path.read_text(encoding="utf-8")
-        lines = content.splitlines()
-        # First match should be replaced
-        assert lines[1] == "replacement"
-        # Second match should remain
-        assert lines[4] == "match"
+        # Only second function should be modified
+        assert "def func1():\n    context\n    match" in content
+        assert "def func2():\n    context\n    replacement" in content
 
     def test_scope_ambiguity(self, rigorous_env, patch_tool_rigorous):
-        """Test scope finding when multiple scopes match."""
+        """Test that ambiguous scope signatures are correctly rejected.
+        
+        The new apply_patch implementation rejects ambiguous scope signatures
+        as a safety feature - if a scope line matches multiple locations,
+        the patch is rejected.
+        """
         workspace, _ = rigorous_env
         file_path = workspace / "ambiguous.py"
         # Two identical function definitions
@@ -191,11 +218,9 @@ def foo():
 *** End Patch"""
         
         result = parse_res(patch_tool_rigorous(patch))
-        # It should match the first 'def foo' and verify context 'return 1'
-        assert result["status"] == "ok"
-        content = file_path.read_text()
-        assert "return 99" in content
-        assert "return 2" in content
+        # New behavior: ambiguous scope is rejected
+        assert result["status"] == "error"
+        assert "ambiguous" in result["error"].lower() or "ambiguous" in result.get("hint", "").lower()
 
     def test_scope_mismatch_content(self, rigorous_env, patch_tool_rigorous):
         """Test finding correct scope but failing context match inside it."""
@@ -337,7 +362,12 @@ class TestMalformed:
         assert file_path.read_text() == "line1\nline2\nline3\n"
 
     def test_partial_match_vulnerability(self, rigorous_env, patch_tool_rigorous):
-        """Test if the matcher can be tricked by similar lines."""
+        """Test that ambiguous partial matches are correctly rejected.
+        
+        The new apply_patch implementation rejects patches where context
+        matches multiple locations as a safety feature. This prevents
+        accidental modifications to the wrong part of the file.
+        """
         workspace, _ = rigorous_env
         file_path = workspace / "similar.py"
         file_path.write_text("""
@@ -350,6 +380,7 @@ class TestMalformed:
         print("c")
 """, encoding="utf-8")
         
+        # This context matches in both functions - should be rejected as ambiguous
         patch = """*** Begin Patch
 *** Update File: similar.py
 @@
@@ -358,10 +389,38 @@ class TestMalformed:
 *** End Patch"""
         
         result = parse_res(patch_tool_rigorous(patch))
+        # New behavior: ambiguous context is rejected
+        assert result["status"] == "error"
+        assert "ambiguous" in result["error"].lower() or "ambiguous" in result.get("hint", "").lower()
+    
+    def test_partial_match_with_scope(self, rigorous_env, patch_tool_rigorous):
+        """Test that scope can disambiguate similar lines."""
+        workspace, _ = rigorous_env
+        file_path = workspace / "similar_scope.py"
+        file_path.write_text("""
+    def foo():
+        print("a")
+        print("b")
+
+    def bar():
+        print("a")
+        print("c")
+""", encoding="utf-8")
+        
+        # Use scope to target foo specifically
+        patch = """*** Begin Patch
+*** Update File: similar_scope.py
+@@ def foo
+-        print("a")
++        print("X")
+         print("b")
+*** End Patch"""
+        
+        result = parse_res(patch_tool_rigorous(patch))
         assert result["status"] == "ok"
         content = file_path.read_text()
-        assert 'def foo():\n        print("X")' in content
-        assert 'def bar():\n        print("a")' in content
+        assert 'def foo():\n        print("X")\n        print("b")' in content
+        assert 'def bar():\n        print("a")\n        print("c")' in content
 
     def test_eof_marker_ambiguity(self, rigorous_env, patch_tool_rigorous):
         """Test that EOF marker correctly picks the last match when multiple exist."""
