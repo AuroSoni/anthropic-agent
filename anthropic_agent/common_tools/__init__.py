@@ -93,6 +93,7 @@ from .apply_patch import ApplyPatchTool
 from .glob_file_search import GlobFileSearchTool
 from .grep_search import GrepSearchTool
 from .list_dir import ListDirTool
+from .code_execution_tool import CodeExecutionTool
 
 __all__ = [
     # Extension utilities
@@ -106,4 +107,5 @@ __all__ = [
     "GlobFileSearchTool",
     "GrepSearchTool",
     "ListDirTool",
+    "CodeExecutionTool",
 ]

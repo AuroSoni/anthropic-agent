@@ -2,10 +2,9 @@ from importlib.util import find_spec
 import logging
 from dataclasses import dataclass
 import ast
-from typing import Any
+from typing import Any, Callable
 from .base import truncate_content, BASE_BUILTIN_MODULES, InterpreterError, FinalAnswerException, PrintContainer, BASE_PYTHON_TOOLS, DEFAULT_MAX_LEN_OUTPUT
 from .ast_evaluator import evaluate_ast
-from ..tools import Tool
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +189,11 @@ class LocalPythonExecutor(PythonExecutor):
     def send_variables(self, variables: dict):
         self.state.update(variables)
         
-    def send_tools(self, tools: dict[str, Tool]):
+    def send_tools(self, tools: dict[str, Callable]):
+        """Send tools to the executor to make them available during code execution.
+        
+        Args:
+            tools: Dictionary mapping tool names to callable functions.
+        """
         # Combine agent tools, base Python tools, and additional Python functions
         self.static_tools = {**tools, **BASE_PYTHON_TOOLS.copy(), **self.additional_functions}

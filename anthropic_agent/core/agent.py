@@ -160,10 +160,12 @@ class AnthropicAgent:
         
         self.tool_registry: Optional[ToolRegistry] = None
         self.tool_schemas: list[dict[str, Any]] = []
+        self._tool_functions: list[Callable[..., Any]] = []  # Store for UUID injection
         if tools:
             self.tool_registry = ToolRegistry()
             self.tool_registry.register_tools(tools)
             self.tool_schemas = self.tool_registry.get_schemas()
+            self._tool_functions = list(tools)  # Keep reference for UUID injection
         
         # Frontend tools (executed in browser, schema-only on server)
         self.frontend_tool_schemas: list[dict[str, Any]] = []
@@ -183,6 +185,9 @@ class AnthropicAgent:
         # If agent_uuid provided, state will be loaded from DB via initialize() 
         # (called automatically in run() or explicitly by caller)
         self.agent_uuid = agent_uuid or str(uuid.uuid4())
+        
+        # Inject agent UUID into tools that need it (e.g., CodeExecutionTool)
+        self._inject_agent_uuid_to_tools()
         
         # db_config is empty at construction - state is loaded asynchronously via initialize()
         db_config: dict[str, Any] = {}
@@ -329,6 +334,29 @@ class AnthropicAgent:
         
         # Initialize the Anthropic async client for proper async streaming
         self.client = anthropic.AsyncAnthropic()
+    
+    def _inject_agent_uuid_to_tools(self) -> None:
+        """Inject agent UUID into tools that need it.
+        
+        This method iterates over registered tool functions and looks for tools
+        that have a __tool_instance__ attribute with a set_agent_uuid() method.
+        This duck-typed protocol allows tools like CodeExecutionTool to receive
+        the agent UUID for creating agent-scoped output files.
+        
+        Called automatically after agent_uuid is assigned in __init__.
+        """
+        for tool_func in self._tool_functions:
+            # Check for tool instance attached to the function
+            tool_instance = getattr(tool_func, '__tool_instance__', None)
+            if tool_instance is not None:
+                # Check if instance has set_agent_uuid method
+                set_uuid_method = getattr(tool_instance, 'set_agent_uuid', None)
+                if callable(set_uuid_method):
+                    try:
+                        set_uuid_method(self.agent_uuid)
+                        logger.debug(f"Injected agent_uuid into tool instance: {type(tool_instance).__name__}")
+                    except Exception as e:
+                        logger.warning(f"Failed to inject agent_uuid into tool: {e}")
     
     @property
     def is_initialized(self) -> bool:
