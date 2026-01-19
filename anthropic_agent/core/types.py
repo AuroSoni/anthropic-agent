@@ -1,46 +1,72 @@
-import json
+"""Provider-agnostic public types.
+
+The original implementation of this project was Anthropic-specific and used
+Anthropic SDK types directly (e.g., ``BetaMessage`` / ``BetaUsage``). In order
+to support multiple providers (OpenAI, Gemini, Grok, LiteLLM, ...), these
+dataclasses are intentionally provider-agnostic.
+
+Provider-specific agents may store the raw provider response object in
+:attr:`AgentResult.final_message`.
+"""
+
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Optional
-from anthropic.types.beta import BetaMessage, BetaUsage
+from typing import Any, Optional
+
 
 @dataclass
 class AgentResult:
-    """Result object returned from agent.run() containing the full agent execution context.
-    
+    """Result returned by an agent run.
+
     Attributes:
-        final_message: The last message from the assistant (BetaMessage object)
-        conversation_history: Full conversation history including all messages (uncompacted)
-        stop_reason: Why the model stopped generating ("end_turn", "tool_use", "max_tokens", etc.)
-        model: The model used for this execution
-        usage: Token usage statistics from the final message
-        container_id: Container ID for multi-turn conversations (if applicable)
-        total_steps: Number of agent steps taken (including tool use loops)
-        agent_logs: List of log entries tracking compactions and other agent actions
-        generated_files: List of metadata dicts for files generated during the run
+        final_message:
+            Provider-specific raw response object for the final model call.
+            (Example: Anthropic ``BetaMessage``, OpenAI ``ChatCompletion`` or
+            ``Response`` object.)
+
+        final_answer:
+            The extracted assistant text returned to the user (post tool calls).
+
+        conversation_history:
+            Canonical message history for the *current run* (not necessarily the
+            full persisted multi-run history). Messages are stored in a
+            provider-agnostic content-block format.
+
+        stop_reason:
+            Canonical stop reason string (e.g., "end_turn", "tool_use",
+            "max_tokens"). When the agent pauses for frontend tools, this is set
+            to "awaiting_frontend_tools".
+
+        model:
+            Model identifier used for the final model call.
+
+        usage:
+            Provider-agnostic usage dictionary. Common keys include:
+            - input_tokens
+            - output_tokens
+            Providers may include additional keys.
+
+        container_id:
+            Optional provider-specific container/session identifier.
+
+        total_steps:
+            Number of agent steps executed for this run.
+
+        agent_logs:
+            Additional structured logs captured during the run.
+
+        generated_files:
+            Optional list of generated file metadata captured during the run.
     """
-    final_message: BetaMessage
-    conversation_history: list[dict]
+
+    final_message: Any
+    final_answer: str
+    conversation_history: list[dict[str, Any]]
     stop_reason: str
     model: str
-    usage: BetaUsage
+    usage: dict[str, Any]
     container_id: Optional[str] = None
     total_steps: int = 1
-    agent_logs: Optional[list[dict]] = None
-    generated_files: Optional[list[dict]] = None
-    final_answer: str = ""
-
-    def __str__(self) -> str:
-        """Return a JSON-formatted representation with all fields."""
-        payload = {
-            "final_message": self.final_message,
-            "final_answer": self.final_answer,
-            "conversation_history": self.conversation_history,
-            "stop_reason": self.stop_reason,
-            "model": self.model,
-            "usage": self.usage,
-            "container_id": self.container_id,
-            "total_steps": self.total_steps,
-            "agent_logs": self.agent_logs,
-            "generated_files": self.generated_files,
-        }
-        return json.dumps(payload, indent=2, default=str)
+    agent_logs: Optional[list[dict[str, Any]]] = None
+    generated_files: Optional[list[dict[str, Any]]] = None
