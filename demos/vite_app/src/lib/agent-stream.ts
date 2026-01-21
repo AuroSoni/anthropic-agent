@@ -282,7 +282,8 @@ export async function streamToolResults(
   agentUuid: string,
   toolResults: FrontendToolResult[],
   callbacks: AgentStreamCallbacks,
-  existingState: AgentState
+  existingState: AgentState,
+  agentType?: AgentType
 ) {
   // Continue from existing state, but switch back to streaming
   let currentState: AgentState = {
@@ -364,6 +365,7 @@ export async function streamToolResults(
       body: JSON.stringify({
         agent_uuid: agentUuid,
         tool_results: toolResults,
+        agent_type: agentType,  // Pass agent type for correct config selection
       }),
 
       onopen: async (response) => {

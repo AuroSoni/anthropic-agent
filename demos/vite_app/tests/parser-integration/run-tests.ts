@@ -119,6 +119,7 @@ async function streamToolResultsContinuation(
   agentUuid: string,
   tools: PendingFrontendTool[],
   existingFormat: StreamFormat,
+  agentType?: string,
 ): Promise<{ nodes: AgentNode[]; chunkCount: number }> {
   // Create tool results (respond "yes" to all user_confirm tools)
   const toolResults = tools.map(tool => ({
@@ -133,6 +134,7 @@ async function streamToolResultsContinuation(
     body: JSON.stringify({
       agent_uuid: agentUuid,
       tool_results: toolResults,
+      agent_type: agentType,  // Pass agent type for correct config selection
     }),
   });
 
@@ -405,7 +407,7 @@ async function runTest(testCase: TestCase): Promise<TestResult> {
     console.log(`  [INFO] Found ${pendingTools.length} frontend tool(s), submitting results...`);
     
     try {
-      const continuation = await streamToolResultsContinuation(agentUuid, pendingTools, streamFormat);
+      const continuation = await streamToolResultsContinuation(agentUuid, pendingTools, streamFormat, testCase.agentType);
       chunkCount += continuation.chunkCount;
       allNodes = [...allNodes, ...continuation.nodes];
       console.log(`  [INFO] Continuation complete, +${continuation.chunkCount} chunks, +${continuation.nodes.length} nodes`);

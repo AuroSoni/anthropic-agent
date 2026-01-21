@@ -125,6 +125,7 @@ class AgentConfig(BaseModel):
     file_backend: Any = None
     db_backend: Any = None
     formatter: str = "raw"
+    stream_meta_history_and_tool_results: bool = False  # Include tool results in stream output
 
 
 # Agent type literal for request validation
@@ -172,6 +173,7 @@ class ToolResultsRequest(BaseModel):
     """Request to submit frontend tool results and resume agent execution."""
     agent_uuid: str
     tool_results: list[FrontendToolResult]
+    agent_type: Optional[AgentType] = None  # Original agent type for correct config (defaults to agent_frontend_tools)
 
 
 class ConversationItem(BaseModel):
@@ -466,8 +468,9 @@ async def stream_tool_results_response(
     """
     try:
         # Re-hydrate agent from DB (state is loaded automatically via agent_uuid)
-        # Use agent_frontend_tools config since we know this agent has frontend tools
-        config = AGENT_CONFIGS["agent_frontend_tools"]
+        # Use the specified agent_type config, defaulting to agent_frontend_tools
+        agent_type = request.agent_type or "agent_frontend_tools"
+        config = AGENT_CONFIGS.get(agent_type, AGENT_CONFIGS["agent_frontend_tools"])
         
         agent = AnthropicAgent(
             **config.model_dump(exclude_none=True),
