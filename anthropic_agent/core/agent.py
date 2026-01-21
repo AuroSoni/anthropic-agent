@@ -1102,6 +1102,10 @@ class AnthropicAgent:
             ValueError: If agent is not awaiting frontend tools, or if tool_use_ids
                 don't match the pending frontend tools
         """
+        # Ensure agent is initialized (loads state from DB if needed)
+        if not self._initialized:
+            await self.initialize()
+        
         if not self._awaiting_frontend_tools:
             raise ValueError("Agent is not awaiting frontend tools")
         

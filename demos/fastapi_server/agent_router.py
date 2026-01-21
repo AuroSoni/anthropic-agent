@@ -223,6 +223,7 @@ agent_no_tools = AgentConfig(
     file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
     db_backend=SQLBackend(connection_string=os.getenv("DATABASE_URL")),
     formatter="raw",
+    stream_meta_history_and_tool_results=True,
 )
 
 agent_client_tools = AgentConfig(
@@ -234,6 +235,7 @@ agent_client_tools = AgentConfig(
     file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
     db_backend=SQLBackend(connection_string=os.getenv("DATABASE_URL")),
     formatter="raw",
+    stream_meta_history_and_tool_results=True,
 )
 
 agent_all_raw = AgentConfig(
@@ -284,6 +286,7 @@ agent_all_raw = AgentConfig(
     file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
     db_backend=SQLBackend(connection_string=os.getenv("DATABASE_URL")),
     formatter="raw",
+    stream_meta_history_and_tool_results=True,
 )
 
 agent_all_xml = AgentConfig(
@@ -334,6 +337,7 @@ agent_all_xml = AgentConfig(
     file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
     db_backend=SQLBackend(connection_string=os.getenv("DATABASE_URL")),
     formatter="xml",
+    stream_meta_history_and_tool_results=True,
 )
 
 # Agent with frontend tools (for browser-executed tools like user_confirm)
@@ -349,6 +353,7 @@ any action that could have consequences, ask for user confirmation using the use
     file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
     db_backend=SQLBackend(connection_string=os.getenv("DATABASE_URL")),
     formatter="xml",  # XML formatter for proper tag streaming
+    stream_meta_history_and_tool_results=True,
 )
 
 # Agent with frontend tools - RAW format (for testing parser compatibility)
@@ -364,6 +369,7 @@ any action that could have consequences, ask for user confirmation using the use
     file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
     db_backend=SQLBackend(connection_string=os.getenv("DATABASE_URL")),
     formatter="raw",  # Raw JSON format for testing
+    stream_meta_history_and_tool_results=True,
 )
 
 # Agent config registry
@@ -467,9 +473,6 @@ async def stream_tool_results_response(
             **config.model_dump(exclude_none=True),
             agent_uuid=request.agent_uuid,
         )
-        
-        # Load agent state from DB (required for continue_with_tool_results)
-        await agent.initialize()
         
         # Create queue for streaming
         queue: asyncio.Queue[str | None] = asyncio.Queue()
