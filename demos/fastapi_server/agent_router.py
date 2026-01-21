@@ -468,6 +468,9 @@ async def stream_tool_results_response(
             agent_uuid=request.agent_uuid,
         )
         
+        # Load agent state from DB (required for continue_with_tool_results)
+        await agent.initialize()
+        
         # Create queue for streaming
         queue: asyncio.Queue[str | None] = asyncio.Queue()
         

@@ -96,6 +96,7 @@ export async function streamAgent(
   
   // Parser selection: will be determined from meta_init
   let parser: StreamParser | null = null;
+  let xmlFallbackParser: XmlStreamParser | null = null; // For XML chunks in raw mode (e.g., awaiting_frontend_tools)
   let streamFormat: StreamFormat | null = null;
   let metaInitProcessed = false;
 
@@ -110,15 +111,22 @@ export async function streamAgent(
 
     // Process content based on format
     if (streamFormat === 'raw') {
-      // Raw format: content is JSON-encoded Anthropic events
-      // Backend escapes backslashes for SSE transport, so unescape before parsing
-      const unescaped = content.replace(/\\\\/g, '\\');
-      try {
-        const anthropicEvent = JSON.parse(unescaped) as AnthropicEvent;
-        (parser as AnthropicStreamParser).processEvent(anthropicEvent);
-      } catch (e) {
-        // Not valid JSON - might be an error message or other text
-        console.warn('Failed to parse Anthropic event JSON:', unescaped.slice(0, 100), e);
+      const trimmed = content.trim();
+      
+      // Check for XML content injected by backend (e.g., <awaiting_frontend_tools>)
+      if (trimmed.startsWith('<')) {
+        xmlFallbackParser?.appendChunk(content);
+      } else {
+        // Raw format: content is JSON-encoded Anthropic events
+        // Backend escapes backslashes for SSE transport, so unescape before parsing
+        const unescaped = content.replace(/\\\\/g, '\\');
+        try {
+          const anthropicEvent = JSON.parse(unescaped) as AnthropicEvent;
+          (parser as AnthropicStreamParser).processEvent(anthropicEvent);
+        } catch (e) {
+          // Not valid JSON - might be an error message or other text
+          console.warn('Failed to parse Anthropic event JSON:', unescaped.slice(0, 100), e);
+        }
       }
     } else {
       // XML format: content is plain XML text (unescaping happens in normalizeNodes)
@@ -126,7 +134,10 @@ export async function streamAgent(
     }
     
     // Update nodes from parser state (aggressive real-time updates)
-    currentState.nodes = parser.getNodes();
+    // Merge main parser nodes with XML fallback nodes for raw mode
+    const mainNodes = parser.getNodes();
+    const xmlNodes = xmlFallbackParser?.getNodes() || [];
+    currentState.nodes = [...mainNodes, ...xmlNodes];
     
     // Check for awaiting_frontend_tools tag (frontend tool relay)
     const awaitingNode = currentState.nodes.find(
@@ -198,6 +209,7 @@ export async function streamAgent(
             // Initialize parser based on format
             if (streamFormat === 'raw') {
               parser = new AnthropicStreamParser();
+              xmlFallbackParser = new XmlStreamParser(); // For XML chunks in raw mode
             } else {
               parser = new XmlStreamParser();
             }
@@ -220,6 +232,7 @@ export async function streamAgent(
           // If it starts with '{', assume raw JSON; otherwise XML
           if (dataStr.trim().startsWith('{')) {
             parser = new AnthropicStreamParser();
+            xmlFallbackParser = new XmlStreamParser(); // For XML chunks in raw mode
             streamFormat = 'raw';
           } else {
             parser = new XmlStreamParser();
@@ -282,10 +295,12 @@ export async function streamToolResults(
   
   // Parser for continuation stream - reuse format from existing state
   let parser: StreamParser | null = null;
+  let xmlFallbackParser: XmlStreamParser | null = null; // For XML chunks in raw mode
   const streamFormat = existingState.streamFormat || 'xml';
   
   if (streamFormat === 'raw') {
     parser = new AnthropicStreamParser();
+    xmlFallbackParser = new XmlStreamParser(); // For XML chunks in raw mode
   } else {
     parser = new XmlStreamParser();
   }
@@ -299,24 +314,34 @@ export async function streamToolResults(
     currentState.rawContent += content;
 
     if (streamFormat === 'raw') {
-      const unescaped = content.replace(/\\\\/g, '\\');
-      try {
-        const anthropicEvent = JSON.parse(unescaped) as AnthropicEvent;
-        (parser as AnthropicStreamParser).processEvent(anthropicEvent);
-      } catch (e) {
-        console.warn('Failed to parse Anthropic event JSON:', unescaped.slice(0, 100), e);
+      const trimmed = content.trim();
+      
+      // Check for XML content injected by backend (e.g., <awaiting_frontend_tools>)
+      if (trimmed.startsWith('<')) {
+        xmlFallbackParser?.appendChunk(content);
+      } else {
+        const unescaped = content.replace(/\\\\/g, '\\');
+        try {
+          const anthropicEvent = JSON.parse(unescaped) as AnthropicEvent;
+          (parser as AnthropicStreamParser).processEvent(anthropicEvent);
+        } catch (e) {
+          console.warn('Failed to parse Anthropic event JSON:', unescaped.slice(0, 100), e);
+        }
       }
     } else {
       (parser as XmlStreamParser).appendChunk(content);
     }
     
     // Merge new nodes with existing nodes
-    const newNodes = parser.getNodes();
+    // Include XML fallback nodes for raw mode
+    const mainNodes = parser.getNodes();
+    const xmlNodes = xmlFallbackParser?.getNodes() || [];
+    const newNodes = [...mainNodes, ...xmlNodes];
     currentState.nodes = [...existingState.nodes, ...newNodes];
     
     // Check for another awaiting_frontend_tools (nested tool calls)
     const awaitingNode = newNodes.find(
-      n => n.type === 'element' && n.tagName === 'awaiting_frontend_tools'
+      (n: AgentNode) => n.type === 'element' && n.tagName === 'awaiting_frontend_tools'
     );
     if (awaitingNode?.attributes?.data) {
       try {
