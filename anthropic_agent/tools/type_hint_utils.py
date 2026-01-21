@@ -58,7 +58,7 @@ _BASE_TYPE_MAPPING = {
     bool: {"type": "boolean"},
     list: {"type": "array"},
     dict: {"type": "object"},
-    Any: {"type": "any"},
+    Any: {},  # Empty schema = unconstrained/any value (JSON Schema 2020-12 compliant)
     types.NoneType: {"type": "null"},
 }
 
@@ -73,14 +73,23 @@ def _parse_union_type(args: tuple[Any, ...]) -> dict:
     if len(subtypes) == 1:
         # A single non-null type can be expressed directly
         return_dict = subtypes[0]
-    elif all(isinstance(subtype["type"], str) for subtype in subtypes):
+    elif all(isinstance(subtype.get("type"), str) for subtype in subtypes):
         # A union of basic types can be expressed as a list in the schema
         return_dict = {"type": sorted([subtype["type"] for subtype in subtypes])}
     else:
         # A union of more complex types requires "anyOf"
         return_dict = {"anyOf": subtypes}
+    
+    # Handle nullable types by adding "null" to the type (JSON Schema 2020-12 compliant)
+    # Note: "nullable" is an OpenAPI keyword, not valid in JSON Schema
     if type(None) in args:
-        return_dict["nullable"] = True
+        if "type" in return_dict and isinstance(return_dict["type"], list):
+            if "null" not in return_dict["type"]:
+                return_dict["type"].append("null")
+        elif "type" in return_dict:
+            return_dict["type"] = [return_dict["type"], "null"]
+        elif "anyOf" in return_dict:
+            return_dict["anyOf"].append({"type": "null"})
     return return_dict
 
 def _get_json_schema_type(param_type: type) -> dict[str, str]:
@@ -152,9 +161,9 @@ def _parse_type_hint(hint: type) -> dict:
 
     elif origin is Literal:
         literal_types = set(type(arg) for arg in args)
-        final_type = _parse_union_type(literal_types)
+        final_type = _parse_union_type(tuple(literal_types))
 
-        # None literal value is represented by 'nullable' field set by _parse_union_type
+        # None literal value is handled by _parse_union_type adding "null" to the type
         final_type.update({"enum": [arg for arg in args if arg is not None]})
         return final_type
 
@@ -231,18 +240,21 @@ def _convert_type_hints_to_json_schema(func: callable, error_on_missing_type_hin
         if param_name not in properties:
             properties[param_name] = {}
 
+        # Parameters without defaults are required
+        # Note: Having a default value does NOT mean nullable - it just means optional
+        # The "nullable" keyword is OpenAPI, not valid in JSON Schema 2020-12
         if param.default == inspect.Parameter.empty:
             required.append(param_name)
-        else:
-            properties[param_name]["nullable"] = True
 
-    # Return: multi‐type union -> treat as Any
+    # Return: multi‐type union -> treat as unconstrained (empty schema)
+    # Note: "any" is not a valid JSON Schema type - use empty schema instead
     if (
         "return" in properties
         and (return_type := properties["return"].get("type"))
         and not isinstance(return_type, str)
     ):
-        properties["return"]["type"] = "any"
+        # Replace with empty schema (accepts any value)
+        properties["return"] = {}
 
     schema = {"type": "object", "properties": properties}
     if required:
