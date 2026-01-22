@@ -336,7 +336,7 @@ class SlidingWindowCompactor:
     This is the recommended default compactor for production use. It applies
     increasingly aggressive compaction strategies in order:
     
-    1. Remove thinking blocks (extended thinking can be very large)
+    1. Remove thinking blocks from older assistant messages (keeps last one)
     2. Truncate long tool results to max_result_chars
     3. Replace old tool results with placeholders  
     4. Remove entire old assistant/user turn pairs (keeping recent N turns)
@@ -347,6 +347,15 @@ class SlidingWindowCompactor:
     Always preserves:
     - First user message (original intent)
     - Most recent messages (configurable via keep_recent_turns)
+    - Thinking block on the LAST assistant message (required by Anthropic API)
+    
+    Note on thinking blocks:
+        When extended thinking is enabled, the Anthropic API requires the final
+        assistant message to start with a thinking block. Older thinking blocks
+        can be safely removed - the API automatically ignores them and doesn't
+        count them toward context usage. This compactor removes thinking blocks
+        from all assistant messages EXCEPT the last one, which is both safe and
+        more token-efficient.
     """
     
     PLACEHOLDER_TEXT = "[Content removed during compaction]"
@@ -366,11 +375,15 @@ class SlidingWindowCompactor:
                 uses model-specific defaults from MODEL_TOKEN_LIMITS.
             keep_recent_turns: Minimum number of recent turn pairs to preserve.
                 A "turn" is an assistant message + its tool results (if any).
+                Used for tool result truncation/replacement and turn removal phases.
             max_result_chars: Maximum characters to keep in tool results during
                 truncation phase. Results longer than this are truncated.
-            remove_thinking: Whether to remove thinking blocks from OLD assistant
-                messages. Recent messages (based on keep_recent_turns) retain their
-                thinking blocks. Recommended True as thinking can be very large.
+            remove_thinking: Whether to remove thinking blocks from older assistant
+                messages. When True (recommended), removes thinking blocks from all
+                assistant messages EXCEPT the last one. The last assistant message
+                always retains its thinking block as required by the Anthropic API
+                when extended thinking is enabled with tool use. Older thinking
+                blocks are safely removed - the API ignores them automatically.
         """
         self.threshold = threshold
         self.keep_recent_turns = keep_recent_turns
@@ -498,10 +511,25 @@ class SlidingWindowCompactor:
         return compacted, metadata
     
     def _remove_thinking_blocks(self, messages: list[dict]) -> tuple[list[dict], int]:
-        """Remove thinking blocks from old assistant messages.
+        """Remove thinking blocks from all assistant messages EXCEPT the last one.
         
-        Preserves thinking blocks in the most recent assistant messages
-        (based on keep_recent_turns), only removing from older messages.
+        When extended thinking is enabled in the Anthropic API, the LAST assistant
+        message in the conversation history must retain its thinking block. This is
+        required by the API when using tools with extended thinking - the final
+        assistant turn must start with a thinking block.
+        
+        However, older thinking blocks can be safely removed. Per Anthropic's
+        documentation:
+        - "It is only strictly necessary to send back thinking blocks when using
+          tools with extended thinking"
+        - "You must include the complete unmodified block back to the API for
+          the last assistant turn"
+        - "The API automatically ignores thinking blocks from previous turns and
+          they are not included when calculating context usage"
+        
+        This method removes thinking blocks from all assistant messages except the
+        very last one, which is both safe and more token-efficient than preserving
+        thinking in the last N messages.
         
         Args:
             messages: List of message dictionaries
@@ -517,8 +545,16 @@ class SlidingWindowCompactor:
             if msg.get("role") == "assistant"
         ]
         
-        # Keep thinking in the most recent N assistant messages
-        indices_to_process = assistant_indices[:-self.keep_recent_turns] if len(assistant_indices) > self.keep_recent_turns else []
+        # Nothing to do if no assistant messages
+        if not assistant_indices:
+            return messages, 0
+        
+        # CRITICAL: Always preserve thinking block on the LAST assistant message.
+        # The Anthropic API requires the final assistant turn to start with a
+        # thinking block when extended thinking is enabled with tool use.
+        # Older thinking blocks can be safely removed.
+        last_assistant_idx = assistant_indices[-1]
+        indices_to_process = [i for i in assistant_indices if i != last_assistant_idx]
         
         for i in indices_to_process:
             msg = messages[i]
@@ -534,7 +570,9 @@ class SlidingWindowCompactor:
                 else:
                     new_content.append(block)
             
-            msg["content"] = new_content
+            # Only update if we actually removed something
+            if len(new_content) < len(content):
+                msg["content"] = new_content
         
         return messages, removed_count
     
@@ -704,9 +742,12 @@ def get_default_compactor(threshold: int | None = None) -> Compactor:
     
     This returns a SlidingWindowCompactor with sensible defaults:
     - Uses model-specific token thresholds (or provided threshold)
-    - Keeps 10 recent turns
+    - Keeps 10 recent turns for tool results and turn removal
     - Truncates tool results > 2000 chars
-    - Removes thinking blocks
+    - Removes thinking blocks from older messages (preserves last assistant's)
+    
+    Note: Thinking blocks are removed from all assistant messages except the last
+    one, which is required by the Anthropic API when extended thinking is enabled.
     
     Args:
         threshold: Optional override for token threshold. If None, uses
