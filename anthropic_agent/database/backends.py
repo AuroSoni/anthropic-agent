@@ -654,6 +654,7 @@ class SQLBackend:
         """
         pool = await self._get_pool()
         
+        #TODO: To be updated to include provider_type and provider_config.
         query = """
             SELECT 
                 agent_uuid, system_prompt, model, max_steps, thinking_tokens,

@@ -89,27 +89,25 @@ class AnthropicAgent(BaseAgent):
         file_backend: Any = None,
         **api_kwargs: Any,
     ):
-        # Preserve original default beta headers unless explicitly provided.
-        if beta_headers is None:
-            beta_headers = list(self.DEFAULT_BETA_HEADERS)
+        # Anthropic-specific instance variables (set BEFORE super().__init__)
+        self.thinking_tokens = thinking_tokens if thinking_tokens is not None else self.DEFAULT_THINKING_TOKENS
+        self.beta_headers = beta_headers if beta_headers is not None else list(self.DEFAULT_BETA_HEADERS)
+        self.container_id = container_id
+        self.enable_cache_control = enable_cache_control if enable_cache_control is not None else True
 
         super().__init__(
             system_prompt=system_prompt,
             model=model,
             max_steps=max_steps,
-            thinking_tokens=thinking_tokens,
             max_tokens=max_tokens,
             stream_meta_history_and_tool_results=stream_meta_history_and_tool_results,
             tools=tools,
             frontend_tools=frontend_tools,
             server_tools=server_tools,
-            beta_headers=beta_headers,
-            container_id=container_id,
             messages=messages,
             max_retries=max_retries,
             base_delay=base_delay,
             formatter=formatter,  # type: ignore[arg-type]
-            enable_cache_control=enable_cache_control,
             compactor=compactor,
             memory_store=memory_store,
             final_answer_check=final_answer_check,
@@ -131,6 +129,47 @@ class AnthropicAgent(BaseAgent):
         """Anthropic Files API requires a beta header."""
         if self.file_backend and "files-api-2025-04-14" not in self.beta_headers:
             self.beta_headers.append("files-api-2025-04-14")
+
+    def _get_provider_type(self) -> str:
+        return "anthropic"
+
+    def _get_provider_specific_config(self) -> dict[str, Any]:
+        return {
+            "thinking_tokens": self.thinking_tokens,
+            "beta_headers": self.beta_headers,
+            "container_id": self.container_id,
+            "enable_cache_control": self.enable_cache_control,
+        }
+
+    def _restore_provider_specific_state(
+        self,
+        provider_config: dict[str, Any],
+        full_config: dict[str, Any],
+    ) -> None:
+        """Restore Anthropic-specific state with backward compatibility for v1 format."""
+        # Try v2 format first, fall back to v1 (top-level) if not found
+        self.thinking_tokens = provider_config.get(
+            "thinking_tokens",
+            full_config.get("thinking_tokens", self.thinking_tokens),
+        )
+        self.beta_headers = provider_config.get(
+            "beta_headers",
+            full_config.get("beta_headers", self.beta_headers),
+        )
+        self.container_id = provider_config.get(
+            "container_id",
+            full_config.get("container_id", self.container_id),
+        )
+        self.enable_cache_control = provider_config.get(
+            "enable_cache_control",
+            full_config.get("enable_cache_control", self.enable_cache_control),
+        )
+
+    def _get_provider_specific_usage_fields(self, usage: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
+            "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
+        }
 
     async def _stream_llm_response(
         self,

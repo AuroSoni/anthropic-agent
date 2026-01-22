@@ -15,20 +15,15 @@ CREATE TABLE agent_config (
     system_prompt TEXT NOT NULL,
     model VARCHAR(100) NOT NULL,
     max_steps INTEGER DEFAULT 50,
-    thinking_tokens INTEGER DEFAULT 0,
     max_tokens INTEGER DEFAULT 2048,
     
     -- State for resumption
-    container_id VARCHAR(255),  -- Anthropic container for code execution
     messages JSONB,  -- Current compacted messages state
     
     -- Tools configuration
     tool_schemas JSONB,  -- Client-side tool schemas [{name, description, input_schema}]
     tool_names TEXT[],  -- Quick reference list of tool names
-    server_tools JSONB,  -- Anthropic server tools (code_execution, web_search, etc.)
-    
-    -- Beta features
-    beta_headers TEXT[],  -- e.g., ["code-execution-2025-08-25"]
+    server_tools JSONB,  -- Server tools (code_execution, web_search, etc.)
     
     -- API configuration
     api_kwargs JSONB,  -- Pass-through API params (temperature, top_p, stop_sequences, etc.)
@@ -64,6 +59,10 @@ CREATE TABLE agent_config (
     -- UI metadata
     title VARCHAR(255),  -- Auto-generated conversation title
     
+    -- Provider configuration (multi-provider support)
+    provider_type VARCHAR(50) DEFAULT 'anthropic',  -- e.g., "anthropic", "openai", "gemini"
+    provider_config JSONB DEFAULT '{}',  -- Provider-specific config (thinking_tokens, beta_headers, etc.)
+    
     -- Metadata
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW(),
@@ -74,6 +73,7 @@ CREATE TABLE agent_config (
 -- Indexes
 CREATE INDEX idx_agent_config_updated ON agent_config(updated_at DESC);
 CREATE INDEX idx_agent_config_last_run ON agent_config(last_run_at DESC);
+CREATE INDEX idx_agent_config_provider ON agent_config(provider_type);
 ```
 
 ### Document Schema (Filesystem/JSON)
@@ -86,11 +86,9 @@ CREATE INDEX idx_agent_config_last_run ON agent_config(last_run_at DESC);
   "system_prompt": "You are a helpful assistant...",
   "model": "claude-sonnet-4-5",
   "max_steps": 50,
-  "thinking_tokens": 0,
   "max_tokens": 2048,
   
   # State for resumption
-  "container_id": "container_xyz789",
   "messages": [
     {"role": "user", "content": "..."},
     {"role": "assistant", "content": "..."},
@@ -107,11 +105,8 @@ CREATE INDEX idx_agent_config_last_run ON agent_config(last_run_at DESC);
   ],
   "tool_names": ["web_search", "calculator"],
   "server_tools": [
-    {"type": "code_execution_20250825"}  # Anthropic server tools
+    {"type": "code_execution_20250825"}  # Server tools
   ],
-  
-  # Beta features
-  "beta_headers": ["code-execution-2025-08-25"],
   
   # API configuration
   "api_kwargs": {
@@ -165,6 +160,18 @@ CREATE INDEX idx_agent_config_last_run ON agent_config(last_run_at DESC);
   
   # UI metadata
   "title": "Python Function for List Sorting",  # Auto-generated conversation title (nullable)
+  
+  # Provider configuration (multi-provider support)
+  "provider_type": "anthropic",  # e.g., "anthropic", "openai", "gemini"
+  "provider_config": {
+    # Anthropic-specific config
+    "thinking_tokens": 4096,
+    "beta_headers": ["prompt-caching-2024-07-31", "code-execution-2025-08-25"],
+    "container_id": "container_xyz789",
+    "enable_cache_control": true
+    # OpenAI would have: "reasoning_effort": "medium"
+    # Gemini would have: ...
+  },
   
   # Metadata
   "created_at": "2025-11-25T10:00:00Z",
@@ -660,6 +667,33 @@ FROM agent_runs
 WHERE action_type = 'error'
 ORDER BY timestamp DESC
 LIMIT 50;
+```
+
+### Pattern 6: Filter agents by provider
+```sql
+SELECT * FROM agent_config WHERE provider_type = 'openai';
+```
+```python
+# Filesystem
+configs = [
+    load_json(f) for f in glob("data/agent_config/*.json")
+    if load_json(f).get("provider_type") == "openai"
+]
+```
+
+### Pattern 7: Find Anthropic agents with extended thinking enabled
+```sql
+SELECT * FROM agent_config 
+WHERE provider_type = 'anthropic' 
+AND (provider_config->>'thinking_tokens')::int > 0;
+```
+```python
+# Filesystem
+configs = [
+    load_json(f) for f in glob("data/agent_config/*.json")
+    if load_json(f).get("provider_type") == "anthropic"
+    and load_json(f).get("provider_config", {}).get("thinking_tokens", 0) > 0
+]
 ```
 
 ---

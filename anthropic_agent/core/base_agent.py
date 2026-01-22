@@ -68,7 +68,6 @@ DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant that should help the user w
 DEFAULT_MODEL = ""
 
 DEFAULT_MAX_STEPS = 50
-DEFAULT_THINKING_TOKENS = 0
 DEFAULT_MAX_TOKENS = 2048
 DEFAULT_STREAM_META = False
 DEFAULT_FORMATTER: FormatterType = "xml"
@@ -174,7 +173,6 @@ class BaseAgent(ABC):
     DEFAULT_SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
     DEFAULT_MODEL = DEFAULT_MODEL
     DEFAULT_MAX_STEPS = DEFAULT_MAX_STEPS
-    DEFAULT_THINKING_TOKENS = DEFAULT_THINKING_TOKENS
     DEFAULT_MAX_TOKENS = DEFAULT_MAX_TOKENS
     DEFAULT_STREAM_META = DEFAULT_STREAM_META
     DEFAULT_FORMATTER = DEFAULT_FORMATTER
@@ -186,19 +184,15 @@ class BaseAgent(ABC):
         system_prompt: Optional[str] = None,
         model: Optional[str] = None,
         max_steps: Optional[int] = None,
-        thinking_tokens: Optional[int] = None,
-        max_tokens: Optional[int] = None,
+        max_tokens: Optional[int] = None,   # To be removed. Can be provider specific.
         stream_meta_history_and_tool_results: Optional[bool] = None,
         tools: list[Callable[..., Any]] | None = None,
         frontend_tools: list[Callable[..., Any]] | None = None,
-        server_tools: list[dict[str, Any]] | None = None,
-        beta_headers: list[str] | None = None,
-        container_id: str | None = None,
-        messages: list[dict] | None = None,
+        server_tools: list[dict[str, Any]] | None = None,   # To be removed. It is provider specific.
+        messages: list[dict] | None = None, # Generic message list.
         max_retries: Optional[int] = None,
         base_delay: Optional[float] = None,
         formatter: FormatterType | None = None,
-        enable_cache_control: Optional[bool] = None,
         compactor: CompactorType | Compactor | None = None,
         memory_store: MemoryStoreType | MemoryStore | None = None,
         final_answer_check: Optional[Callable[[str], tuple[bool, str]]] = None,
@@ -208,11 +202,14 @@ class BaseAgent(ABC):
         title_generator: Optional[Callable[[str], Awaitable[str]]] = None,
         **api_kwargs: Any,
     ):
+        # ------------------------------------------------------------------
+        # Items to take from the constructor or set a default value.
+        # ------------------------------------------------------------------
+
         # Core config
         self.system_prompt = system_prompt if system_prompt is not None else self.DEFAULT_SYSTEM_PROMPT
         self.model = model if model is not None else self.DEFAULT_MODEL
         self.max_steps = max_steps if max_steps is not None else self.DEFAULT_MAX_STEPS
-        self.thinking_tokens = thinking_tokens if thinking_tokens is not None else self.DEFAULT_THINKING_TOKENS
         self.max_tokens = max_tokens if max_tokens is not None else self.DEFAULT_MAX_TOKENS
         self.stream_meta_history_and_tool_results = (
             stream_meta_history_and_tool_results
@@ -224,10 +221,7 @@ class BaseAgent(ABC):
         self.base_delay = base_delay if base_delay is not None else self.DEFAULT_BASE_DELAY
 
         # Provider/adapter knobs (kept generic; subclasses may interpret)
-        self.enable_cache_control = enable_cache_control if enable_cache_control is not None else True
         self.server_tools = server_tools or []
-        self.beta_headers = beta_headers or []
-        self.container_id = container_id
         self.api_kwargs = api_kwargs or {}
 
         # Session identity
@@ -249,6 +243,14 @@ class BaseAgent(ABC):
 
         if self.file_backend is not None:
             self._on_file_backend_configured()
+
+        # ------------------------------------------------------------------
+        # - Constructing the consolidated tool schema.
+        # - Initializing the tool registry and injecting agent_uuid into tools that accept it.
+        # - Initializing agent context modulators (memory store, compactor).
+        # - Initializing the final answer check callback.
+        # - Initializing the title generator callback.
+        # ------------------------------------------------------------------
 
         # Tools
         self.tool_registry: ToolRegistry | None = None
@@ -297,6 +299,10 @@ class BaseAgent(ABC):
         # Optional title generator callback (provider-agnostic)
         self._title_generator = title_generator
 
+        # ------------------------------------------------------------------
+        # Runtime state
+        # ------------------------------------------------------------------
+
         # Runtime state
         self._initialized = False
 
@@ -344,6 +350,31 @@ class BaseAgent(ABC):
         """Optional hook for provider-specific file processing at end of run."""
         return
 
+    def _get_provider_type(self) -> str:
+        """Return provider identifier for DB storage. Override in subclasses."""
+        return "base"
+
+    def _get_provider_specific_config(self) -> dict[str, Any]:
+        """Return provider-specific fields to persist. Override in subclasses."""
+        return {}
+
+    def _restore_provider_specific_state(
+        self,
+        provider_config: dict[str, Any],
+        full_config: dict[str, Any],
+    ) -> None:
+        """Restore provider-specific state from config. Override in subclasses.
+
+        Args:
+            provider_config: The nested provider_config dict (v2 format)
+            full_config: The full config dict (for v1 backward compatibility fallback)
+        """
+        pass
+
+    def _get_provider_specific_usage_fields(self, usage: dict[str, Any]) -> dict[str, Any]:
+        """Extract provider-specific token usage fields. Override in subclasses."""
+        return {}
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -385,9 +416,17 @@ class BaseAgent(ABC):
         formatter: Optional[FormatterType] = None,
     ) -> AgentResult:
         """Run the agent on a new user prompt."""
+        
+        # ------------------------------------------------------------------
+        # Load agent state from DB backend if the uuid exists.
+        # ------------------------------------------------------------------
+
         if not self._initialized:
             await self.initialize()
 
+        # ------------------------------------------------------------------
+        # Initialize run state variables.
+        # ------------------------------------------------------------------
         effective_formatter: FormatterType = formatter if formatter is not None else self.formatter
 
         # Fresh per-run state
@@ -458,13 +497,6 @@ class BaseAgent(ABC):
             messages=self.messages,
             system=self.system_prompt,
             tools=combined_tools or None,
-            thinking=(
-                {"type": "enabled", "budget_tokens": self.thinking_tokens}
-                if self.thinking_tokens and self.thinking_tokens > 0
-                else None
-            ),
-            betas=self.beta_headers or None,
-            container=self.container_id,
         )
 
         return await self._run_loop(start_step=0, queue=queue, formatter=effective_formatter)
@@ -1033,9 +1065,6 @@ class BaseAgent(ABC):
         messages: Optional[list[dict[str, Any]]] = None,
         system: Optional[str] = None,
         tools: Optional[list[dict[str, Any]]] = None,
-        thinking: Optional[dict[str, Any]] = None,  # kept for signature compatibility
-        betas: Optional[list[str]] = None,  # kept for signature compatibility
-        container: Optional[str] = None,  # kept for signature compatibility
     ) -> int:
         """Cheap heuristic token estimator (character-count based)."""
         text_parts: list[str] = []
@@ -1168,15 +1197,15 @@ class BaseAgent(ABC):
             # Fallback: keep heuristic estimate, but don't regress
             pass
 
-        self._token_usage_history.append(
-            {
-                "step": step,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
-                "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
-            }
-        )
+        usage_entry: dict[str, Any] = {
+            "step": step,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        }
+        # Add provider-specific fields via hook
+        usage_entry.update(self._get_provider_specific_usage_fields(usage))
+
+        self._token_usage_history.append(usage_entry)
 
     @retry_with_backoff(max_retries=3, base_delay=1.0)
     async def _save_agent_config(self) -> None:
@@ -1188,13 +1217,10 @@ class BaseAgent(ABC):
             "system_prompt": self.system_prompt,
             "model": self.model,
             "max_steps": self.max_steps,
-            "thinking_tokens": self.thinking_tokens,
             "max_tokens": self.max_tokens,
-            "container_id": self.container_id,
             "messages": self.messages,
             "tool_schemas": self.tool_schemas,
             "tool_names": [t.get("name") for t in self.tool_schemas] if self.tool_schemas else [],
-            "beta_headers": self.beta_headers,
             "server_tools": self.server_tools,
             "formatter": self.formatter,
             "stream_meta_history_and_tool_results": self.stream_meta_history_and_tool_results,
@@ -1217,6 +1243,10 @@ class BaseAgent(ABC):
             "updated_at": datetime.now(),
             "last_run_at": getattr(self, "_run_start_time", None),
             "total_runs": existing_config.get("total_runs", 0) + 1,
+            # Provider identification (top-level for easy querying)
+            "provider_type": self._get_provider_type(),
+            # Provider-specific config (nested)
+            "provider_config": self._get_provider_specific_config(),
         }
 
         if self.compactor:
@@ -1396,7 +1426,6 @@ class BaseAgent(ABC):
     def _restore_state_from_config(self, config: dict[str, Any]) -> None:
         # Core resumable state
         self.messages = config.get("messages", self.messages)
-        self.container_id = config.get("container_id", self.container_id)
         self.file_registry = config.get("file_registry", self.file_registry)
         self._last_known_input_tokens = config.get("last_known_input_tokens", self._last_known_input_tokens)
         self._last_known_output_tokens = config.get("last_known_output_tokens", self._last_known_output_tokens)
@@ -1416,6 +1445,10 @@ class BaseAgent(ABC):
             self._loaded_conversation_history = config.get("conversation_history", [])
         else:
             self._loaded_conversation_history = []
+
+        # Provider-specific restoration via hook (pass full_config for v1 fallback)
+        provider_config = config.get("provider_config", {})
+        self._restore_provider_specific_state(provider_config, config)
 
     def _build_user_message(self, prompt: str | list[dict[str, Any]] | dict[str, Any]) -> dict[str, Any]:
         if isinstance(prompt, str):
@@ -1445,11 +1478,8 @@ class BaseAgent(ABC):
             "system_prompt": self.system_prompt,
             "model": self.model,
             "max_steps": self.max_steps,
-            "thinking_tokens": self.thinking_tokens,
             "max_tokens": self.max_tokens,
             "stream_meta_history_and_tool_results": self.stream_meta_history_and_tool_results,
-            "beta_headers": self.beta_headers,
-            "container_id": self.container_id,
             "messages_count": len(self.messages),
             "conversation_history_count": len(getattr(self, "conversation_history", [])),
             "agent_logs_count": len(getattr(self, "agent_logs", [])),
@@ -1462,5 +1492,7 @@ class BaseAgent(ABC):
             "final_answer_check": self.final_answer_check is not None,
             "db_backend": self.db_backend.__class__.__name__ if self.db_backend else None,
             "tools": tool_names,
+            "provider_type": self._get_provider_type(),
+            "provider_config": self._get_provider_specific_config(),
         }
         return json.dumps(config_snapshot, indent=2, default=str)
