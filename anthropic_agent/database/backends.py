@@ -5,14 +5,15 @@ for storing agent configuration, conversation history, and detailed run logs.
 """
 
 import json
-import logging
 from pathlib import Path
 from typing import Protocol, Any
 from datetime import datetime
 
 import asyncpg
 
-logger = logging.getLogger(__name__)
+from ..logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class DatabaseBackend(Protocol):
@@ -201,9 +202,7 @@ class FilesystemBackend:
         with open(temp_file, "w") as f:
             json.dump(config, f, indent=2, default=self._json_default)
         temp_file.replace(config_file)
-        
-        logger.debug(f"Saved agent config for {agent_uuid}")
-    
+        logger.debug("Saved agent config", agent_uuid=agent_uuid, backend="filesystem", config=config)
     async def load_agent_config(self, agent_uuid: str) -> dict | None:
         """Load agent configuration from JSON file."""
         config_file = self.base_path / "agent_config" / f"{agent_uuid}.json"
@@ -214,7 +213,7 @@ class FilesystemBackend:
         with open(config_file, "r") as f:
             config = json.load(f)
         
-        logger.debug(f"Loaded agent config for {agent_uuid}")
+        logger.debug("Loaded agent config", agent_uuid=agent_uuid, backend="filesystem", config=config)
         return config
     
     async def update_agent_title(self, agent_uuid: str, title: str) -> bool:
@@ -225,7 +224,8 @@ class FilesystemBackend:
         
         config["title"] = title
         await self.save_agent_config(config)
-        logger.debug(f"Updated title for {agent_uuid}: {title}")
+        
+        logger.debug("Updated agent title", agent_uuid=agent_uuid, backend="filesystem", title=title)
         return True
     
     async def list_agent_sessions(
@@ -261,8 +261,8 @@ class FilesystemBackend:
                     "updated_at": config.get("updated_at") or file_mtime.isoformat(),
                     "total_runs": config.get("total_runs", 0),
                 })
-            except (json.JSONDecodeError, OSError) as e:
-                logger.warning(f"Failed to load config file {config_file}: {e}")
+            except (json.JSONDecodeError, OSError):
+                logger.warning("Failed to load config file", file=str(config_file))
                 continue
         
         # Sort by updated_at descending (newest first)
@@ -275,7 +275,7 @@ class FilesystemBackend:
         # Apply pagination
         sessions = sessions[offset:offset + limit]
         
-        logger.debug(f"Listed {len(sessions)} agent sessions (total: {total})")
+        logger.debug("Listed agent sessions", sessions=len(sessions), total=total, backend="filesystem")
         return sessions, total
     
     async def save_conversation_history(self, conversation: dict) -> None:
@@ -309,9 +309,7 @@ class FilesystemBackend:
         }
         with open(index_file, "w") as f:
             json.dump(index, f, indent=2)
-        
-        logger.debug(f"Saved conversation history for {agent_uuid}, sequence {next_sequence}")
-    
+        logger.debug("Saved conversation history", agent_uuid=agent_uuid, backend="filesystem", conversation=conversation)
     async def load_conversation_history(
         self, 
         agent_uuid: str, 
@@ -336,7 +334,7 @@ class FilesystemBackend:
             with open(conv_file, "r") as f:
                 conversations.append(json.load(f))
         
-        logger.debug(f"Loaded {len(conversations)} conversations for {agent_uuid}")
+        logger.debug("Loaded conversation history", agent_uuid=agent_uuid, backend="filesystem", conversations=len(conversations))
         return conversations
     
     async def load_conversation_history_cursor(
@@ -382,10 +380,7 @@ class FilesystemBackend:
             with open(conv_file, "r") as f:
                 conversations.append(json.load(f))
         
-        logger.debug(
-            f"Loaded {len(conversations)} conversations for {agent_uuid} "
-            f"(before={before}, has_more={has_more})"
-        )
+        logger.debug("Loaded conversation history cursor", agent_uuid=agent_uuid, backend="filesystem", conversations=len(conversations), has_more=has_more)
         return conversations, has_more
     
     async def save_agent_run_logs(
@@ -404,9 +399,7 @@ class FilesystemBackend:
         with open(log_file, "w") as f:
             for log_entry in logs:
                 f.write(json.dumps(log_entry, default=self._json_default) + "\n")
-        
-        logger.debug(f"Saved {len(logs)} log entries for run {run_id}")
-    
+        logger.debug("Saved agent run logs", agent_uuid=agent_uuid, run_id=run_id, backend="filesystem", logs=len(logs))
     async def load_agent_run_logs(
         self, 
         agent_uuid: str, 
@@ -425,7 +418,7 @@ class FilesystemBackend:
                 if line.strip():
                     logs.append(json.loads(line))
         
-        logger.debug(f"Loaded {len(logs)} log entries for run {run_id}")
+        logger.debug("Loaded agent run logs", agent_uuid=agent_uuid, run_id=run_id, backend="filesystem", logs=len(logs))
         return logs
 
 
@@ -474,7 +467,7 @@ class SQLBackend:
                 max_size=self._pool_size,
                 server_settings={'timezone': 'Asia/Kolkata'}
             )
-            logger.info(f"Created PostgreSQL connection pool (max_size={self._pool_size}, timezone=Asia/Kolkata)")
+            logger.info("Created PostgreSQL connection pool", max_size=self._pool_size)
         return self._pool
     
     async def close(self) -> None:
@@ -640,9 +633,8 @@ class SQLBackend:
                 config.get("current_step", 0),
                 self._to_jsonb(config.get("conversation_history", [])),
             )
+        logger.debug("Saved agent config", agent_uuid=config.get("agent_uuid"), backend="sql", config=config)
         
-        logger.debug(f"Saved agent config for {config.get('agent_uuid')}")
-    
     async def load_agent_config(self, agent_uuid: str) -> dict | None:
         """Load agent configuration from database.
         
@@ -714,7 +706,7 @@ class SQLBackend:
             "title": row["title"],
         }
         
-        logger.debug(f"Loaded agent config for {agent_uuid}")
+        logger.debug("Loaded agent config", agent_uuid=agent_uuid, backend="sql", config=config)
         return config
     
     async def update_agent_title(self, agent_uuid: str, title: str) -> bool:
@@ -742,7 +734,7 @@ class SQLBackend:
         if result is None:
             return False
         
-        logger.debug(f"Updated title for {agent_uuid}: {title}")
+        logger.debug("Updated agent title", agent_uuid=agent_uuid, backend="sql", title=title)
         return True
     
     async def list_agent_sessions(
@@ -782,7 +774,7 @@ class SQLBackend:
             for row in rows
         ]
         
-        logger.debug(f"Listed {len(sessions)} agent sessions (total: {total})")
+        logger.debug("Listed agent sessions", sessions=len(sessions), total=total, backend="sql")
         return sessions, total
     
     async def save_conversation_history(self, conversation: dict) -> None:
@@ -822,12 +814,8 @@ class SQLBackend:
                 self._to_jsonb(conversation.get("generated_files")),
                 self._to_datetime(conversation.get("created_at")),
             )
+        logger.debug("Saved conversation history", agent_uuid=conversation.get("agent_uuid"), backend="sql", conversation=conversation)
         
-        logger.debug(
-            f"Saved conversation history for agent {conversation.get('agent_uuid')}, "
-            f"run {conversation.get('run_id')}"
-        )
-    
     async def load_conversation_history(
         self, 
         agent_uuid: str, 
@@ -879,7 +867,7 @@ class SQLBackend:
                 "created_at": self._parse_datetime(row["created_at"]),
             })
         
-        logger.debug(f"Loaded {len(conversations)} conversations for {agent_uuid}")
+        logger.debug("Loaded conversation history", agent_uuid=agent_uuid, backend="sql", conversations=len(conversations))
         return conversations
     
     async def load_conversation_history_cursor(
@@ -952,10 +940,7 @@ class SQLBackend:
                 "created_at": self._parse_datetime(row["created_at"]),
             })
         
-        logger.debug(
-            f"Loaded {len(conversations)} conversations for {agent_uuid} "
-            f"(before={before}, has_more={has_more})"
-        )
+        logger.debug("Loaded conversation history cursor", agent_uuid=agent_uuid, backend="sql", conversations=len(conversations), has_more=has_more)
         return conversations, has_more
     
     async def save_agent_run_logs(
@@ -1005,9 +990,8 @@ class SQLBackend:
         
         async with pool.acquire() as conn:
             await conn.executemany(query, records)
+        logger.debug("Saved agent run logs", agent_uuid=agent_uuid, run_id=run_id, backend="sql", logs=len(logs))
         
-        logger.debug(f"Saved {len(logs)} log entries for run {run_id}")
-    
     async def load_agent_run_logs(
         self, 
         agent_uuid: str, 
@@ -1053,6 +1037,6 @@ class SQLBackend:
                 "duration_ms": row["duration_ms"],
             })
         
-        logger.debug(f"Loaded {len(logs)} log entries for run {run_id}")
+        logger.debug("Loaded agent run logs", agent_uuid=agent_uuid, run_id=run_id, backend="sql", logs=len(logs))
         return logs
 

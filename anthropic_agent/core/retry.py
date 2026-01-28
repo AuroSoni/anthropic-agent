@@ -1,12 +1,12 @@
 import asyncio
 import anthropic
 import random
-import logging
 from typing import Optional, Callable, TypeVar, Awaitable, Any
 from anthropic.types.beta import BetaMessage
 from ..streaming import render_stream, get_formatter, FormatterType
+from ..logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 T = TypeVar("T")
 
@@ -82,11 +82,8 @@ async def anthropic_stream_with_backoff(
     """
     for attempt in range(max_retries):
         try:
-            logger.info(
-                f"Attempting Anthropic stream call (attempt {attempt + 1}/{max_retries})"
-            )
-            
-            logger.debug("Anthropic request params: %s", request_params)
+            logger.info("Attempting Anthropic stream call", attempt=attempt + 1, max_retries=max_retries)
+            logger.debug("Anthropic stream call parameters", request_params=request_params)
             # Execute the streaming call with async context manager
             async with client.beta.messages.stream(**request_params) as stream:
                 if queue:
@@ -101,10 +98,7 @@ async def anthropic_stream_with_backoff(
                         pass  # Just consume events
                     accumulated_message = await stream.get_final_message()
             
-            logger.info(
-                f"Anthropic stream completed successfully "
-                f"(stop_reason: {accumulated_message.stop_reason})"
-            )
+            logger.info("Anthropic stream completed", stop_reason=accumulated_message.stop_reason)
             return accumulated_message
             
         except (
@@ -117,18 +111,12 @@ async def anthropic_stream_with_backoff(
             if attempt < max_retries - 1:
                 # Calculate delay with exponential backoff + jitter
                 delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
-                logger.warning(
-                    f"Retryable error on attempt {attempt + 1}: {type(e).__name__}: {e}. "
-                    f"Retrying in {delay:.2f} seconds..."
-                )
+                logger.warning("Retryable error, will retry", attempt=attempt + 1, error_type=type(e).__name__, delay=f"{delay:.2f}s")
                 await asyncio.sleep(delay)
                 continue
             else:
                 # Exhausted all retries
-                logger.error(
-                    f"All {max_retries} attempts failed with retryable error. "
-                    f"Final error: {type(e).__name__}: {e}"
-                )
+                logger.error("All retry attempts failed", max_retries=max_retries, error_type=type(e).__name__)
                 raise
                 
         except anthropic.APIStatusError as e:
@@ -137,23 +125,15 @@ async def anthropic_stream_with_backoff(
                 # Server error - retryable
                 if attempt < max_retries - 1:
                     delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
-                    logger.warning(
-                        f"Server error (5xx) on attempt {attempt + 1}: {e.status_code} - {e}. "
-                        f"Retrying in {delay:.2f} seconds..."
-                    )
+                    logger.warning("Server error (5xx), will retry", attempt=attempt + 1, status_code=e.status_code, delay=f"{delay:.2f}s")
                     await asyncio.sleep(delay)
                     continue
                 else:
-                    logger.error(
-                        f"All {max_retries} attempts failed with server error. "
-                        f"Final error: {e.status_code} - {e}"
-                    )
+                    logger.error("All retry attempts failed with server error", max_retries=max_retries, status_code=e.status_code)
                     raise
             else:
                 # Client error (4xx) - don't retry
-                logger.error(
-                    f"Non-retryable API status error: {e.status_code} - {e}"
-                )
+                logger.error("Non-retryable API status error", status_code=e.status_code)
                 raise
                 
         except (
@@ -164,23 +144,19 @@ async def anthropic_stream_with_backoff(
             anthropic.UnprocessableEntityError,
         ) as e:
             # Non-retryable errors - fail immediately
-            logger.error(
-                f"Non-retryable error: {type(e).__name__}: {e}"
-            )
+            logger.error("Non-retryable error", error_type=type(e).__name__)
             raise
             
         except Exception as e:
             # Unknown error - retry with caution
-            logger.error(
-                f"Unexpected error on attempt {attempt + 1}: {type(e).__name__}: {e}"
-            )
+            logger.error("Unexpected error", attempt=attempt + 1, error_type=type(e).__name__)
             if attempt < max_retries - 1:
                 delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
-                logger.warning(f"Retrying unexpected error in {delay:.2f} seconds...")
+                logger.warning("Retrying unexpected error", delay=f"{delay:.2f}s")
                 await asyncio.sleep(delay)
                 continue
             else:
-                logger.error(f"All {max_retries} attempts failed. Final error: {e}")
+                logger.error("All retry attempts failed", max_retries=max_retries)
                 raise
 
 
@@ -212,17 +188,10 @@ def retry_with_backoff(
                     last_exc = e
                     if attempt < max_retries - 1:
                         delay = base_delay * (2 ** attempt)
-                        logger.warning(
-                            f"Retryable error in {func.__name__} "
-                            f"(attempt {attempt + 1}/{max_retries}): {e}. "
-                            f"Retrying in {delay:.2f} seconds..."
-                        )
+                        logger.warning("Retryable error, will retry", func=func.__name__, attempt=attempt + 1, max_retries=max_retries, delay=f"{delay:.2f}s")
                         await asyncio.sleep(delay)
                     else:
-                        logger.error(
-                            f"{func.__name__} failed after {max_retries} attempts: {e}",
-                            exc_info=True,
-                        )
+                        logger.error("Function failed after all retries", func=func.__name__, max_retries=max_retries, exc_info=True)
                         raise last_exc
 
             # This line should be unreachable

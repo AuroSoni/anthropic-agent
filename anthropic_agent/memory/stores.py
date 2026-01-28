@@ -4,12 +4,12 @@ This module defines the MemoryStore protocol and provides placeholder implementa
 Real implementations (vector-based, semantic, etc.) will be added in future iterations.
 """
 
-import logging
 from typing import Protocol, Literal, Any
 from datetime import datetime
 
+from ..logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Type alias for memory store names
 MemoryStoreType = Literal["placeholder", "none"]
@@ -203,7 +203,7 @@ class PlaceholderMemoryStore:
         """
         self.top_k = top_k
         self.config = kwargs
-        logger.info(f"PlaceholderMemoryStore initialized with top_k={top_k}")
+        logger.info("PlaceholderMemoryStore initialized", top_k=top_k)
     
     def retrieve(
         self,
@@ -221,13 +221,8 @@ class PlaceholderMemoryStore:
         4. Format top_k results as context message
         5. Inject into messages list
         
-        Current behavior: Returns messages unchanged, logs call.
+        Current behavior: Returns messages unchanged.
         """
-        logger.debug(f"PlaceholderMemoryStore.retrieve called for model={model}")
-        logger.debug(f"  User message: {user_message.get('content', '')[:100]}...")
-        logger.debug(f"  Current message count: {len(messages)}")
-        logger.debug(f"  Available tools: {len(tools)}")
-        
         # TODO: Implement memory retrieval and injection
         # Example structure for injected memory:
         # memory_message = {
@@ -257,13 +252,8 @@ class PlaceholderMemoryStore:
         4. Update existing memories if applicable
         5. Return created/updated memory IDs
         
-        Current behavior: Returns empty metadata, logs call.
+        Current behavior: Returns empty metadata.
         """
-        logger.debug(f"PlaceholderMemoryStore.update called for model={model}")
-        logger.debug(f"  Compacted messages: {len(messages)}")
-        logger.debug(f"  Full conversation: {len(conversation_history)}")
-        logger.debug(f"  Tools used: {len(tools)}")
-        
         # TODO: Implement memory extraction and storage
         # Example:
         # - Extract facts from assistant responses
@@ -291,11 +281,8 @@ class PlaceholderMemoryStore:
         3. Store temporarily for potential re-injection
         4. Update internal memory state
         
-        Current behavior: Logs call, no extraction.
+        Current behavior: No extraction.
         """
-        logger.debug(f"PlaceholderMemoryStore.before_compact called for model={model}")
-        logger.debug(f"  Messages to compact: {len(messages)}")
-        
         # TODO: Extract important info before it's removed
         # Example:
         # - Find tool results with important data
@@ -318,14 +305,8 @@ class PlaceholderMemoryStore:
         3. Inject summarized/semantic versions if needed
         4. Return updated messages with injected context
         
-        Current behavior: Returns compacted messages unchanged, logs call.
+        Current behavior: Returns compacted messages unchanged.
         """
-        messages_removed = len(original_messages) - len(compacted_messages)
-        logger.debug(f"PlaceholderMemoryStore.after_compact called for model={model}")
-        logger.debug(f"  Original messages: {len(original_messages)}")
-        logger.debug(f"  Compacted messages: {len(compacted_messages)}")
-        logger.debug(f"  Messages removed: {messages_removed}")
-        
         # TODO: Analyze compaction and inject replacement context
         # Example:
         # - If important tool results were removed, inject summaries

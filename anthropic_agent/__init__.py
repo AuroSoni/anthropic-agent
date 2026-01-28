@@ -10,6 +10,11 @@ Main exports:
     - anthropic_stream_with_backoff: Streaming with retry logic
     - render_stream: Stream renderer with custom formatting
     - FormatterType: Type alias for formatter options ("xml" | "raw")
+
+Logging:
+    - configure_logging: Configure the logging framework
+    - LogConfig, LogLevel, LogFormat: Configuration classes
+    - bind_context, clear_context: Context management for request tracing
     
 Example:
     >>> from anthropic_agent import AnthropicAgent
@@ -30,14 +35,34 @@ except ImportError:
 from .core import AgentResult, AnthropicAgent, anthropic_stream_with_backoff
 from .streaming import render_stream, stream_to_aqueue, FormatterType
 
+# Logging exports
+from .logging import (
+    configure_logging,
+    LogConfig,
+    LogLevel,
+    LogFormat,
+    bind_context,
+    clear_context,
+    get_logger,
+)
+
 __version__ = "0.1.0"
 
 __all__ = [
+    # Core
     'AgentResult',
     'AnthropicAgent',
     'anthropic_stream_with_backoff',
     'render_stream',
     'stream_to_aqueue',
     'FormatterType',
+    # Logging
+    'configure_logging',
+    'LogConfig',
+    'LogLevel',
+    'LogFormat',
+    'bind_context',
+    'clear_context',
+    'get_logger',
 ]
 

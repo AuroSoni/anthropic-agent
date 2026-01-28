@@ -2,14 +2,14 @@ import ast
 import inspect
 import builtins
 import difflib
-import logging
 from types import ModuleType
 from importlib import import_module
 from collections.abc import Mapping
 from typing import Any
 from .base import safer_eval, safer_func, BASE_BUILTIN_MODULES, InterpreterError, MAX_OPERATIONS, MAX_WHILE_ITERATIONS, check_import_authorized
+from ..logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 ERRORS = {
     name: getattr(builtins, name)

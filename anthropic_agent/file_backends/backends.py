@@ -1,11 +1,12 @@
 """File storage backend implementations for Anthropic agent."""
 
-import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol, Any
 
-logger = logging.getLogger(__name__)
+from ..logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class FileStorageBackend(Protocol):
@@ -144,7 +145,7 @@ class LocalFilesystemBackend:
         file_path.write_bytes(content)
 
         storage_location = str(file_path.absolute())
-        logger.info(f"Stored file {filename} ({file_id}) at {storage_location}")
+        logger.info("Stored file", filename=filename, file_id=file_id, backend="local")
 
         return {
             "file_id": file_id,
@@ -185,7 +186,7 @@ class LocalFilesystemBackend:
         file_path.write_bytes(content)
 
         storage_location = str(file_path.absolute())
-        logger.info(f"Updated file {filename} ({file_id}) at {storage_location}")
+        logger.info("Updated file", filename=filename, file_id=file_id, backend="local")
 
         return {
             "file_id": file_id,
@@ -285,7 +286,7 @@ class S3Backend:
         )
 
         storage_location = self._build_public_url(key)
-        logger.info(f"Stored file {filename} ({file_id}) at {storage_location}")
+        logger.info("Stored file", filename=filename, file_id=file_id, backend="s3", bucket=self.bucket)
 
         return {
             "file_id": file_id,
@@ -328,7 +329,7 @@ class S3Backend:
         )
 
         storage_location = self._build_public_url(key)
-        logger.info(f"Updated file {filename} ({file_id}) at {storage_location}")
+        logger.info("Updated file", filename=filename, file_id=file_id, backend="s3", bucket=self.bucket)
 
         return {
             "file_id": file_id,

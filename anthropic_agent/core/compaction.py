@@ -7,11 +7,12 @@ and assistant turns.
 
 import json
 import copy
-import logging
 from typing import Protocol, Literal, Any
 from datetime import datetime
 
-logger = logging.getLogger(__name__)
+from ..logging import get_logger
+
+logger = get_logger(__name__)
 
 # Type alias for compactor names
 CompactorType = Literal["sliding_window", "tool_result_removal", "none"]
@@ -448,7 +449,7 @@ class SlidingWindowCompactor:
                 metadata["phases_applied"].append("remove_thinking")
                 metadata["thinking_blocks_removed"] = thinking_removed
                 current_tokens = estimate_tokens(compacted)
-                logger.info(f"Compaction phase 1: Removed {thinking_removed} thinking blocks, tokens: {current_tokens}")
+                logger.info("Compaction phase 1: removed thinking blocks", removed=thinking_removed, tokens=current_tokens)
                 
                 if current_tokens <= threshold:
                     metadata["compaction_applied"] = True
@@ -463,7 +464,7 @@ class SlidingWindowCompactor:
             metadata["phases_applied"].append("truncate_results")
             metadata["tool_results_truncated"] = truncated_count
             current_tokens = estimate_tokens(compacted)
-            logger.info(f"Compaction phase 2: Truncated {truncated_count} tool results, tokens: {current_tokens}")
+            logger.info("Compaction phase 2: truncated tool results", truncated=truncated_count, tokens=current_tokens)
             
             if current_tokens <= threshold:
                 metadata["compaction_applied"] = True
@@ -478,7 +479,7 @@ class SlidingWindowCompactor:
             metadata["phases_applied"].append("replace_results")
             metadata["tool_results_replaced"] = replaced_count
             current_tokens = estimate_tokens(compacted)
-            logger.info(f"Compaction phase 3: Replaced {replaced_count} tool results, tokens: {current_tokens}")
+            logger.info("Compaction phase 3: replaced tool results", replaced=replaced_count, tokens=current_tokens)
             
             if current_tokens <= threshold:
                 metadata["compaction_applied"] = True
@@ -493,7 +494,7 @@ class SlidingWindowCompactor:
             metadata["phases_applied"].append("remove_turns")
             metadata["messages_removed"] = removed_count
             current_tokens = estimate_tokens(compacted)
-            logger.info(f"Compaction phase 4: Removed {removed_count} messages, tokens: {current_tokens}")
+            logger.info("Compaction phase 4: removed messages", removed=removed_count, tokens=current_tokens)
         
         metadata["compaction_applied"] = True
         metadata["final_token_estimate"] = current_tokens
@@ -502,10 +503,7 @@ class SlidingWindowCompactor:
         
         # Warn if still over threshold after all phases
         if current_tokens > threshold:
-            logger.warning(
-                f"Compaction complete but still over threshold: {current_tokens} > {threshold}. "
-                f"Consider increasing keep_recent_turns or reducing message sizes."
-            )
+            logger.warning("Compaction complete but still over threshold", tokens=current_tokens, threshold=threshold)
             metadata["warning"] = "still_over_threshold"
         
         return compacted, metadata

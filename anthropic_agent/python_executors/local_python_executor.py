@@ -1,12 +1,12 @@
 from importlib.util import find_spec
-import logging
 from dataclasses import dataclass
 import ast
 from typing import Any, Callable
 from .base import truncate_content, BASE_BUILTIN_MODULES, InterpreterError, FinalAnswerException, PrintContainer, BASE_PYTHON_TOOLS, DEFAULT_MAX_LEN_OUTPUT
 from .ast_evaluator import evaluate_ast
+from ..logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 def evaluate_python_code(
     code: str,

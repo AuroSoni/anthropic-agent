@@ -3,7 +3,7 @@ import asyncio
 import json
 import html
 import anthropic
-import logging
+from ..logging import get_logger
 import uuid
 import warnings
 import yaml
@@ -22,7 +22,7 @@ from ..memory import MemoryStoreType, get_memory_store, MemoryStore
 from ..database import DBBackendType, get_db_backend, DatabaseBackend
 from ..file_backends import FileBackendType, get_file_backend, FileStorageBackend
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 # Default configuration values for agents
@@ -357,7 +357,7 @@ class AnthropicAgent:
                         set_uuid_method(self.agent_uuid)
                         logger.debug(f"Injected agent_uuid into tool instance: {type(tool_instance).__name__}")
                     except Exception as e:
-                        logger.warning(f"Failed to inject agent_uuid into tool: {e}")
+                        logger.warning("Failed to inject agent_uuid into tool", exc_info=True)
     
     @property
     def is_initialized(self) -> bool:
@@ -397,23 +397,19 @@ class AnthropicAgent:
             
             if config is None:
                 # New agent - will be created on first run
-                logger.info(f"No existing state for agent {self.agent_uuid}, creating new")
+                logger.info("No existing state, creating new agent", agent_uuid=self.agent_uuid)
                 self._initialized = True
                 return {}
             
             # Restore state from loaded configuration
             self._restore_state_from_config(config)
             
-            logger.info(
-                f"Loaded state for agent {self.agent_uuid}: "
-                f"{len(config.get('messages', []))} messages, "
-                f"container_id={config.get('container_id')}"
-            )
+            logger.info("Loaded agent state", agent_uuid=self.agent_uuid, messages=len(config.get('messages', [])))
             self._initialized = True
             return config
             
         except Exception as e:
-            logger.error(f"Failed to load state for agent {self.agent_uuid}: {e}", exc_info=True)
+            logger.error("Failed to load agent state", agent_uuid=self.agent_uuid, exc_info=True)
             self._initialized = True
             return {}
     
@@ -774,7 +770,7 @@ class AnthropicAgent:
                             "action": "final_answer_validation_failed",
                             "details": {"error": error_message, "step": step}
                         })
-                        logger.warning(f"Final answer validation failed at step {step}: {error_message}")
+                        logger.warning("Final answer validation failed", step=step, error=error_message)
                         
                         # Inject error as user message and continue loop
                         error_user_message = {
@@ -803,7 +799,7 @@ class AnthropicAgent:
                     "action": "memory_update",
                     "details": memory_metadata
                 })
-                logger.info(f"Memory updated: {memory_metadata}")
+                logger.info("Memory updated", **memory_metadata)
 
             # Build AgentResult (generated_files populated after file processing/registry aggregation)
             result = AgentResult(
@@ -845,7 +841,7 @@ class AnthropicAgent:
             return result
 
         # Max steps reached - generate final summary
-        logger.warning(f"Max steps ({self.max_steps}) reached, generating final summary")
+        logger.warning("Max steps reached, generating final summary", max_steps=self.max_steps)
         return await self._generate_final_summary(queue=queue, formatter=formatter)
     
     def _apply_cache_control(
@@ -1411,7 +1407,7 @@ class AnthropicAgent:
                             "action": "final_answer_validation_failed",
                             "details": {"error": error_message, "step": step}
                         })
-                        logger.warning(f"Final answer validation failed at step {step}: {error_message}")
+                        logger.warning("Final answer validation failed", step=step, error=error_message)
                         
                         error_user_message = {
                             "role": "user",
@@ -1437,7 +1433,7 @@ class AnthropicAgent:
                     "action": "memory_update",
                     "details": memory_metadata
                 })
-                logger.info(f"Memory updated: {memory_metadata}")
+                logger.info("Memory updated", **memory_metadata)
 
             # Build AgentResult
             result = AgentResult(
@@ -1472,7 +1468,7 @@ class AnthropicAgent:
             return result
 
         # Max steps reached
-        logger.warning(f"Max steps ({self.max_steps}) reached in _resume_run")
+        logger.warning("Max steps reached in resume", max_steps=self.max_steps)
         return await self._generate_final_summary(queue=queue, formatter=formatter)
     
     def _apply_compaction(self, step_number: int = 0) -> None:
@@ -1527,7 +1523,7 @@ class AnthropicAgent:
             # Log: compaction applied (to run logs buffer)
             self._log_action("compaction", metadata, step_number=step_number)
             
-            logger.info(f"Compaction applied: {metadata}")
+            logger.info("Compaction applied", **metadata)
     
     def _extract_final_answer(self, message: BetaMessage) -> str:
         """Extract and concatenate text from all content blocks in the message.
@@ -1707,7 +1703,7 @@ class AnthropicAgent:
                 "action": "memory_update",
                 "details": memory_metadata
             })
-            logger.info(f"Memory updated after final summary: {memory_metadata}")
+            logger.info("Memory updated after final summary", **memory_metadata)
         
         # Build AgentResult (generated_files populated from file_registry below)
         result = AgentResult(
@@ -1775,7 +1771,7 @@ class AnthropicAgent:
                 "action": "manual_compaction",
                 "details": metadata
             })
-            logger.info(f"Manual compaction applied: {metadata}")
+            logger.info("Manual compaction applied", **metadata)
         
         return metadata
     
@@ -1911,7 +1907,7 @@ class AnthropicAgent:
             response = await self.client.messages.count_tokens(**params)
             return getattr(response, "input_tokens", None)
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"Token count API call failed: {e}")
+            logger.warning("Token count API call failed", exc_info=True)
             return None
     
     async def _estimate_tokens(
@@ -2284,9 +2280,9 @@ class AnthropicAgent:
         
         try:
             await self.db_backend.update_agent_title(self.agent_uuid, title)
-            logger.debug(f"Generated title for {self.agent_uuid}: {title}")
+            logger.info("Generated title", agent_uuid=self.agent_uuid, title=title)
         except Exception as e:
-            logger.error(f"Failed to save title for {self.agent_uuid}: {e}")
+            logger.error("Failed to save title", agent_uuid=self.agent_uuid, exc_info=True)
     
     async def _save_run_data_with_retry(
         self,
@@ -2312,7 +2308,8 @@ class AnthropicAgent:
                 await op()
             except Exception as e:  # noqa: BLE001
                 logger.error(
-                    f"Failed to persist {operation_type} for run {self._run_id}: {e}",
+                    f"Failed to persist {operation_type}",
+                    run_id=self._run_id,
                     exc_info=True,
                 )
                 failure_metadata = {
@@ -2384,7 +2381,7 @@ class AnthropicAgent:
             }
         
         total_tasks = len(self._background_tasks)
-        logger.info(f"Draining {total_tasks} background task(s) with {timeout}s timeout")
+        logger.info("Draining background tasks", total=total_tasks, timeout=timeout)
         
         try:
             # Wait for all tasks with timeout
@@ -2402,10 +2399,7 @@ class AnthropicAgent:
             completed = total_tasks - len(incomplete_tasks)
             timed_out = len(incomplete_tasks)
             
-            logger.warning(
-                f"Timeout after {timeout}s: {completed}/{total_tasks} tasks completed, "
-                f"{timed_out} tasks still pending"
-            )
+            logger.warning("Background task drain timeout", timeout=timeout, completed=completed, pending=timed_out)
             
             # Try to extract run_ids from incomplete tasks (best effort)
             incomplete_ids = [f"task_{id(t)}" for t in incomplete_tasks]
@@ -2511,7 +2505,7 @@ class AnthropicAgent:
             return file_metadata, file_content
         
         except Exception as e:
-            logger.error(f"Failed to download file {file_id}: {e}", exc_info=True)
+            logger.error("Failed to download file", file_id=file_id, exc_info=True)
             raise
     
     def extract_file_ids(self, message: BetaMessage | dict[str, Any]) -> list[str]:
@@ -2527,7 +2521,7 @@ class AnthropicAgent:
             
         # Ensure content is iterable
         if not isinstance(content, list):
-            logger.warning(f"Message content is not a list: {type(content)}")
+            logger.warning("Message content is not a list", content_type=type(content).__name__)
             return file_ids
 
         for item in content:
@@ -2539,7 +2533,6 @@ class AnthropicAgent:
                 item_type = getattr(item, "type", "")
                 item_content = getattr(item, "content", None)
             
-            # logger.debug(f"Scanning content item type: {item_type}")
 
             # Check for both specific beta type and generic tool_result that might contain bash result
             if item_type == 'bash_code_execution_tool_result' or item_type == 'tool_result':
@@ -2558,7 +2551,6 @@ class AnthropicAgent:
                     # Content is likely a string or list, not the expected nested structure
                     continue
                 
-                # logger.debug(f"Found potentially relevant result with inner type: {inner_type}")
 
                 if inner_type == 'bash_code_execution_result':
                     if isinstance(files, list):
@@ -2570,7 +2562,6 @@ class AnthropicAgent:
                                 file_id = getattr(file, "file_id", None)
                                 
                             if file_id:
-                                logger.info(f"Found file_id: {file_id}")
                                 file_ids.append(file_id)
         return file_ids
 
@@ -2591,14 +2582,14 @@ class AnthropicAgent:
         if not self.file_registry:
             return []
 
-        logger.info(f"Processing {len(self.file_registry)} file(s) via file backend")
+        logger.info("Processing files via backend", count=len(self.file_registry))
 
         for file_id, registry_entry in self.file_registry.items():
             filename = registry_entry.get("filename") or str(file_id)
 
             try:
                 # Download file content from Anthropic Files API
-                logger.info(f"Downloading file {filename} ({file_id}) for backend storage")
+                logger.info("Downloading file for backend storage", filename=filename, file_id=file_id)
                 # content is a tuple (FileMetadata, bytes) - we need index 1 for content bytes
                 file_metadata_api, content_bytes = await self._download_file(file_id)
                 # Update filename from metadata if available
@@ -2635,14 +2626,11 @@ class AnthropicAgent:
 
                 files_metadata.append(merged)
 
-                logger.info(f"Successfully processed file {filename} ({file_id}) via backend")
+                logger.info("Successfully processed file via backend", filename=filename, file_id=file_id)
 
             except Exception as e:
                 # Log error but continue processing other files
-                logger.warning(
-                    f"Failed to process file {filename} ({file_id}) via backend: {e}",
-                    exc_info=True,
-                )
+                logger.warning("Failed to process file via backend", file_id=file_id, filename=filename, exc_info=True)
                 continue
 
         return files_metadata
