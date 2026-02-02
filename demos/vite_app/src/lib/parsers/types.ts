@@ -55,7 +55,7 @@ export interface MessageStartEvent {
     type: 'message';
     role: 'user' | 'assistant';
     model: string;
-    content: any[];
+    content: unknown[];
     stop_reason: string | null;
     stop_sequence: string | null;
     usage: {
@@ -98,10 +98,10 @@ export interface ContentBlockStartEvent {
     thinking?: string;
     id?: string;
     name?: string;
-    input?: any;
-    content?: any; // For tool results
+    input?: unknown;
+    content?: unknown; // For tool results
     tool_use_id?: string; // For tool results
-    [key: string]: any;
+    [key: string]: unknown;
   };
 }
 
@@ -114,7 +114,7 @@ export interface ContentBlockDeltaEvent {
     thinking?: string;
     signature?: string;
     partial_json?: string;
-    [key: string]: any;
+    [key: string]: unknown;
   };
 }
 
@@ -123,7 +123,7 @@ export interface ContentBlockStopEvent {
   index: number;
   content_block?: {
     citations?: Citation[];
-    [key: string]: any;
+    [key: string]: unknown;
   };
 }
 
@@ -151,9 +151,18 @@ export type StreamFormat = 'xml' | 'raw';
 export interface MetaInit {
   format: StreamFormat;
   user_query: string;
-  message_history: any[];
+  message_history: unknown[];
   agent_uuid: string;
   model: string;
+}
+
+/**
+ * MetaFinal contains metadata sent at the end of a stream.
+ * Emitted as <meta_final data="..."></meta_final> by the backend.
+ */
+export interface MetaFinal {
+  message_history?: unknown[];
+  [key: string]: unknown;
 }
 
 // ============================================================================

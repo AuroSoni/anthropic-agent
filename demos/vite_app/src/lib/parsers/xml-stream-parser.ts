@@ -197,10 +197,10 @@ export class XmlStreamParser {
   }
   
   /**
-   * Get the current node tree.
-   * Can be called at any time for real-time updates.
-   * Tolerant of unclosed tags (uses parseMixedContent which handles streaming).
-   * Defers parsing of incomplete CDATA sections at buffer end.
+ * Get the current node tree.
+ * Can be called at any time for real-time updates.
+ * Tolerant of unclosed tags (uses parseMixedContent which handles streaming).
+ * Defers parsing of incomplete CDATA sections at buffer end.
    */
   getNodes(): AgentNode[] {
     if (!this.buffer) {
@@ -208,17 +208,10 @@ export class XmlStreamParser {
     }
     
     // Pre-process CDATA sections (excludes incomplete CDATA at end)
-    const { processed, cdataMap, incompleteStart } = preprocessCDATA(this.buffer);
+    const { processed, cdataMap } = preprocessCDATA(this.buffer);
     
     // Parse only the complete portion of XML structure
-    // If there's incomplete CDATA, append it as unparsed text to maintain streaming display
-    let textToParse = processed;
-    if (incompleteStart >= 0) {
-      // Append the incomplete portion as-is for display (will be properly parsed when complete)
-      textToParse = processed + this.buffer.slice(incompleteStart);
-    }
-    
-    const rawNodes = parseMixedContent(textToParse);
+    const rawNodes = parseMixedContent(processed);
     
     // Normalize tag names and restore CDATA content
     return normalizeNodes(rawNodes, cdataMap);

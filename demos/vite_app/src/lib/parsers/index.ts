@@ -43,6 +43,7 @@ export type {
   MessageDeltaEvent,
   MessageStopEvent,
   MetaInit,
+  MetaFinal,
   StreamFormat,
   PendingFrontendTool,
   FrontendToolResult,
@@ -54,7 +55,7 @@ export { XmlStreamParser } from './xml-stream-parser';
 export { parseMixedContent } from './xml-parser';
 
 // Meta-init utilities
-export { parseMetaInit, stripMetaInit, hasMetaInit } from './meta-init';
+export { parseMetaInit, stripMetaInit, hasMetaInit, parseMetaFinal, stripMetaFinal, createMetaFinalConsumer } from './meta-init';
 
 // Shared utilities
 export { decodeHtmlEntities, unescapeSseNewlines } from './utils';
