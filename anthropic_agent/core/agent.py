@@ -36,6 +36,15 @@ DEFAULT_FORMATTER: FormatterType = "xml"
 DEFAULT_MAX_RETRIES = 5
 DEFAULT_BASE_DELAY = 1.0
 
+# Escape tool result content for SSE + CDATA safety.
+def _escape_tool_result_cdata(content: str) -> str:
+    if not content:
+        return ""
+    # Prevent CDATA termination and avoid raw newlines in SSE frames.
+    safe = content.replace("]]>", "]]]]><![CDATA[>")
+    safe = safe.replace("\r\n", "\n").replace("\r", "\n")
+    return safe.replace("\n", "\\n")
+
 # Cache control configuration (Anthropic limits)
 MAX_CACHE_BLOCKS = 4
 MIN_CACHE_TOKENS_SONNET = 1024  # Claude Sonnet/Opus minimum
@@ -651,6 +660,8 @@ class AnthropicAgent:
                                         if isinstance(block, dict) and block.get("type") == "text":
                                             text_parts.append(block.get("text", ""))
                                 text_content = "\n".join(text_parts) if text_parts else ""
+                                text_content = _escape_tool_result_cdata(text_content)
+                                text_content = _escape_tool_result_cdata(text_content)
                                 
                                 # Build image reference tags
                                 image_tags = "".join(
@@ -672,6 +683,8 @@ class AnthropicAgent:
                                     content_str = result_content
                                 else:
                                     content_str = json.dumps(result_content, default=str)
+                                content_str = _escape_tool_result_cdata(content_str)
+                                content_str = _escape_tool_result_cdata(content_str)
                                 await queue.put(
                                     f'<content-block-tool_result id="{tool_use_id}" name="{tool_name_escaped}"><![CDATA[{content_str}]]></content-block-tool_result>'
                                 )
@@ -1150,6 +1163,7 @@ class AnthropicAgent:
                 )
                 tool_name = html.escape(tool_name, quote=True)
                 content_str = r["content"] if isinstance(r["content"], str) else json.dumps(r["content"], default=str)
+                content_str = _escape_tool_result_cdata(content_str)
                 await queue.put(
                     f'<content-block-tool_result id="{tool_use_id}" name="{tool_name}"><![CDATA[{content_str}]]></content-block-tool_result>'
                 )
