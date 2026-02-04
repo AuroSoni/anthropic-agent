@@ -2177,6 +2177,7 @@ class AnthropicAgent:
             # can be returned in the AgentResult after continuation. This is distinct from the
             # conversation_history TABLE which stores completed runs across multiple user turns.
             "conversation_history": getattr(self, "conversation_history", []),
+            "title": existing_config.get("title"),
             # Preserve created_at from existing config, or set to now (as datetime)
             "created_at": (
                 datetime.fromisoformat(existing_config["created_at"].replace("Z", "+00:00"))

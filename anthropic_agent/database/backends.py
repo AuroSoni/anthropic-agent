@@ -557,13 +557,13 @@ class SQLBackend:
                 stream_meta_history_and_tool_results, compactor_type,
                 memory_store_type, file_registry, max_retries, base_delay,
                 last_known_input_tokens, last_known_output_tokens,
-                created_at, updated_at, last_run_at, total_runs,
+                title, created_at, updated_at, last_run_at, total_runs,
                 pending_frontend_tools, pending_backend_results,
                 awaiting_frontend_tools, current_step, conversation_history
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                 $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-                $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31
+                $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32
             )
             ON CONFLICT (agent_uuid) DO UPDATE SET
                 system_prompt = EXCLUDED.system_prompt,
@@ -587,6 +587,7 @@ class SQLBackend:
                 base_delay = EXCLUDED.base_delay,
                 last_known_input_tokens = EXCLUDED.last_known_input_tokens,
                 last_known_output_tokens = EXCLUDED.last_known_output_tokens,
+                title = EXCLUDED.title,
                 updated_at = EXCLUDED.updated_at,
                 last_run_at = EXCLUDED.last_run_at,
                 total_runs = EXCLUDED.total_runs,
@@ -622,6 +623,7 @@ class SQLBackend:
                 config.get("base_delay"),
                 config.get("last_known_input_tokens"),
                 config.get("last_known_output_tokens"),
+                config.get("title"),
                 self._to_datetime(config.get("created_at")),
                 self._to_datetime(config.get("updated_at")),
                 self._to_datetime(config.get("last_run_at")),
