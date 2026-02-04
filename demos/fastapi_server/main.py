@@ -22,14 +22,23 @@ except ImportError:
 
 from agent_router import router as agent_router
 from db import db
+from storage import config_adapter, conversation_adapter, run_adapter
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler for startup/shutdown."""
-    # Startup: nothing needed (lazy pool initialization)
+    # Startup: connect storage adapters
+    await config_adapter.connect()
+    await conversation_adapter.connect()
+    await run_adapter.connect()
+    
     yield
-    # Shutdown: close database connection pool
+    
+    # Shutdown: close storage adapters and database connection pool
+    await config_adapter.close()
+    await conversation_adapter.close()
+    await run_adapter.close()
     await db.close()
 
 

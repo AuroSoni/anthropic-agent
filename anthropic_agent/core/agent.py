@@ -19,7 +19,16 @@ from ..tools.base import ToolRegistry, ToolResultContent
 from ..streaming import FormatterType
 from .compaction import CompactorType, get_compactor, get_default_compactor, Compactor
 from ..memory import MemoryStoreType, get_memory_store, MemoryStore
-from ..database import DBBackendType, get_db_backend, DatabaseBackend
+from ..storage import (
+    AgentConfig as StoredAgentConfig,
+    Conversation,
+    AgentConfigAdapter,
+    ConversationAdapter,
+    AgentRunAdapter,
+    MemoryAgentConfigAdapter,
+    MemoryConversationAdapter,
+    MemoryAgentRunAdapter,
+)
 from ..file_backends import FileBackendType, get_file_backend, FileStorageBackend
 
 logger = get_logger(__name__)
@@ -73,7 +82,9 @@ class AnthropicAgent:
         memory_store: MemoryStoreType | MemoryStore | None = None,
         final_answer_check: Optional[Callable[[str], tuple[bool, str]]] = None,
         agent_uuid: str | None = None,
-        db_backend: DBBackendType | DatabaseBackend = "filesystem",
+        config_adapter: AgentConfigAdapter | None = None,
+        conversation_adapter: ConversationAdapter | None = None,
+        run_adapter: AgentRunAdapter | None = None,
         file_backend: FileBackendType | FileStorageBackend | None = None,
         **api_kwargs: Any,
     ):
@@ -115,10 +126,14 @@ class AnthropicAgent:
                 continues until validation passes or max_steps is reached.
             agent_uuid: Optional agent session UUID for resuming previous sessions. If provided,
                 agent state (messages, container_id, file_registry) will be automatically loaded
-                from the database. If not provided, a new UUID is generated.
-            db_backend: Database backend for persisting agent state ("filesystem" or "sql"), or
-                a pre-configured DatabaseBackend instance. Default is "filesystem" with ./data path.
-                All agents persist state by default.
+                from storage. If not provided, a new UUID is generated.
+            config_adapter: Optional adapter for persisting agent configuration and session state.
+                If None, uses in-memory storage (state not persisted across process restarts).
+                For persistence, pass FilesystemAgentConfigAdapter or PostgresAgentConfigAdapter.
+            conversation_adapter: Optional adapter for persisting conversation history records.
+                If None, conversations are not stored. Pass an adapter for UI history features.
+            run_adapter: Optional adapter for persisting detailed run logs.
+                If None, run logs are not stored. Pass an adapter for debugging/analytics.
             file_backend: Optional file storage backend for generated files ("local", "s3", "none"),
                 or a pre-configured FileStorageBackend instance. If None, files are not stored.
                 When configured, enables Files API beta header automatically.
@@ -135,15 +150,12 @@ class AnthropicAgent:
         """
         
         #################################################################### 
-        # DB Backend is mandatory and always present by default.
-        # If agent_uuid is provided, state is loaded from database.
-        # If agent_uuid is provided, but db_backend is not, an error is raised.
+        # Storage adapters - None means memory-only (no persistence)
+        # Each adapter is independently optional for granular control.
         #################################################################### 
-        # Database backend for persistence (always present by default)
-        if isinstance(db_backend, str):
-            self.db_backend = get_db_backend(db_backend)
-        else:
-            self.db_backend = db_backend
+        self.config_adapter = config_adapter or MemoryAgentConfigAdapter()
+        self.conversation_adapter = conversation_adapter or MemoryConversationAdapter()
+        self.run_adapter = run_adapter or MemoryAgentRunAdapter()
         
         # Initialization state - tracks whether state has been loaded from DB
         # Use initialize() to load state, or run() will call it automatically
@@ -378,7 +390,7 @@ class AnthropicAgent:
         return self._initialized
     
     async def initialize(self) -> dict[str, Any]:
-        """Initialize agent by loading state from database.
+        """Initialize agent by loading state from storage.
         
         Can be called explicitly to access agent state before run(),
         or will be called automatically at the start of run().
@@ -389,20 +401,15 @@ class AnthropicAgent:
         Returns:
             Loaded configuration dict, or empty dict if:
             - Already initialized
-            - No db_backend configured
             - No agent_uuid (new agent)
-            - Agent not found in database
+            - Agent not found in storage
             - Error during loading
         """
         if self._initialized:
             return {}  # Already initialized
         
-        if not self.db_backend:
-            self._initialized = True
-            return {}
-        
         try:
-            config = await self.db_backend.load_agent_config(self.agent_uuid)
+            config = await self.config_adapter.load(self.agent_uuid)
             
             if config is None:
                 # New agent - will be created on first run
@@ -410,12 +417,13 @@ class AnthropicAgent:
                 self._initialized = True
                 return {}
             
-            # Restore state from loaded configuration
-            self._restore_state_from_config(config)
+            # Convert dataclass to dict for _restore_state_from_config
+            config_dict = self._stored_config_to_dict(config)
+            self._restore_state_from_config(config_dict)
             
-            logger.info("Loaded agent state", agent_uuid=self.agent_uuid, messages=len(config.get('messages', [])))
+            logger.info("Loaded agent state", agent_uuid=self.agent_uuid, messages=len(config.messages))
             self._initialized = True
-            return config
+            return config_dict
             
         except Exception as e:
             logger.error("Failed to load agent state", agent_uuid=self.agent_uuid, exc_info=True)
@@ -2062,14 +2070,26 @@ class AnthropicAgent:
             default_flow_style=False,
         )
     
+    def _stored_config_to_dict(self, config: StoredAgentConfig) -> dict[str, Any]:
+        """Convert StoredAgentConfig dataclass to dict for _restore_state_from_config.
+        
+        Args:
+            config: StoredAgentConfig dataclass instance
+            
+        Returns:
+            Dictionary representation of the config
+        """
+        from dataclasses import asdict
+        return asdict(config)
+    
     def _restore_state_from_config(self, config: dict[str, Any]) -> None:
         """Restore agent state from a loaded configuration dict.
         
-        Called by initialize() after loading config from database.
+        Called by initialize() after loading config from storage.
         Updates agent instance variables with persisted state.
         
         Args:
-            config: Configuration dict loaded from database
+            config: Configuration dict loaded from storage
         """
         # Restore messages and container state
         self.messages = config.get("messages", [])
@@ -2137,67 +2157,61 @@ class AnthropicAgent:
     @retry_with_backoff(max_retries=3, base_delay=1.0)
     async def _save_agent_config(self) -> None:
         """
-        Save current agent configuration to database.
+        Save current agent configuration to storage.
         
-        This method saves the resumable agent configuration to the database.
+        This method saves the resumable agent configuration to storage.
         Preserves created_at from existing config and increments total_runs.
         """
         # Load existing config to preserve created_at and increment total_runs
-        existing_config = await self.db_backend.load_agent_config(self.agent_uuid)
-        existing_config = existing_config or {}
+        existing_config = await self.config_adapter.load(self.agent_uuid)
         
-        config = {
-            "agent_uuid": self.agent_uuid,
-            "system_prompt": self.system_prompt,
-            "model": self.model,
-            "max_steps": self.max_steps,
-            "thinking_tokens": self.thinking_tokens,
-            "max_tokens": self.max_tokens,
-            "container_id": self.container_id,
-            "messages": self.messages,
-            "tool_schemas": self.tool_schemas,
-            "tool_names": [t["name"] for t in self.tool_schemas] if self.tool_schemas else [],
-            "beta_headers": self.beta_headers,
-            "server_tools": self.server_tools,
-            "formatter": self.formatter,
-            "stream_meta_history_and_tool_results": self.stream_meta_history_and_tool_results,
-            "file_registry": self.file_registry,
-            "max_retries": self.max_retries,
-            "base_delay": self.base_delay,
-            "api_kwargs": self.api_kwargs,
-            "last_known_input_tokens": self._last_known_input_tokens,
-            "last_known_output_tokens": self._last_known_output_tokens,
+        # Get run_start_time as ISO string if available
+        run_start_time = getattr(self, "_run_start_time", None)
+        last_run_at_str = run_start_time.isoformat() if run_start_time else None
+        
+        config = StoredAgentConfig(
+            agent_uuid=self.agent_uuid,
+            system_prompt=self.system_prompt,
+            model=self.model,
+            max_steps=self.max_steps,
+            thinking_tokens=self.thinking_tokens,
+            max_tokens=self.max_tokens,
+            container_id=self.container_id,
+            messages=self.messages,
+            tool_schemas=self.tool_schemas,
+            tool_names=[t["name"] for t in self.tool_schemas] if self.tool_schemas else [],
+            beta_headers=self.beta_headers or [],
+            server_tools=self.server_tools or [],
+            formatter=self.formatter,
+            stream_meta_history_and_tool_results=self.stream_meta_history_and_tool_results,
+            file_registry=self.file_registry,
+            max_retries=self.max_retries,
+            base_delay=self.base_delay,
+            api_kwargs=self.api_kwargs,
+            last_known_input_tokens=self._last_known_input_tokens or 0,
+            last_known_output_tokens=self._last_known_output_tokens or 0,
             # Frontend tool relay state (for resume after browser execution)
-            "pending_frontend_tools": self._pending_frontend_tools,
-            "pending_backend_results": self._pending_backend_results,
-            "awaiting_frontend_tools": self._awaiting_frontend_tools,
-            "current_step": self._current_step,
+            pending_frontend_tools=self._pending_frontend_tools,
+            pending_backend_results=self._pending_backend_results,
+            awaiting_frontend_tools=self._awaiting_frontend_tools,
+            current_step=self._current_step,
             # NOTE: This conversation_history is the per-run history used to populate AgentResult.
             # When frontend tools cause a pause, this preserves the current run's history so it
             # can be returned in the AgentResult after continuation. This is distinct from the
             # conversation_history TABLE which stores completed runs across multiple user turns.
-            "conversation_history": getattr(self, "conversation_history", []),
-            "title": existing_config.get("title"),
-            # Preserve created_at from existing config, or set to now (as datetime)
-            "created_at": (
-                datetime.fromisoformat(existing_config["created_at"].replace("Z", "+00:00"))
-                if isinstance(existing_config.get("created_at"), str)
-                else (existing_config.get("created_at") or datetime.now())
-            ),
-            "updated_at": datetime.now(),
-            "last_run_at": getattr(self, "_run_start_time", None),
+            conversation_history=getattr(self, "conversation_history", []),
+            title=existing_config.title if existing_config else None,
+            # Preserve created_at from existing config, or set to now
+            created_at=existing_config.created_at if existing_config else datetime.now().isoformat(),
+            updated_at=datetime.now().isoformat(),
+            last_run_at=last_run_at_str,
             # Increment total_runs counter
-            "total_runs": existing_config.get("total_runs", 0) + 1,
-        }
+            total_runs=(existing_config.total_runs if existing_config else 0) + 1,
+            compactor_type=self.compactor.__class__.__name__ if self.compactor else None,
+            memory_store_type=self.memory_store.__class__.__name__ if self.memory_store else None,
+        )
         
-        # Add component configs
-        if self.compactor:
-            config["compactor_type"] = self.compactor.__class__.__name__
-        
-        if self.memory_store:
-            config["memory_store_type"] = self.memory_store.__class__.__name__
-        
-        await self.db_backend.save_agent_config(config)
+        await self.config_adapter.save(config)
     
     @retry_with_backoff(max_retries=3, base_delay=1.0)
     async def _save_conversation_entry(
@@ -2205,7 +2219,7 @@ class AnthropicAgent:
         result: AgentResult,
         files_metadata: list[dict]
     ) -> None:
-        """Save conversation history entry to database."""
+        """Save conversation history entry to storage."""
         
         # Extract user message (first user message in conversation_history)
         user_message = ""
@@ -2231,34 +2245,34 @@ class AnthropicAgent:
                     final_response = block.text
                     break
         
-        conversation = {
-            "conversation_id": str(uuid.uuid4()),
-            "agent_uuid": self.agent_uuid,
-            "run_id": self._run_id,
-            "started_at": self._run_start_time,
-            "completed_at": datetime.now(),
-            "user_message": user_message,
-            "final_response": final_response,
-            "messages": result.conversation_history,
-            "stop_reason": result.stop_reason,
-            "total_steps": result.total_steps,
-            "usage": {
+        conversation = Conversation(
+            conversation_id=str(uuid.uuid4()),
+            agent_uuid=self.agent_uuid,
+            run_id=self._run_id,
+            started_at=self._run_start_time.isoformat() if self._run_start_time else None,
+            completed_at=datetime.now().isoformat(),
+            user_message=user_message,
+            final_response=final_response,
+            messages=result.conversation_history,
+            stop_reason=result.stop_reason,
+            total_steps=result.total_steps,
+            usage={
                 "input_tokens": result.usage.input_tokens,
                 "output_tokens": result.usage.output_tokens,
                 "cache_creation_input_tokens": result.usage.cache_creation_input_tokens,
                 "cache_read_input_tokens": result.usage.cache_read_input_tokens,
             },
             # Persist full file metadata snapshot associated with this run
-            "generated_files": files_metadata,
-            "created_at": datetime.now(),
-        }
+            generated_files=files_metadata,
+            created_at=datetime.now().isoformat(),
+        )
         
-        await self.db_backend.save_conversation_history(conversation)
+        await self.conversation_adapter.save(conversation)
     
     @retry_with_backoff(max_retries=3, base_delay=1.0)
     async def _save_run_logs(self) -> None:
-        """Persist batched agent run logs to the database."""
-        await self.db_backend.save_agent_run_logs(
+        """Persist batched agent run logs to storage."""
+        await self.run_adapter.save_logs(
             self.agent_uuid,
             self._run_id,
             self._run_logs_buffer
@@ -2283,18 +2297,15 @@ class AnthropicAgent:
         
         Only runs for new conversations (no existing title).
         """
-        if not self.db_backend:
-            return
-        
         # Check if title already exists
-        existing_config = await self.db_backend.load_agent_config(self.agent_uuid)
-        if existing_config and existing_config.get("title"):
+        existing_config = await self.config_adapter.load(self.agent_uuid)
+        if existing_config and existing_config.title:
             return  # Don't overwrite existing title
         
         title = await generate_title(user_message)
         
         try:
-            await self.db_backend.update_agent_title(self.agent_uuid, title)
+            await self.config_adapter.update_title(self.agent_uuid, title)
             logger.info("Generated title", agent_uuid=self.agent_uuid, title=title)
         except Exception as e:
             logger.error("Failed to save title", agent_uuid=self.agent_uuid, exc_info=True)
