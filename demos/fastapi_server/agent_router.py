@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, model_validator
 from anthropic_agent.core import AnthropicAgent
 from anthropic_agent.file_backends import S3Backend
 from anthropic_agent.tools import SAMPLE_TOOL_FUNCTIONS, tool, ToolResult
-from .storage import config_adapter, conversation_adapter, run_adapter
+from storage import config_adapter, conversation_adapter, run_adapter
 
 logger = logging.getLogger(__name__)
 
