@@ -36,7 +36,7 @@ def test_tool_decorator_missing_type_hint_raises() -> None:
             return str(a or b)
 
 
-def test_tool_decorator_optional_parameters_nullable() -> None:
+def test_tool_decorator_optional_parameters_not_required() -> None:
     @tool
     def greet(name: str, language: str = "en") -> str:
         """Greet a user in an optional language.
@@ -49,7 +49,9 @@ def test_tool_decorator_optional_parameters_nullable() -> None:
 
     schema = greet.__tool_schema__["input_schema"]
     assert "language" not in schema.get("required", [])
-    assert schema["properties"]["language"]["nullable"] is True
+    assert "name" in schema.get("required", [])
+    # language should still have its type defined
+    assert schema["properties"]["language"]["type"] == "string"
 
 
 def test_tool_decorator_handles_nested_types() -> None:

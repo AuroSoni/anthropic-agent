@@ -3,6 +3,7 @@ import asyncio
 import pytest
 from anthropic_agent.tools import tool
 from anthropic_agent.core import AnthropicAgent
+from anthropic_agent.storage import MemoryAgentConfigAdapter
 
 
 # Define a frontend tool for testing
@@ -69,7 +70,6 @@ class TestAgentFrontendToolsInit:
         agent = AnthropicAgent(
             tools=[add_numbers],
             frontend_tools=[user_confirm],
-            db_backend="filesystem",
         )
         
         # Check frontend tool schemas are stored
@@ -87,7 +87,6 @@ class TestAgentFrontendToolsInit:
         """Agent should initialize frontend tool relay state."""
         agent = AnthropicAgent(
             frontend_tools=[user_confirm],
-            db_backend="filesystem",
         )
         
         assert agent._pending_frontend_tools == []
@@ -99,7 +98,6 @@ class TestAgentFrontendToolsInit:
         """Agent without frontend tools should still work."""
         agent = AnthropicAgent(
             tools=[add_numbers],
-            db_backend="filesystem",
         )
         
         assert len(agent.frontend_tool_schemas) == 0
@@ -113,7 +111,6 @@ class TestContinueWithToolResultsValidation:
         """Should raise ValueError when not awaiting frontend tools."""
         agent = AnthropicAgent(
             frontend_tools=[user_confirm],
-            db_backend="filesystem",
         )
         
         async def run_test():
@@ -128,7 +125,6 @@ class TestContinueWithToolResultsValidation:
         """Should raise ValueError when pending tools list is empty."""
         agent = AnthropicAgent(
             frontend_tools=[user_confirm],
-            db_backend="filesystem",
         )
         # Manually set awaiting flag without pending tools
         agent._awaiting_frontend_tools = True
@@ -146,7 +142,6 @@ class TestContinueWithToolResultsValidation:
         """Should raise ValueError when tool_use_ids don't match."""
         agent = AnthropicAgent(
             frontend_tools=[user_confirm],
-            db_backend="filesystem",
         )
         # Set up pending state
         agent._awaiting_frontend_tools = True
@@ -172,7 +167,6 @@ class TestPrepareRequestParamsIncludesFrontendTools:
         agent = AnthropicAgent(
             tools=[add_numbers],
             frontend_tools=[user_confirm],
-            db_backend="filesystem",
         )
         
         params = agent._prepare_request_params()
@@ -189,14 +183,13 @@ class TestStatePersistence:
     
     def test_save_agent_config_includes_relay_state(self):
         """_save_agent_config should include frontend tool relay state."""
-        import tempfile
-        import os
+        adapter = MemoryAgentConfigAdapter()
         
-        # Create agent with filesystem backend for testing
+        # Create agent with memory adapter for testing
         agent = AnthropicAgent(
             frontend_tools=[user_confirm],
             tools=[add_numbers],
-            db_backend="filesystem",
+            config_adapter=adapter,
         )
         
         # Set some relay state
@@ -213,25 +206,27 @@ class TestStatePersistence:
         async def run_test():
             await agent._save_agent_config()
             
-            # Load config back
-            loaded_config = await agent.db_backend.load_agent_config(agent.agent_uuid)
+            # Load config back via the adapter
+            loaded_config = await adapter.load(agent.agent_uuid)
             
             assert loaded_config is not None
-            assert loaded_config.get("pending_frontend_tools") == agent._pending_frontend_tools
-            assert loaded_config.get("pending_backend_results") == agent._pending_backend_results
-            assert loaded_config.get("awaiting_frontend_tools") == True
-            assert loaded_config.get("current_step") == 3
+            assert loaded_config.pending_frontend_tools == agent._pending_frontend_tools
+            assert loaded_config.pending_backend_results == agent._pending_backend_results
+            assert loaded_config.awaiting_frontend_tools == True
+            assert loaded_config.current_step == 3
         
         asyncio.run(run_test())
     
     def test_agent_rehydration_restores_relay_state(self):
         """Agent created with agent_uuid should restore relay state from DB."""
+        # Shared adapter so agent2 can read what agent1 wrote
+        adapter = MemoryAgentConfigAdapter()
         
-        # Create first agent and set state (sync context)
+        # Create first agent and set state
         agent1 = AnthropicAgent(
             frontend_tools=[user_confirm],
             tools=[add_numbers],
-            db_backend="filesystem",
+            config_adapter=adapter,
         )
         
         # Set relay state
@@ -250,11 +245,11 @@ class TestStatePersistence:
         asyncio.run(agent1._save_agent_config())
         saved_uuid = agent1.agent_uuid
         
-        # Create second agent with same UUID
+        # Create second agent with same UUID and same adapter
         agent2 = AnthropicAgent(
             frontend_tools=[user_confirm],
             tools=[add_numbers],
-            db_backend="filesystem",
+            config_adapter=adapter,
             agent_uuid=saved_uuid,
         )
         

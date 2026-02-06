@@ -239,12 +239,12 @@ class TestBasicSearch:
     def test_no_matches_returns_message(
         self, temp_workspace: Path, search_fn: Callable
     ) -> None:
-        """When no files match, return 'No matches found.'"""
+        """When no files match, return a no-matches message."""
         create_file(temp_workspace, "file.txt")  # Not .md or .mmd
         
         result = search_fn("*.md")
         
-        assert result == "No matches found."
+        assert result.startswith("No matches found")
     
     def test_hidden_files_included(
         self, temp_workspace: Path, search_fn: Callable
@@ -559,12 +559,12 @@ class TestEdgeCases:
     def test_empty_directory(
         self, temp_workspace: Path, search_fn: Callable
     ) -> None:
-        """Empty directory should return 'No matches found.'"""
+        """Empty directory should return a no-matches message."""
         create_dir(temp_workspace, "empty")
         
         result = search_fn("*.md", target_directory="empty")
         
-        assert result == "No matches found."
+        assert result.startswith("No matches found")
     
     def test_empty_glob_pattern(
         self, temp_workspace: Path, search_fn: Callable

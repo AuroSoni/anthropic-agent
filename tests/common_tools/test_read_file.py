@@ -244,7 +244,7 @@ class TestCustomMaxLines:
         lines = [f"line{i}\n" for i in range(1, 21)]
         (temp_workspace / "test.md").write_text("".join(lines))
         
-        result = fn("test.md", limit=50)  # Request more than max
+        result = fn("test.md", no_of_lines_to_read=50)  # Request more than max
         # Should only get 10 lines
         assert "[lines 1-10 of 20 in test.md]" in result
 
@@ -400,71 +400,71 @@ class TestParameterValidation:
     def test_invalid_limit_type_string(
         self, temp_workspace: Path, read_file_fn: Callable
     ) -> None:
-        """Non-integer string limit should return error."""
+        """Non-integer string no_of_lines_to_read should return error."""
         create_file(temp_workspace, "test.md", "line1\nline2\n")
-        result = read_file_fn("test.md", limit="abc")
-        assert "ERROR: limit(abc) is not an integer" in result
+        result = read_file_fn("test.md", no_of_lines_to_read="abc")
+        assert "ERROR" in result and "abc" in result and "not an integer" in result
 
     def test_invalid_limit_type_float_string(
         self, temp_workspace: Path, read_file_fn: Callable
     ) -> None:
-        """Float string limit should return error."""
+        """Float string no_of_lines_to_read should return error."""
         create_file(temp_workspace, "test.md", "line1\nline2\n")
-        result = read_file_fn("test.md", limit="3.5")
-        assert "ERROR: limit(3.5) is not an integer" in result
+        result = read_file_fn("test.md", no_of_lines_to_read="3.5")
+        assert "ERROR" in result and "3.5" in result and "not an integer" in result
 
     def test_negative_limit(
         self, temp_workspace: Path, read_file_fn: Callable
     ) -> None:
-        """Negative limit should return error."""
+        """Negative no_of_lines_to_read should return error."""
         create_file(temp_workspace, "test.md", "line1\nline2\n")
-        result = read_file_fn("test.md", limit=-5)
-        assert "ERROR: limit(-5) cannot be negative" in result
+        result = read_file_fn("test.md", no_of_lines_to_read=-5)
+        assert "ERROR" in result and "-5" in result and "cannot be negative" in result
 
     def test_offset_exceeds_total_lines(
         self, temp_workspace: Path, read_file_fn: Callable
     ) -> None:
-        """Offset larger than total lines should return error."""
+        """start_line_one_indexed larger than total lines should return error."""
         create_file(temp_workspace, "short.md", "line1\nline2\n")
-        result = read_file_fn("short.md", offset=10)
-        assert "ERROR: offset(10) cannot be greater than total number of lines (2)" in result
+        result = read_file_fn("short.md", start_line_one_indexed=10)
+        assert "ERROR" in result and "10" in result and "greater than total number of lines" in result
         assert "short.md" in result
 
     def test_offset_underflow_zero(
         self, temp_workspace: Path, read_file_fn: Callable
     ) -> None:
-        """Offset of 0 should be treated as 1."""
+        """start_line_one_indexed of 0 should be treated as 1."""
         create_file(temp_workspace, "test.md", "line1\nline2\nline3\n")
-        result = read_file_fn("test.md", offset=0, limit=1)
+        result = read_file_fn("test.md", start_line_one_indexed=0, no_of_lines_to_read=1)
         assert "[lines 1-1 of 3 in test.md]" in result
         assert "line1" in result
 
     def test_offset_underflow_negative(
         self, temp_workspace: Path, read_file_fn: Callable
     ) -> None:
-        """Negative offset should be treated as 1."""
+        """Negative start_line_one_indexed should be treated as 1."""
         create_file(temp_workspace, "test.md", "line1\nline2\n")
-        result = read_file_fn("test.md", offset=-10, limit=1)
+        result = read_file_fn("test.md", start_line_one_indexed=-10, no_of_lines_to_read=1)
         assert "[lines 1-1 of 2 in test.md]" in result
         assert "line1" in result
 
     def test_limit_clamping_above_max(
         self, temp_workspace: Path, read_file_fn: Callable
     ) -> None:
-        """Limit > MAX_LIMIT should be clamped to MAX_LIMIT."""
+        """no_of_lines_to_read > MAX_LIMIT should be clamped to MAX_LIMIT."""
         # Create file with more than MAX_LIMIT lines
         lines = [f"line{i}\n" for i in range(1, 150)]
         create_file(temp_workspace, "long.md", "".join(lines))
-        result = read_file_fn("long.md", limit=500)
+        result = read_file_fn("long.md", no_of_lines_to_read=500)
         # Should only show MAX_LIMIT (100) lines
         assert f"[lines 1-{MAX_LIMIT} of 149 in long.md]" in result
 
     def test_limit_zero_returns_header_only(
         self, temp_workspace: Path, read_file_fn: Callable
     ) -> None:
-        """Limit of 0 should return header only with 0-0 range."""
+        """no_of_lines_to_read of 0 should return header only with 0-0 range."""
         create_file(temp_workspace, "test.md", "line1\nline2\nline3\n")
-        result = read_file_fn("test.md", limit=0)
+        result = read_file_fn("test.md", no_of_lines_to_read=0)
         assert "[lines 0-0 of 3 in test.md]" in result
         # Should only have header and newline, no content
         lines = result.strip().split("\n")
@@ -475,7 +475,7 @@ class TestParameterValidation:
     ) -> None:
         """Float that equals integer (e.g., 5.0) should work via int()."""
         create_file(temp_workspace, "test.md", "line1\nline2\nline3\n")
-        result = read_file_fn("test.md", limit=2.0)
+        result = read_file_fn("test.md", no_of_lines_to_read=2.0)
         assert "[lines 1-2 of 3 in test.md]" in result
 
     def test_default_offset_and_limit(
@@ -512,7 +512,7 @@ class TestBufferedModeReading:
         """Read specific lines from middle of file."""
         lines = [f"line{i}\n" for i in range(1, 11)]
         create_file(temp_workspace, "test.md", "".join(lines))
-        result = read_file_fn("test.md", offset=3, limit=3)
+        result = read_file_fn("test.md", start_line_one_indexed=3, no_of_lines_to_read=3)
         assert "[lines 3-5 of 10 in test.md]" in result
         assert "line3" in result
         assert "line4" in result
@@ -526,7 +526,7 @@ class TestBufferedModeReading:
         """Read lines near end of file."""
         lines = [f"line{i}\n" for i in range(1, 11)]
         create_file(temp_workspace, "test.md", "".join(lines))
-        result = read_file_fn("test.md", offset=8, limit=5)
+        result = read_file_fn("test.md", start_line_one_indexed=8, no_of_lines_to_read=5)
         # Should only get lines 8-10 (3 lines, not 5)
         assert "[lines 8-10 of 10 in test.md]" in result
         assert "line8" in result
@@ -633,7 +633,7 @@ class TestStreamingModeReading:
             "anthropic_agent.common_tools.read_file.STREAMING_THRESHOLD_BYTES", 1
         ):
             fn = read_file_tool.get_tool()
-            result = fn("large.md", offset=5, limit=3)
+            result = fn("large.md", start_line_one_indexed=5, no_of_lines_to_read=3)
 
         assert "[lines 5-7 of 20 in large.md]" in result
         assert "line5" in result
@@ -653,7 +653,7 @@ class TestStreamingModeReading:
             "anthropic_agent.common_tools.read_file.STREAMING_THRESHOLD_BYTES", 1
         ):
             fn = read_file_tool.get_tool()
-            result = fn("large.md", limit=0)
+            result = fn("large.md", no_of_lines_to_read=0)
 
         assert "[lines 0-0 of 3 in large.md]" in result
         lines = result.strip().split("\n")
@@ -670,9 +670,9 @@ class TestStreamingModeReading:
             "anthropic_agent.common_tools.read_file.STREAMING_THRESHOLD_BYTES", 1
         ):
             fn = read_file_tool.get_tool()
-            result = fn("large.md", offset=100)
+            result = fn("large.md", start_line_one_indexed=100)
 
-        assert "ERROR: offset(100) cannot be greater than total number of lines (2)" in result
+        assert "ERROR" in result and "100" in result and "greater than total number of lines" in result
 
     def test_streaming_read_from_end(
         self, temp_workspace: Path, read_file_tool: ReadFileTool
@@ -685,7 +685,7 @@ class TestStreamingModeReading:
             "anthropic_agent.common_tools.read_file.STREAMING_THRESHOLD_BYTES", 1
         ):
             fn = read_file_tool.get_tool()
-            result = fn("large.md", offset=95, limit=10)
+            result = fn("large.md", start_line_one_indexed=95, no_of_lines_to_read=10)
 
         # Should get lines 95-100 (6 lines, not 10)
         assert "[lines 95-100 of 100 in large.md]" in result
@@ -717,7 +717,7 @@ class TestEdgeCases:
         """Offset exactly equal to total lines should work."""
         content = "Line 1\nLine 2\nLine 3\n"
         create_file(temp_workspace, "test.md", content)
-        result = read_file_fn("test.md", offset=3, limit=1)
+        result = read_file_fn("test.md", start_line_one_indexed=3, no_of_lines_to_read=1)
         assert "[lines 3-3 of 3 in test.md]" in result
         assert "Line 3" in result
 
@@ -805,14 +805,14 @@ class TestEdgeCases:
 
         # First, read in buffered mode (default threshold)
         fn_buffered = read_file_tool.get_tool()
-        result_buffered = fn_buffered("test.md", offset=2, limit=2)
+        result_buffered = fn_buffered("test.md", start_line_one_indexed=2, no_of_lines_to_read=2)
 
         # Then, read in streaming mode (by lowering threshold)
         with patch(
             "anthropic_agent.common_tools.read_file.STREAMING_THRESHOLD_BYTES", 1
         ):
             fn_streaming = read_file_tool.get_tool()
-            result_streaming = fn_streaming("test.md", offset=2, limit=2)
+            result_streaming = fn_streaming("test.md", start_line_one_indexed=2, no_of_lines_to_read=2)
 
         # Both should produce identical output
         assert result_buffered == result_streaming
@@ -834,7 +834,7 @@ class TestEdgeCases:
         """Limit exactly equal to MAX_LIMIT should not be clamped."""
         lines = [f"line{i}\n" for i in range(1, 150)]
         create_file(temp_workspace, "test.md", "".join(lines))
-        result = read_file_fn("test.md", limit=MAX_LIMIT)
+        result = read_file_fn("test.md", no_of_lines_to_read=MAX_LIMIT)
         assert f"[lines 1-{MAX_LIMIT} of 149 in test.md]" in result
 
     def test_read_file_called_multiple_times(

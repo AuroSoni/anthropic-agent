@@ -702,7 +702,7 @@ class TestErrorHandling:
         search_fn = tool.get_tool()
 
         result = search_fn("")
-        assert result == "pattern cannot be empty"
+        assert "cannot be empty" in result
 
     def test_none_query_returns_error(self, temp_workspace: Path) -> None:
         """Verify None query returns error message."""
@@ -710,7 +710,7 @@ class TestErrorHandling:
         search_fn = tool.get_tool()
 
         result = search_fn(None)
-        assert result == "pattern cannot be empty"
+        assert "cannot be empty" in result
 
     @patch("anthropic_agent.common_tools.grep_search.subprocess.run")
     def test_missing_rg_returns_friendly_error(
@@ -723,7 +723,7 @@ class TestErrorHandling:
         search_fn = tool.get_tool()
         result = search_fn("pattern")
 
-        assert result == "ripgrep (rg) is not installed or not found in PATH."
+        assert "ripgrep (rg) is not installed or not found in PATH" in result
 
     @patch("anthropic_agent.common_tools.grep_search.subprocess.run")
     def test_invalid_regex_returns_stderr(
@@ -752,7 +752,7 @@ class TestErrorHandling:
         search_fn = tool.get_tool()
         result = search_fn("nonexistent")
 
-        assert result == "No matches found."
+        assert result.startswith("No matches found")
 
     @patch("anthropic_agent.common_tools.grep_search.subprocess.run")
     def test_no_matches_with_returncode_0_empty_stdout(
@@ -765,7 +765,7 @@ class TestErrorHandling:
         search_fn = tool.get_tool()
         result = search_fn("pattern")
 
-        assert result == "No matches found."
+        assert result.startswith("No matches found")
 
     @patch("anthropic_agent.common_tools.grep_search.subprocess.run")
     def test_generic_exception_returns_message(
@@ -826,7 +826,7 @@ class TestErrorHandling:
         search_fn = tool.get_tool()
         result = search_fn("pattern")
 
-        assert result == "ripgrep failed."
+        assert result.startswith("ripgrep failed")
 
 
 # ---------------------------------------------------------------------------

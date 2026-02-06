@@ -11,7 +11,7 @@ from typing import Protocol, Dict, Any, Callable, Literal, Optional, TYPE_CHECKI
 from .decorators import tool
 
 if TYPE_CHECKING:
-    from anthropic_agent.file_backends.backends import FileStorageBackend
+    from anthropic_agent.file_backends.base import FileStorageBackend
 
 # Type alias for tool result content that can be sent to Anthropic API
 ToolResultContent = str | list[dict[str, Any]]
@@ -76,7 +76,7 @@ class ToolResult:
         """
         return cls(content=[text, ImageBlock(image_data, media_type)])
     
-    def to_api_format(
+    async def to_api_format(
         self,
         file_backend: "FileStorageBackend | None" = None,
         agent_uuid: str | None = None,
@@ -129,7 +129,7 @@ class ToolResult:
                     filename = f"{image_id}.{ext}"
                     
                     # Store image using file backend
-                    metadata = file_backend.store(
+                    metadata = await file_backend.store(
                         file_id=image_id,
                         filename=filename,
                         content=item.data,
@@ -137,10 +137,9 @@ class ToolResult:
                     )
                     
                     # Build streaming reference based on backend type
-                    storage_backend = metadata.get("storage_backend", "local")
-                    if storage_backend == "s3":
+                    if metadata.storage_backend == "s3":
                         # S3: use direct URL (presigned if needed)
-                        src = metadata.get("storage_location", "")
+                        src = metadata.storage_location or ""
                     else:
                         # Local: use API path
                         src = f"/agent/{agent_uuid}/images/{image_id}"
@@ -235,7 +234,7 @@ class ToolRegistry:
             name = schema['name']
             self.register(name, func, schema)
     
-    def execute(
+    async def execute(
         self,
         tool_name: str,
         tool_input: Dict[str, Any],
@@ -264,7 +263,7 @@ class ToolRegistry:
             
             # Handle ToolResult wrapper
             if isinstance(result, ToolResult):
-                return result.to_api_format(file_backend, agent_uuid)
+                return await result.to_api_format(file_backend, agent_uuid)
             
             # Backward compatibility: raw string returns
             return result, []

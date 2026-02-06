@@ -1066,7 +1066,7 @@ class AnthropicAgent:
         
         return request_params
     
-    def execute_tool_call(
+    async def execute_tool_call(
         self,
         tool_name: str,
         tool_input: dict,
@@ -1085,7 +1085,7 @@ class AnthropicAgent:
         if not self.tool_registry:
             return "No tools have been registered for this agent.", []
         
-        return self.tool_registry.execute(
+        return await self.tool_registry.execute(
             tool_name,
             tool_input,
             file_backend=self.file_backend,
@@ -2627,7 +2627,7 @@ class AnthropicAgent:
                 # Decide whether to store or update based on existing backend metadata
                 has_backend_metadata = "storage_backend" in registry_entry
                 if has_backend_metadata:
-                    metadata = self.file_backend.update(
+                    metadata_obj = await self.file_backend.update(
                         file_id=file_id,
                         filename=filename,
                         content=content_bytes,
@@ -2635,12 +2635,13 @@ class AnthropicAgent:
                         agent_uuid=self.agent_uuid,
                     )
                 else:
-                    metadata = self.file_backend.store(
+                    metadata_obj = await self.file_backend.store(
                         file_id=file_id,
                         filename=filename,
                         content=content_bytes,
                         agent_uuid=self.agent_uuid,
                     )
+                metadata = metadata_obj.to_dict()
 
                 # Attach step information for this processing pass
                 metadata["processed_at_step"] = step
@@ -2676,7 +2677,7 @@ class AnthropicAgent:
             return
         
         # Format as JSON inside custom content block
-        files_json = json.dumps({"files": metadata}, indent=2)
+        files_json = json.dumps({"files": metadata}, default=str, separators=(",", ":"))
         meta_tag = f'<content-block-meta_files><![CDATA[{files_json}]]></content-block-meta_files>'
         
         await queue.put(meta_tag)

@@ -1,7 +1,10 @@
 """File storage backends for Anthropic agent."""
 
-from .backends import (
+from .base import (
+    FileMetadata,
     FileStorageBackend,
+)
+from .backends import (
     NoOpBackend,
     LocalFilesystemBackend,
     S3Backend,
@@ -13,6 +16,7 @@ from .registry import (
 )
 
 __all__ = [
+    "FileMetadata",
     "FileStorageBackend",
     "NoOpBackend",
     "LocalFilesystemBackend",
@@ -21,4 +25,3 @@ __all__ = [
     "get_file_backend",
     "FILE_BACKENDS",
 ]
-

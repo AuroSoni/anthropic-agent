@@ -178,9 +178,8 @@ async function streamToolResultsContinuation(
           xmlInsertionPoints.push({ afterMainBlockCount: mainBlockCount, xmlNodeIndex: i });
         }
       } else {
-        const unescaped = data.replace(/\\\\/g, '\\');
         try {
-          const event = JSON.parse(unescaped) as AnthropicEvent;
+          const event = JSON.parse(data) as AnthropicEvent;
           
           // Track when new blocks start
           if (event.type === 'content_block_start') {
@@ -275,10 +274,11 @@ async function runTest(testCase: TestCase): Promise<TestResult> {
       }
       
       // JSON events from Anthropic API
-      // Backend escapes backslashes for SSE transport, so unescape before parsing
-      const unescaped = chunk.replace(/\\\\/g, '\\');
+      // model_dump_json() produces valid compact JSON; stream_to_aqueue() only
+      // escapes literal newlines as a safety net (no-op for valid JSON).
+      // No client-side unescaping is needed — parse the chunk as-is.
       try {
-        const event = JSON.parse(unescaped) as AnthropicEvent;
+        const event = JSON.parse(chunk) as AnthropicEvent;
         
         // Track when new blocks start (for interleaving with XML nodes)
         if (event.type === 'content_block_start') {
