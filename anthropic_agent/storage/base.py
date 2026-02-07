@@ -118,7 +118,10 @@ class Conversation:
     
     # Files generated in this run
     generated_files: list[dict] = field(default_factory=list)
-    
+
+    # Cost breakdown for this run (CostBreakdown as dict)
+    cost: dict[str, Any] = field(default_factory=dict)
+
     # Sequence for pagination (auto-assigned)
     sequence_number: int | None = None
     

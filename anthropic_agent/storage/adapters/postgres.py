@@ -177,6 +177,7 @@ def _row_to_conversation(row: asyncpg.Record) -> Conversation:
         total_steps=row["total_steps"],
         usage=_from_jsonb(row["usage"]) or {},
         generated_files=_from_jsonb(row["generated_files"]) or [],
+        cost=_from_jsonb(row["cost"]) or {},
         extras=_from_jsonb(row["extras"]) or {},
         sequence_number=row["sequence_number"],
         created_at=_parse_datetime(row["created_at"]),
@@ -482,12 +483,12 @@ class PostgresConversationAdapter(ConversationAdapter):
             INSERT INTO conversation_history (
                 conversation_id, agent_uuid, run_id, started_at, completed_at,
                 user_message, final_response, messages, stop_reason, total_steps,
-                usage, generated_files, extras, created_at
+                usage, generated_files, cost, extras, created_at
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
             )
         """
-        
+
         async with pool.acquire() as conn:
             await conn.execute(
                 query,
@@ -503,6 +504,7 @@ class PostgresConversationAdapter(ConversationAdapter):
                 conversation.total_steps,
                 _to_jsonb(conversation.usage),
                 _to_jsonb(conversation.generated_files),
+                _to_jsonb(conversation.cost),
                 _to_jsonb(conversation.extras),
                 _to_datetime(conversation.created_at),
             )
@@ -527,7 +529,7 @@ class PostgresConversationAdapter(ConversationAdapter):
             SELECT 
                 conversation_id, agent_uuid, run_id, started_at, completed_at,
                 user_message, final_response, messages, stop_reason, total_steps,
-                usage, generated_files, extras, sequence_number, created_at
+                usage, generated_files, cost, extras, sequence_number, created_at
             FROM conversation_history
             WHERE agent_uuid = $1
             ORDER BY sequence_number DESC
