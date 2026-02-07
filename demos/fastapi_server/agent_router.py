@@ -14,9 +14,9 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from anthropic_agent.core import AnthropicAgent
-from anthropic_agent.database import SQLBackend
 from anthropic_agent.file_backends import S3Backend
 from anthropic_agent.tools import SAMPLE_TOOL_FUNCTIONS, tool, ToolResult
+from storage import config_adapter, conversation_adapter, run_adapter
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +123,9 @@ class AgentConfig(BaseModel):
     context_management: dict | None = None
     beta_headers: list[str] = []
     file_backend: Any = None
-    db_backend: Any = None
+    config_adapter: Any = None
+    conversation_adapter: Any = None
+    run_adapter: Any = None
     formatter: str = "raw"
     stream_meta_history_and_tool_results: bool = False  # Include tool results in stream output
 
@@ -223,7 +225,9 @@ agent_no_tools = AgentConfig(
     thinking_tokens=1024,
     max_tokens=64000,
     file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
-    db_backend=SQLBackend(connection_string=os.getenv("DATABASE_URL")),
+    config_adapter=config_adapter,
+    conversation_adapter=conversation_adapter,
+    run_adapter=run_adapter,
     formatter="raw",
     stream_meta_history_and_tool_results=True,
 )
@@ -235,7 +239,9 @@ agent_client_tools = AgentConfig(
     max_tokens=64000,
     tools=SAMPLE_TOOL_FUNCTIONS,
     file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
-    db_backend=SQLBackend(connection_string=os.getenv("DATABASE_URL")),
+    config_adapter=config_adapter,
+    conversation_adapter=conversation_adapter,
+    run_adapter=run_adapter,
     formatter="raw",
     stream_meta_history_and_tool_results=True,
 )
@@ -286,7 +292,9 @@ agent_all_raw = AgentConfig(
     },
     beta_headers=["code-execution-2025-08-25", "web-fetch-2025-09-10", "files-api-2025-04-14", "context-management-2025-06-27"],
     file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
-    db_backend=SQLBackend(connection_string=os.getenv("DATABASE_URL")),
+    config_adapter=config_adapter,
+    conversation_adapter=conversation_adapter,
+    run_adapter=run_adapter,
     formatter="raw",
     stream_meta_history_and_tool_results=True,
 )
@@ -337,7 +345,9 @@ agent_all_xml = AgentConfig(
     },
     beta_headers=["code-execution-2025-08-25", "web-fetch-2025-09-10", "files-api-2025-04-14", "context-management-2025-06-27"],
     file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
-    db_backend=SQLBackend(connection_string=os.getenv("DATABASE_URL")),
+    config_adapter=config_adapter,
+    conversation_adapter=conversation_adapter,
+    run_adapter=run_adapter,
     formatter="xml",
     stream_meta_history_and_tool_results=True,
 )
@@ -353,7 +363,9 @@ any action that could have consequences, ask for user confirmation using the use
     tools=SAMPLE_TOOL_FUNCTIONS + [read_image_raw],
     frontend_tools=FRONTEND_TOOL_FUNCTIONS,  # Include frontend tools
     file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
-    db_backend=SQLBackend(connection_string=os.getenv("DATABASE_URL")),
+    config_adapter=config_adapter,
+    conversation_adapter=conversation_adapter,
+    run_adapter=run_adapter,
     formatter="xml",  # XML formatter for proper tag streaming
     stream_meta_history_and_tool_results=True,
 )
@@ -369,7 +381,9 @@ any action that could have consequences, ask for user confirmation using the use
     tools=SAMPLE_TOOL_FUNCTIONS + [read_image_raw],
     frontend_tools=FRONTEND_TOOL_FUNCTIONS,
     file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
-    db_backend=SQLBackend(connection_string=os.getenv("DATABASE_URL")),
+    config_adapter=config_adapter,
+    conversation_adapter=conversation_adapter,
+    run_adapter=run_adapter,
     formatter="raw",  # Raw JSON format for testing
     stream_meta_history_and_tool_results=True,
 )
@@ -795,7 +809,6 @@ async def get_tool_image(
 async def list_sessions(
     limit: int = Query(default=50, le=100, description="Maximum number of sessions to return"),
     offset: int = Query(default=0, ge=0, description="Number of sessions to skip"),
-    agent_type: AgentType = Query(default="agent_frontend_tools", description="Agent type to determine database backend"),
 ) -> AgentSessionListResponse:
     """List all agent sessions with metadata.
     
@@ -805,22 +818,12 @@ async def list_sessions(
     Args:
         limit: Maximum number of sessions to return (max 100)
         offset: Number of sessions to skip
-        agent_type: Agent type to determine which database backend to query
         
     Returns:
         AgentSessionListResponse with list of sessions and total count
     """
-    # Get the database backend from the agent config
-    config = AGENT_CONFIGS.get(agent_type)
-    if not config or not config.db_backend:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Agent type '{agent_type}' does not have a database backend configured"
-        )
-    
-    db_backend = config.db_backend
-    
-    sessions, total = await db_backend.list_agent_sessions(limit=limit, offset=offset)
+    # Use shared adapter directly
+    sessions, total = await config_adapter.list_sessions(limit=limit, offset=offset)
     
     return AgentSessionListResponse(
         sessions=[
@@ -842,7 +845,6 @@ async def get_conversations(
     agent_uuid: str,
     before: int | None = Query(default=None, description="Load conversations with sequence_number < before"),
     limit: int = Query(default=20, le=100, description="Maximum conversations to return"),
-    agent_type: AgentType = Query(default="agent_frontend_tools", description="Agent type to determine database backend"),
 ) -> ConversationListResponse:
     """Get paginated conversation history for an agent (newest first).
     
@@ -854,7 +856,6 @@ async def get_conversations(
         agent_uuid: The agent's UUID
         before: Load conversations with sequence_number < this value (None = latest)
         limit: Maximum number of conversations to return (max 100)
-        agent_type: Agent type to determine which database backend to query
         
     Returns:
         ConversationListResponse with conversations and has_more flag
@@ -868,45 +869,35 @@ async def get_conversations(
         GET /agent/{uuid}/conversations?before=31&limit=20
         ```
     """
-    # Get the database backend from the agent config
-    config = AGENT_CONFIGS.get(agent_type)
-    if not config or not config.db_backend:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid agent_type or no database backend configured: {agent_type}",
-        )
-    
-    db_backend = config.db_backend
-    
-    # Load conversations using cursor-based pagination
-    conversations, has_more = await db_backend.load_conversation_history_cursor(
+    # Use conversation adapter - returns list of Conversation dataclasses
+    conversations, has_more = await conversation_adapter.load_cursor(
         agent_uuid=agent_uuid,
         before=before,
         limit=limit,
     )
     
-    # Convert to response models
+    # Convert Conversation dataclasses to response models
     items = [
         ConversationItem(
-            conversation_id=conv.get("conversation_id", ""),
-            run_id=conv.get("run_id", ""),
-            sequence_number=conv.get("sequence_number", 0),
-            user_message=conv.get("user_message", ""),
-            final_response=conv.get("final_response"),
-            started_at=conv.get("started_at"),
-            completed_at=conv.get("completed_at"),
-            stop_reason=conv.get("stop_reason"),
-            total_steps=conv.get("total_steps"),
-            usage=conv.get("usage"),
-            generated_files=conv.get("generated_files"),
-            messages=conv.get("messages", []),
+            conversation_id=conv.conversation_id,
+            run_id=conv.run_id,
+            sequence_number=conv.sequence_number or 0,
+            user_message=conv.user_message,
+            final_response=conv.final_response,
+            started_at=conv.started_at,
+            completed_at=conv.completed_at,
+            stop_reason=conv.stop_reason,
+            total_steps=conv.total_steps,
+            usage=conv.usage,
+            generated_files=conv.generated_files,
+            messages=conv.messages,
         )
         for conv in conversations
     ]
     
-    # Get session title from agent config
-    agent_config = await db_backend.load_agent_config(agent_uuid)
-    session_title = agent_config.get("title") if agent_config else None
+    # Get session title from config adapter
+    agent_config = await config_adapter.load(agent_uuid)
+    session_title = agent_config.title if agent_config else None
     
     return ConversationListResponse(
         conversations=items,

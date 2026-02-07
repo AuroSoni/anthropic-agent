@@ -1,7 +1,9 @@
 """File backend registry and factory functions."""
 
 from typing import Literal
-from .backends import FileStorageBackend, NoOpBackend, LocalFilesystemBackend, S3Backend
+
+from .base import FileStorageBackend
+from .backends import NoOpBackend, LocalFilesystemBackend, S3Backend
 
 # Type for built-in file backend names
 FileBackendType = Literal["local", "s3", "none"]
@@ -16,20 +18,20 @@ FILE_BACKENDS: dict[str, type[FileStorageBackend]] = {
 
 def get_file_backend(
     name: str,
-    **kwargs
+    **kwargs,
 ) -> FileStorageBackend:
     """Factory function to create file backend by name.
-    
+
     Args:
         name: Backend name ("local", "s3", "none")
         **kwargs: Additional arguments passed to backend constructor
-        
+
     Returns:
         Instantiated file backend
-        
+
     Raises:
         ValueError: If backend name is not recognized
-        
+
     Example:
         >>> backend = get_file_backend("local", base_path="/data/files")
         >>> backend = get_file_backend("s3", bucket="my-bucket", region="us-west-2")
@@ -39,7 +41,6 @@ def get_file_backend(
             f"Unknown file backend: {name}. "
             f"Available backends: {', '.join(FILE_BACKENDS.keys())}"
         )
-    
+
     backend_class = FILE_BACKENDS[name]
     return backend_class(**kwargs)
-

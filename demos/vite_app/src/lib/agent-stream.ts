@@ -224,14 +224,15 @@ export async function streamAgent(
         }
       } else {
         // Raw format: content is JSON-encoded Anthropic events
-        // Backend escapes backslashes for SSE transport, so unescape before parsing
-        const unescaped = content.replace(/\\\\/g, '\\');
+        // model_dump_json() produces valid compact JSON; stream_to_aqueue() only
+        // escapes literal newlines as a safety net (no-op for valid JSON).
+        // No client-side unescaping is needed — parse the content as-is.
         try {
-          const anthropicEvent = JSON.parse(unescaped) as AnthropicEvent;
+          const anthropicEvent = JSON.parse(content) as AnthropicEvent;
           (parser as AnthropicStreamParser).processEvent(anthropicEvent);
         } catch (e) {
           // Not valid JSON - might be an error message or other text
-          console.warn('Failed to parse Anthropic event JSON:', unescaped.slice(0, 100), e);
+          console.warn('Failed to parse Anthropic event JSON:', content.slice(0, 100), e);
         }
       }
     } else {
@@ -458,12 +459,11 @@ export async function streamToolResults(
           xmlAccumulationBuffer = '';
         }
       } else {
-        const unescaped = content.replace(/\\\\/g, '\\');
         try {
-          const anthropicEvent = JSON.parse(unescaped) as AnthropicEvent;
+          const anthropicEvent = JSON.parse(content) as AnthropicEvent;
           (parser as AnthropicStreamParser).processEvent(anthropicEvent);
         } catch (e) {
-          console.warn('Failed to parse Anthropic event JSON:', unescaped.slice(0, 100), e);
+          console.warn('Failed to parse Anthropic event JSON:', content.slice(0, 100), e);
         }
       }
     } else {

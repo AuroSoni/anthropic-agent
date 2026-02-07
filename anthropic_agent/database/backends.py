@@ -559,11 +559,13 @@ class SQLBackend:
                 last_known_input_tokens, last_known_output_tokens,
                 title, created_at, updated_at, last_run_at, total_runs,
                 pending_frontend_tools, pending_backend_results,
-                awaiting_frontend_tools, current_step, conversation_history
+                awaiting_frontend_tools, current_step, conversation_history,
+                extras
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                 $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-                $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32
+                $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32,
+                $33
             )
             ON CONFLICT (agent_uuid) DO UPDATE SET
                 system_prompt = EXCLUDED.system_prompt,
@@ -595,7 +597,8 @@ class SQLBackend:
                 pending_backend_results = EXCLUDED.pending_backend_results,
                 awaiting_frontend_tools = EXCLUDED.awaiting_frontend_tools,
                 current_step = EXCLUDED.current_step,
-                conversation_history = EXCLUDED.conversation_history
+                conversation_history = EXCLUDED.conversation_history,
+                extras = EXCLUDED.extras
         """
         
         async with pool.acquire() as conn:
@@ -634,6 +637,7 @@ class SQLBackend:
                 config.get("awaiting_frontend_tools", False),
                 config.get("current_step", 0),
                 self._to_jsonb(config.get("conversation_history", [])),
+                self._to_jsonb(config.get("extras", {})),
             )
         logger.debug("Saved agent config", agent_uuid=config.get("agent_uuid"), backend="sql", config=config)
         
@@ -659,7 +663,7 @@ class SQLBackend:
                 created_at, updated_at, last_run_at, total_runs,
                 pending_frontend_tools, pending_backend_results,
                 awaiting_frontend_tools, current_step, conversation_history,
-                title
+                title, extras
             FROM agent_config
             WHERE agent_uuid = $1
         """
@@ -706,6 +710,7 @@ class SQLBackend:
             "conversation_history": self._from_jsonb(row["conversation_history"]) or [],
             # Title for conversation display
             "title": row["title"],
+            "extras": self._from_jsonb(row["extras"]) or {},
         }
         
         logger.debug("Loaded agent config", agent_uuid=agent_uuid, backend="sql", config=config)
@@ -793,9 +798,9 @@ class SQLBackend:
             INSERT INTO conversation_history (
                 conversation_id, agent_uuid, run_id, started_at, completed_at,
                 user_message, final_response, messages, stop_reason, total_steps,
-                usage, generated_files, created_at
+                usage, generated_files, extras, created_at
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
             )
         """
         
@@ -814,6 +819,7 @@ class SQLBackend:
                 conversation.get("total_steps"),
                 self._to_jsonb(conversation.get("usage")),
                 self._to_jsonb(conversation.get("generated_files")),
+                self._to_jsonb(conversation.get("extras", {})),
                 self._to_datetime(conversation.get("created_at")),
             )
         logger.debug("Saved conversation history", agent_uuid=conversation.get("agent_uuid"), backend="sql", conversation=conversation)
@@ -840,7 +846,7 @@ class SQLBackend:
             SELECT 
                 conversation_id, agent_uuid, run_id, started_at, completed_at,
                 user_message, final_response, messages, stop_reason, total_steps,
-                usage, generated_files, sequence_number, created_at
+                usage, generated_files, extras, sequence_number, created_at
             FROM conversation_history
             WHERE agent_uuid = $1
             ORDER BY sequence_number DESC
@@ -865,6 +871,7 @@ class SQLBackend:
                 "total_steps": row["total_steps"],
                 "usage": self._from_jsonb(row["usage"]),
                 "generated_files": self._from_jsonb(row["generated_files"]),
+                "extras": self._from_jsonb(row["extras"]) or {},
                 "sequence_number": row["sequence_number"],
                 "created_at": self._parse_datetime(row["created_at"]),
             })
@@ -897,7 +904,7 @@ class SQLBackend:
                 SELECT 
                     conversation_id, agent_uuid, run_id, started_at, completed_at,
                     user_message, final_response, messages, stop_reason, total_steps,
-                    usage, generated_files, sequence_number, created_at
+                    usage, generated_files, extras, sequence_number, created_at
                 FROM conversation_history
                 WHERE agent_uuid = $1 AND sequence_number < $2
                 ORDER BY sequence_number DESC
@@ -910,7 +917,7 @@ class SQLBackend:
                 SELECT 
                     conversation_id, agent_uuid, run_id, started_at, completed_at,
                     user_message, final_response, messages, stop_reason, total_steps,
-                    usage, generated_files, sequence_number, created_at
+                    usage, generated_files, extras, sequence_number, created_at
                 FROM conversation_history
                 WHERE agent_uuid = $1
                 ORDER BY sequence_number DESC
@@ -938,6 +945,7 @@ class SQLBackend:
                 "total_steps": row["total_steps"],
                 "usage": self._from_jsonb(row["usage"]),
                 "generated_files": self._from_jsonb(row["generated_files"]),
+                "extras": self._from_jsonb(row["extras"]) or {},
                 "sequence_number": row["sequence_number"],
                 "created_at": self._parse_datetime(row["created_at"]),
             })

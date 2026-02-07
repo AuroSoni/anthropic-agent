@@ -1,0 +1,10 @@
+Major Upgrades:
+    ✔ Make DB Backends and File Backends easily pluggable and extendable. @done(26-02-05 04:21)
+    ☐ Test the new storage architecture.
+
+Minor Fixes:
+    ☐ Improve title generation logic. Save it per conversation.
+    ☐ Factor title generation cost in agent cost tracking.
+
+Potential Improvements:
+    ☐ Better agent run logging for deeper analytics.
