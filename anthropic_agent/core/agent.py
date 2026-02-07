@@ -30,6 +30,7 @@ from ..storage import (
     MemoryAgentRunAdapter,
 )
 from ..file_backends import FileBackendType, get_file_backend, FileStorageBackend
+from ..pricing import calculate_run_cost
 
 logger = get_logger(__name__)
 
@@ -822,6 +823,9 @@ class AnthropicAgent:
                 })
                 logger.info("Memory updated", **memory_metadata)
 
+            # Calculate cost and cumulative usage
+            cost_dict, cumulative_usage = self._calculate_cost_and_cumulative_usage()
+
             # Build AgentResult (generated_files populated after file processing/registry aggregation)
             result = AgentResult(
                 final_message=accumulated_message,
@@ -833,15 +837,20 @@ class AnthropicAgent:
                 container_id=self.container_id,
                 total_steps=step,
                 agent_logs=self.agent_logs.copy(),
-                generated_files=None  # Will be populated from file_registry below
+                generated_files=None,  # Will be populated from file_registry below
+                cost=cost_dict,
+                cumulative_usage=cumulative_usage,
             )
-            
+
             # Log: run completed
             self._log_action("run_completed", {
                 "stop_reason": accumulated_message.stop_reason,
                 "total_steps": step,
-                "total_input_tokens": accumulated_message.usage.input_tokens,
-                "total_output_tokens": accumulated_message.usage.output_tokens,
+                "total_input_tokens": cumulative_usage["input_tokens"],
+                "total_output_tokens": cumulative_usage["output_tokens"],
+                "total_cache_creation_input_tokens": cumulative_usage["cache_creation_input_tokens"],
+                "total_cache_read_input_tokens": cumulative_usage["cache_read_input_tokens"],
+                "cost": cost_dict,
             }, step_number=step)
 
             # Finalize file processing (extract, store, stream)
@@ -855,10 +864,10 @@ class AnthropicAgent:
 
             # Save run data asynchronously with complete file registry snapshot
             self._save_run_data_async(result, all_files_metadata)
-            
+
             # Emit meta_final tag at end of run (only if stream_meta_history_and_tool_results is True)
             await self._emit_meta_final(queue, result)
-            
+
             return result
 
         # Max steps reached - generate final summary
@@ -1457,6 +1466,9 @@ class AnthropicAgent:
                 })
                 logger.info("Memory updated", **memory_metadata)
 
+            # Calculate cost and cumulative usage
+            cost_dict, cumulative_usage = self._calculate_cost_and_cumulative_usage()
+
             # Build AgentResult
             result = AgentResult(
                 final_message=accumulated_message,
@@ -1468,14 +1480,19 @@ class AnthropicAgent:
                 container_id=self.container_id,
                 total_steps=step,
                 agent_logs=self.agent_logs.copy(),
-                generated_files=None
+                generated_files=None,
+                cost=cost_dict,
+                cumulative_usage=cumulative_usage,
             )
-            
+
             self._log_action("run_completed", {
                 "stop_reason": accumulated_message.stop_reason,
                 "total_steps": step,
-                "total_input_tokens": accumulated_message.usage.input_tokens,
-                "total_output_tokens": accumulated_message.usage.output_tokens,
+                "total_input_tokens": cumulative_usage["input_tokens"],
+                "total_output_tokens": cumulative_usage["output_tokens"],
+                "total_cache_creation_input_tokens": cumulative_usage["cache_creation_input_tokens"],
+                "total_cache_read_input_tokens": cumulative_usage["cache_read_input_tokens"],
+                "cost": cost_dict,
             }, step_number=step)
 
             # Finalize file processing
@@ -1483,10 +1500,10 @@ class AnthropicAgent:
             all_files_metadata: list[dict[str, Any]] = list(self.file_registry.values())
             result.generated_files = all_files_metadata
             self._save_run_data_async(result, all_files_metadata)
-            
+
             # Emit meta_final tag at end of run (only if stream_meta_history_and_tool_results is True)
             await self._emit_meta_final(queue, result)
-            
+
             return result
 
         # Max steps reached
@@ -1575,7 +1592,26 @@ class AnthropicAgent:
                 full_text.append(block.text)
         
         return "".join(full_text)
-    
+
+    def _calculate_cost_and_cumulative_usage(self) -> tuple[dict | None, dict]:
+        """Calculate run cost and cumulative token usage from _token_usage_history.
+
+        Returns:
+            Tuple of (cost_dict or None, cumulative_usage_dict).
+            cost_dict is None if model pricing is unknown.
+        """
+        cumulative_usage = {
+            "input_tokens": sum(s.get("input_tokens", 0) or 0 for s in self._token_usage_history),
+            "output_tokens": sum(s.get("output_tokens", 0) or 0 for s in self._token_usage_history),
+            "cache_creation_input_tokens": sum(s.get("cache_creation_input_tokens", 0) or 0 for s in self._token_usage_history),
+            "cache_read_input_tokens": sum(s.get("cache_read_input_tokens", 0) or 0 for s in self._token_usage_history),
+        }
+
+        cost_breakdown = calculate_run_cost(self._token_usage_history, self.model)
+        cost_dict = cost_breakdown.to_dict() if cost_breakdown else None
+
+        return cost_dict, cumulative_usage
+
     async def _emit_meta_final(
         self,
         queue: Optional[asyncio.Queue],
@@ -1599,6 +1635,8 @@ class AnthropicAgent:
             "stop_reason": result.stop_reason,
             "total_steps": result.total_steps,
             "generated_files": result.generated_files,
+            "cost": result.cost,
+            "cumulative_usage": result.cumulative_usage,
         }
         escaped_json = html.escape(json.dumps(meta_final), quote=True)
         await queue.put(f'<meta_final data="{escaped_json}"></meta_final>')
@@ -1727,6 +1765,9 @@ class AnthropicAgent:
             })
             logger.info("Memory updated after final summary", **memory_metadata)
         
+        # Calculate cost and cumulative usage
+        cost_dict, cumulative_usage = self._calculate_cost_and_cumulative_usage()
+
         # Build AgentResult (generated_files populated from file_registry below)
         result = AgentResult(
             final_message=accumulated_message,
@@ -1738,15 +1779,20 @@ class AnthropicAgent:
             container_id=self.container_id,
             total_steps=self.max_steps,
             agent_logs=self.agent_logs.copy(),
-            generated_files=None  # Will be populated from file_registry below
+            generated_files=None,  # Will be populated from file_registry below
+            cost=cost_dict,
+            cumulative_usage=cumulative_usage,
         )
-        
+
         # Log: final summary generated
         self._log_action("final_summary_generation", {
             "stop_reason": accumulated_message.stop_reason,
             "total_steps": self.max_steps,
-            "total_input_tokens": accumulated_message.usage.input_tokens,
-            "total_output_tokens": accumulated_message.usage.output_tokens,
+            "total_input_tokens": cumulative_usage["input_tokens"],
+            "total_output_tokens": cumulative_usage["output_tokens"],
+            "total_cache_creation_input_tokens": cumulative_usage["cache_creation_input_tokens"],
+            "total_cache_read_input_tokens": cumulative_usage["cache_read_input_tokens"],
+            "cost": cost_dict,
         }, step_number=self.max_steps)
 
         # Finalize file processing (extract, store, stream)
@@ -2256,7 +2302,7 @@ class AnthropicAgent:
             messages=result.conversation_history,
             stop_reason=result.stop_reason,
             total_steps=result.total_steps,
-            usage={
+            usage=result.cumulative_usage or {
                 "input_tokens": result.usage.input_tokens,
                 "output_tokens": result.usage.output_tokens,
                 "cache_creation_input_tokens": result.usage.cache_creation_input_tokens,
@@ -2264,6 +2310,7 @@ class AnthropicAgent:
             },
             # Persist full file metadata snapshot associated with this run
             generated_files=files_metadata,
+            cost=result.cost or {},
             created_at=datetime.now().isoformat(),
         )
         

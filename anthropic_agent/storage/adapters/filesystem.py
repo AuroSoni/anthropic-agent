@@ -44,12 +44,8 @@ def _json_default(obj: Any) -> str:
 
 
 def _config_to_dict(config: AgentConfig) -> dict:
-    """Convert AgentConfig to dict, merging extras into top level for backward compat."""
-    data = asdict(config)
-    # Merge extras into top level and remove extras key for backward compatibility
-    extras = data.pop("extras", {})
-    data.update(extras)
-    return data
+    """Convert AgentConfig to dict, preserving extras as a nested field."""
+    return asdict(config)
 
 
 def _dict_to_config(data: dict) -> AgentConfig:
@@ -84,11 +80,8 @@ def _dict_to_config(data: dict) -> AgentConfig:
 
 
 def _conv_to_dict(conv: Conversation) -> dict:
-    """Convert Conversation to dict, merging extras for backward compat."""
-    data = asdict(conv)
-    extras = data.pop("extras", {})
-    data.update(extras)
-    return data
+    """Convert Conversation to dict, preserving extras as a nested field."""
+    return asdict(conv)
 
 
 def _dict_to_conv(data: dict) -> Conversation:
@@ -96,7 +89,7 @@ def _dict_to_conv(data: dict) -> Conversation:
     known_fields = {
         "conversation_id", "agent_uuid", "run_id", "started_at", "completed_at",
         "user_message", "final_response", "messages", "stop_reason", "total_steps",
-        "usage", "generated_files", "sequence_number", "created_at", "extras"
+        "usage", "generated_files", "cost", "sequence_number", "created_at", "extras"
     }
     
     known_data = {}

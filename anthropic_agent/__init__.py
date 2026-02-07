@@ -46,6 +46,13 @@ from .logging import (
     get_logger,
 )
 
+# Pricing exports
+from .pricing import (
+    CostBreakdown,
+    calculate_run_cost,
+    load_pricing,
+)
+
 __version__ = "0.1.0"
 
 __all__ = [
@@ -64,5 +71,9 @@ __all__ = [
     'bind_context',
     'clear_context',
     'get_logger',
+    # Pricing
+    'CostBreakdown',
+    'calculate_run_cost',
+    'load_pricing',
 ]
 

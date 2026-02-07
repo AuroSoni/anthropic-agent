@@ -216,6 +216,9 @@ CREATE TABLE conversation_history (
     -- Files generated in this run
     generated_files JSONB,  -- [{file_id, filename, storage_path, step, ...}]
 
+    -- Cost breakdown for this run
+    cost JSONB DEFAULT '{}'::jsonb,  -- {input_cost, output_cost, cache_write_cost, cache_read_cost, total_cost, total_input_tokens, total_output_tokens, total_cache_creation_tokens, total_cache_read_tokens, model_id, long_context_applied, currency}
+
     -- Custom extension point
     extras JSONB DEFAULT '{}'::jsonb,
     
@@ -334,7 +337,23 @@ EXECUTE FUNCTION set_conversation_sequence();
       "timestamp": "2025-11-25T10:01:45Z"
     }
   ],
-  
+
+  # Cost breakdown for this run (from CostBreakdown)
+  "cost": {
+    "input_cost": 0.0057,
+    "output_cost": 0.0195,
+    "cache_write_cost": 0.00075,
+    "cache_read_cost": 0.00012,
+    "total_cost": 0.02607,
+    "total_input_tokens": 2500,
+    "total_output_tokens": 1300,
+    "total_cache_creation_tokens": 200,
+    "total_cache_read_tokens": 400,
+    "model_id": "claude-sonnet-4-5",
+    "long_context_applied": false,
+    "currency": "USD"
+  },
+
   # Custom extension point
   "extras": {
     "credits_used": 42
