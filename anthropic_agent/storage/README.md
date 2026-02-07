@@ -55,7 +55,7 @@ Each entity includes:
 ### Important note about `extras` persistence (filesystem vs postgres)
 
 - **Filesystem adapters** merge unknown/custom fields into the JSON on disk for backward compatibility (see `_config_to_dict()` / `_conv_to_dict()` in `storage/adapters/filesystem.py`). That means `extras` (and any unknown keys) **will round-trip**.
-- **Postgres adapters** target the **existing typed schema** and do **not** persist unknown fields by default (there are no columns for them). If you need extra fields in Postgres (e.g., `user_id`, `credits_used`), implement a custom adapter or extend your schema and adapter accordingly.
+- **Postgres adapters** persist `extras` in a dedicated `JSONB` column (requires schema migration). Other unknown fields outside `extras` still won’t persist unless you add columns or a custom adapter.
 
 ## Quickstart
 

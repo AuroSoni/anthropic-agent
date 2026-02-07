@@ -41,6 +41,9 @@ CREATE TABLE agent_config (
     
     -- File registry (consolidated across all runs)
     file_registry JSONB,  -- {file_id: {filename, storage_path, ...}}
+
+    -- Custom extension point
+    extras JSONB DEFAULT '{}'::jsonb,
     
     -- Retry configuration
     max_retries INTEGER DEFAULT 5,
@@ -165,6 +168,11 @@ CREATE INDEX idx_agent_config_last_run ON agent_config(last_run_at DESC);
   
   # UI metadata
   "title": "Python Function for List Sorting",  # Auto-generated conversation title (nullable)
+
+  # Custom extension point
+  "extras": {
+    "user_id": "user_123"
+  },
   
   # Metadata
   "created_at": "2025-11-25T10:00:00Z",
@@ -207,6 +215,9 @@ CREATE TABLE conversation_history (
     
     -- Files generated in this run
     generated_files JSONB,  -- [{file_id, filename, storage_path, step, ...}]
+
+    -- Custom extension point
+    extras JSONB DEFAULT '{}'::jsonb,
     
     -- Sequence for pagination
     sequence_number INTEGER,  -- Auto-incrementing within agent_uuid
@@ -324,6 +335,11 @@ EXECUTE FUNCTION set_conversation_sequence();
     }
   ],
   
+  # Custom extension point
+  "extras": {
+    "credits_used": 42
+  },
+
   # Metadata
   "sequence_number": 1,
   "created_at": "2025-11-25T10:02:30Z"

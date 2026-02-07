@@ -119,6 +119,7 @@ def _config_to_row_values(config: AgentConfig) -> tuple:
         config.awaiting_frontend_tools,
         config.current_step,
         _to_jsonb(config.conversation_history),
+        _to_jsonb(config.extras),
     )
 
 
@@ -153,6 +154,7 @@ def _row_to_config(row: asyncpg.Record) -> AgentConfig:
         current_step=row["current_step"] or 0,
         conversation_history=_from_jsonb(row["conversation_history"]) or [],
         title=row["title"],
+        extras=_from_jsonb(row["extras"]) or {},
         created_at=_parse_datetime(row["created_at"]),
         updated_at=_parse_datetime(row["updated_at"]),
         last_run_at=_parse_datetime(row["last_run_at"]),
@@ -175,6 +177,7 @@ def _row_to_conversation(row: asyncpg.Record) -> Conversation:
         total_steps=row["total_steps"],
         usage=_from_jsonb(row["usage"]) or {},
         generated_files=_from_jsonb(row["generated_files"]) or [],
+        extras=_from_jsonb(row["extras"]) or {},
         sequence_number=row["sequence_number"],
         created_at=_parse_datetime(row["created_at"]),
     )
@@ -187,7 +190,7 @@ def _row_to_conversation(row: asyncpg.Record) -> Conversation:
 class PostgresAgentConfigAdapter(AgentConfigAdapter):
     """PostgreSQL adapter for agent configuration.
     
-    Uses the existing agent_config table with 32 typed columns.
+    Uses the existing agent_config table with 33 typed columns.
     Maintains full backward compatibility with existing SQLBackend.
     """
     
@@ -250,11 +253,13 @@ class PostgresAgentConfigAdapter(AgentConfigAdapter):
                 last_known_input_tokens, last_known_output_tokens,
                 title, created_at, updated_at, last_run_at, total_runs,
                 pending_frontend_tools, pending_backend_results,
-                awaiting_frontend_tools, current_step, conversation_history
+                awaiting_frontend_tools, current_step, conversation_history,
+                extras
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                 $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-                $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32
+                $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32,
+                $33
             )
             ON CONFLICT (agent_uuid) DO UPDATE SET
                 system_prompt = EXCLUDED.system_prompt,
@@ -286,7 +291,8 @@ class PostgresAgentConfigAdapter(AgentConfigAdapter):
                 pending_backend_results = EXCLUDED.pending_backend_results,
                 awaiting_frontend_tools = EXCLUDED.awaiting_frontend_tools,
                 current_step = EXCLUDED.current_step,
-                conversation_history = EXCLUDED.conversation_history
+                conversation_history = EXCLUDED.conversation_history,
+                extras = EXCLUDED.extras
         """
         
         values = _config_to_row_values(config)
@@ -315,7 +321,7 @@ class PostgresAgentConfigAdapter(AgentConfigAdapter):
                 created_at, updated_at, last_run_at, total_runs,
                 pending_frontend_tools, pending_backend_results,
                 awaiting_frontend_tools, current_step, conversation_history,
-                title
+                title, extras
             FROM agent_config
             WHERE agent_uuid = $1
         """
@@ -476,9 +482,9 @@ class PostgresConversationAdapter(ConversationAdapter):
             INSERT INTO conversation_history (
                 conversation_id, agent_uuid, run_id, started_at, completed_at,
                 user_message, final_response, messages, stop_reason, total_steps,
-                usage, generated_files, created_at
+                usage, generated_files, extras, created_at
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
             )
         """
         
@@ -497,6 +503,7 @@ class PostgresConversationAdapter(ConversationAdapter):
                 conversation.total_steps,
                 _to_jsonb(conversation.usage),
                 _to_jsonb(conversation.generated_files),
+                _to_jsonb(conversation.extras),
                 _to_datetime(conversation.created_at),
             )
         
@@ -520,7 +527,7 @@ class PostgresConversationAdapter(ConversationAdapter):
             SELECT 
                 conversation_id, agent_uuid, run_id, started_at, completed_at,
                 user_message, final_response, messages, stop_reason, total_steps,
-                usage, generated_files, sequence_number, created_at
+                usage, generated_files, extras, sequence_number, created_at
             FROM conversation_history
             WHERE agent_uuid = $1
             ORDER BY sequence_number DESC
@@ -554,7 +561,7 @@ class PostgresConversationAdapter(ConversationAdapter):
                 SELECT 
                     conversation_id, agent_uuid, run_id, started_at, completed_at,
                     user_message, final_response, messages, stop_reason, total_steps,
-                    usage, generated_files, sequence_number, created_at
+                    usage, generated_files, extras, sequence_number, created_at
                 FROM conversation_history
                 WHERE agent_uuid = $1 AND sequence_number < $2
                 ORDER BY sequence_number DESC
@@ -567,7 +574,7 @@ class PostgresConversationAdapter(ConversationAdapter):
                 SELECT 
                     conversation_id, agent_uuid, run_id, started_at, completed_at,
                     user_message, final_response, messages, stop_reason, total_steps,
-                    usage, generated_files, sequence_number, created_at
+                    usage, generated_files, extras, sequence_number, created_at
                 FROM conversation_history
                 WHERE agent_uuid = $1
                 ORDER BY sequence_number DESC
