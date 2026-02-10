@@ -1,4 +1,6 @@
 import asyncio
+import time
+import threading
 
 import pytest
 
@@ -101,5 +103,46 @@ def test_register_method_overwrites_existing_schema() -> None:
         content, image_refs = await registry.execute("add", {"a": 1, "b": 1})
         assert content == "3"
         assert image_refs == []
+    asyncio.run(run())
+
+
+def test_async_tool_execution() -> None:
+    """Async tool functions should be awaited directly."""
+    @tool
+    async def greet(name: str) -> str:
+        """Greet someone."""
+        await asyncio.sleep(0)  # confirm we are actually awaited
+        return f"Hello, {name}!"
+
+    registry = ToolRegistry()
+    registry.register_tools([greet])
+
+    async def run():
+        content, image_refs = await registry.execute("greet", {"name": "World"})
+        assert content == "Hello, World!"
+        assert image_refs == []
+    asyncio.run(run())
+
+
+def test_sync_tool_runs_off_event_loop() -> None:
+    """Sync tools should be dispatched to a thread via asyncio.to_thread."""
+    @tool
+    def blocking_tool(x: int) -> str:
+        """A tool that blocks."""
+        # Record the thread; if it ran in the main thread the event loop
+        # would have been blocked.
+        blocking_tool._thread = threading.current_thread()
+        time.sleep(0.05)
+        return str(x * 2)
+
+    registry = ToolRegistry()
+    registry.register_tools([blocking_tool])
+
+    async def run():
+        main_thread = threading.current_thread()
+        content, _ = await registry.execute("blocking_tool", {"x": 5})
+        assert content == "10"
+        # The tool should have executed in a *different* thread.
+        assert blocking_tool._thread is not main_thread
     asyncio.run(run())
 

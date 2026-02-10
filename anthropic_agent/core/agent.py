@@ -45,6 +45,7 @@ DEFAULT_STREAM_META = False
 DEFAULT_FORMATTER: FormatterType = "json"
 DEFAULT_MAX_RETRIES = 5
 DEFAULT_BASE_DELAY = 1.0
+MAX_PARALLEL_TOOL_CALLS = 5
 
 # Escape tool result content for SSE + CDATA safety.
 def _escape_tool_result_cdata(content: str) -> str:
@@ -187,6 +188,7 @@ class AnthropicAgent:
         messages: list[dict] | None = None,    # TODO: Add Message Type.
         max_retries: Optional[int] = None,
         base_delay: Optional[float] = None,
+        max_parallel_tool_calls: int | None = None,
         formatter: FormatterType | None = None,
         enable_cache_control: Optional[bool] = None,
         compactor: CompactorType | Compactor | None = None,
@@ -292,6 +294,8 @@ class AnthropicAgent:
             # Pre-configured FileStorageBackend instance provided
             self.file_backend = file_backend
         
+        self.max_parallel_tool_calls = max_parallel_tool_calls or MAX_PARALLEL_TOOL_CALLS
+
         self.tool_registry: Optional[ToolRegistry] = None
         self.tool_schemas: list[dict[str, Any]] = []
         self._tool_functions: list[Callable[..., Any]] = []  # Store for UUID injection
@@ -746,55 +750,10 @@ class AnthropicAgent:
                     backend_tool_calls = [t for t in tool_calls if t.name not in self.frontend_tool_names]
                     frontend_tool_calls = [t for t in tool_calls if t.name in self.frontend_tool_names]
                     
-                    # Execute ALL backend tools first
-                    tool_results = []
-                    for tool_call in backend_tool_calls:
-                        is_error = False
-                        result_content: ToolResultContent = ""
-                        image_refs: list[dict[str, Any]] = []
-                        try:
-                            # Execute the tool (support both sync and async executors)
-                            result = self.execute_tool_call(tool_call.name, tool_call.input)
-                            # Check if result is a coroutine (async function)
-                            if asyncio.iscoroutine(result):
-                                result = await result
-                            # Unpack result tuple (content, image_refs)
-                            result_content, image_refs = result
-                            tool_results.append({
-                                "type": "tool_result",
-                                "tool_use_id": tool_call.id,
-                                "content": result_content
-                            })
-                        except Exception as e:
-                            # Handle tool execution errors
-                            is_error = True
-                            result_content = f"Error executing tool: {str(e)}"
-                            image_refs = []
-                            tool_results.append({
-                                "type": "tool_result",
-                                "tool_use_id": tool_call.id,
-                                "content": result_content,
-                                "is_error": True
-                            })
-                        
-                        # Stream tool result to queue
-                        if queue is not None:
-                            active_fmt = formatter if formatter is not None else self.formatter
-                            await _emit_tool_result(
-                                queue, active_fmt, self.agent_uuid,
-                                tool_use_id=str(tool_call.id),
-                                tool_name=str(tool_call.name),
-                                result_content=result_content,
-                                image_refs=image_refs if image_refs else None,
-                            )
-
-                        # Log: tool execution
-                        self._log_action("tool_execution", {
-                            "tool_name": tool_call.name,
-                            "tool_use_id": tool_call.id,
-                            "success": not is_error,
-                            "has_images": len(image_refs) > 0,
-                        }, step_number=step)
+                    # Execute all backend tools (parallel when multiple)
+                    tool_results = await self._execute_tools_parallel(
+                        backend_tool_calls, queue, formatter, step,
+                    )
 
                     # If frontend tools exist, pause and wait for browser execution
                     if frontend_tool_calls:
@@ -1198,7 +1157,140 @@ class AnthropicAgent:
             file_backend=self.file_backend,
             agent_uuid=self.agent_uuid,
         )
-    
+
+    async def _execute_tools_sequential(
+        self,
+        backend_tool_calls: list,
+        queue: asyncio.Queue | None,
+        formatter: "FormatterType | None",
+        step: int,
+    ) -> list[dict]:
+        """Execute backend tool calls one at a time.
+
+        Used as the fast-path when there is only a single tool call
+        (avoids semaphore / lock / task overhead).
+        """
+        tool_results: list[dict] = []
+        for tool_call in backend_tool_calls:
+            is_error = False
+            result_content: ToolResultContent = ""
+            image_refs: list[dict[str, Any]] = []
+            try:
+                result_content, image_refs = await self.execute_tool_call(
+                    tool_call.name, tool_call.input,
+                )
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_call.id,
+                    "content": result_content,
+                })
+            except Exception as e:
+                is_error = True
+                result_content = f"Error executing tool: {str(e)}"
+                image_refs = []
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_call.id,
+                    "content": result_content,
+                    "is_error": True,
+                })
+
+            # Stream tool result to SSE queue
+            if queue is not None:
+                active_fmt = formatter if formatter is not None else self.formatter
+                await _emit_tool_result(
+                    queue, active_fmt, self.agent_uuid,
+                    tool_use_id=str(tool_call.id),
+                    tool_name=str(tool_call.name),
+                    result_content=result_content,
+                    image_refs=image_refs if image_refs else None,
+                )
+
+            self._log_action("tool_execution", {
+                "tool_name": tool_call.name,
+                "tool_use_id": tool_call.id,
+                "success": not is_error,
+                "has_images": len(image_refs) > 0,
+            }, step_number=step)
+
+        return tool_results
+
+    async def _execute_tools_parallel(
+        self,
+        backend_tool_calls: list,
+        queue: asyncio.Queue | None,
+        formatter: "FormatterType | None",
+        step: int,
+    ) -> list[dict]:
+        """Execute backend tool calls with bounded parallelism.
+
+        Results are streamed to the SSE *queue* as each tool completes.
+        The returned list preserves the original order of *backend_tool_calls*
+        so the Anthropic API contract (tool_result ordering matches tool_use
+        ordering) is maintained.
+        """
+        # Fast-path: single or zero tool calls — skip concurrency overhead.
+        if len(backend_tool_calls) <= 1:
+            return await self._execute_tools_sequential(
+                backend_tool_calls, queue, formatter, step,
+            )
+
+        semaphore = asyncio.Semaphore(self.max_parallel_tool_calls)
+        emit_lock = asyncio.Lock()
+        results: list[dict | None] = [None] * len(backend_tool_calls)
+
+        async def _run_one(index: int, tool_call: Any) -> None:
+            async with semaphore:
+                is_error = False
+                result_content: ToolResultContent = ""
+                image_refs: list[dict[str, Any]] = []
+                try:
+                    result_content, image_refs = await self.execute_tool_call(
+                        tool_call.name, tool_call.input,
+                    )
+                    results[index] = {
+                        "type": "tool_result",
+                        "tool_use_id": tool_call.id,
+                        "content": result_content,
+                    }
+                except Exception as e:
+                    is_error = True
+                    result_content = f"Error executing tool: {str(e)}"
+                    image_refs = []
+                    results[index] = {
+                        "type": "tool_result",
+                        "tool_use_id": tool_call.id,
+                        "content": result_content,
+                        "is_error": True,
+                    }
+
+                # Stream to SSE queue — lock ensures each tool's
+                # multi-put sequence is not interleaved with another's.
+                if queue is not None:
+                    active_fmt = formatter if formatter is not None else self.formatter
+                    async with emit_lock:
+                        await _emit_tool_result(
+                            queue, active_fmt, self.agent_uuid,
+                            tool_use_id=str(tool_call.id),
+                            tool_name=str(tool_call.name),
+                            result_content=result_content,
+                            image_refs=image_refs if image_refs else None,
+                        )
+
+                self._log_action("tool_execution", {
+                    "tool_name": tool_call.name,
+                    "tool_use_id": tool_call.id,
+                    "success": not is_error,
+                    "has_images": len(image_refs) > 0,
+                }, step_number=step)
+
+        tasks = [
+            asyncio.create_task(_run_one(i, tc))
+            for i, tc in enumerate(backend_tool_calls)
+        ]
+        await asyncio.gather(*tasks)
+        return results  # type: ignore[return-value]
+
     async def continue_with_tool_results(
         self,
         frontend_results: list[dict],
@@ -1398,51 +1490,10 @@ class AnthropicAgent:
                     backend_tool_calls = [t for t in tool_calls if t.name not in self.frontend_tool_names]
                     frontend_tool_calls = [t for t in tool_calls if t.name in self.frontend_tool_names]
                     
-                    # Execute ALL backend tools first
-                    tool_results = []
-                    for tool_call in backend_tool_calls:
-                        is_error = False
-                        result_content: ToolResultContent = ""
-                        image_refs: list[dict[str, Any]] = []
-                        try:
-                            result = self.execute_tool_call(tool_call.name, tool_call.input)
-                            if asyncio.iscoroutine(result):
-                                result = await result
-                            # Unpack result tuple (content, image_refs)
-                            result_content, image_refs = result
-                            tool_results.append({
-                                "type": "tool_result",
-                                "tool_use_id": tool_call.id,
-                                "content": result_content
-                            })
-                        except Exception as e:
-                            is_error = True
-                            result_content = f"Error executing tool: {str(e)}"
-                            image_refs = []
-                            tool_results.append({
-                                "type": "tool_result",
-                                "tool_use_id": tool_call.id,
-                                "content": result_content,
-                                "is_error": True
-                            })
-                        
-                        # Stream tool result to queue
-                        if queue is not None:
-                            active_fmt = formatter if formatter is not None else self.formatter
-                            await _emit_tool_result(
-                                queue, active_fmt, self.agent_uuid,
-                                tool_use_id=str(tool_call.id),
-                                tool_name=str(tool_call.name),
-                                result_content=result_content,
-                                image_refs=image_refs if image_refs else None,
-                            )
-
-                        self._log_action("tool_execution", {
-                            "tool_name": tool_call.name,
-                            "tool_use_id": tool_call.id,
-                            "success": not is_error,
-                            "has_images": len(image_refs) > 0,
-                        }, step_number=step)
+                    # Execute all backend tools (parallel when multiple)
+                    tool_results = await self._execute_tools_parallel(
+                        backend_tool_calls, queue, formatter, step,
+                    )
 
                     # If frontend tools exist, pause and wait
                     if frontend_tool_calls:

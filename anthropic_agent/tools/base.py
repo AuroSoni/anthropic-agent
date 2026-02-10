@@ -1,7 +1,9 @@
 """Base interfaces and utilities for tool execution."""
 from __future__ import annotations
 
+import asyncio
 import base64
+import inspect
 import uuid
 import warnings
 from abc import ABC, abstractmethod
@@ -259,12 +261,18 @@ class ToolRegistry:
         
         try:
             tool_func = self.tools[tool_name]
-            result = tool_func(**tool_input)
-            
+
+            # Dispatch: async tools are awaited directly; sync tools are
+            # offloaded to a thread so they never block the event loop.
+            if inspect.iscoroutinefunction(tool_func):
+                result = await tool_func(**tool_input)
+            else:
+                result = await asyncio.to_thread(tool_func, **tool_input)
+
             # Handle ToolResult wrapper
             if isinstance(result, ToolResult):
                 return await result.to_api_format(file_backend, agent_uuid)
-            
+
             # Backward compatibility: raw string returns
             return result, []
         except Exception as e:
