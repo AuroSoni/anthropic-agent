@@ -43,7 +43,7 @@ class ContentBlock:
 class ParsedSSEStream:
     """Result of parsing an SSE stream."""
     
-    format: Literal["xml", "raw"]
+    format: Literal["xml", "raw", "json"]
     blocks: list[ContentBlock]
     metadata: dict[str, Any] = field(default_factory=dict)
     raw_content: str = ""
@@ -428,7 +428,7 @@ def parse_raw_stream(sse_content: str) -> ParsedSSEStream:
 # Utility Functions
 # ============================================================================
 
-def detect_format(sse_content: str) -> Literal["xml", "raw"]:
+def detect_format(sse_content: str) -> Literal["xml", "raw", "json"]:
     """Auto-detect the format of SSE content."""
     # Check first few data lines
     lines = sse_content.strip().split("\n")
@@ -438,16 +438,21 @@ def detect_format(sse_content: str) -> Literal["xml", "raw"]:
             # XML format uses content-block-* tags
             if "<content-block-" in data:
                 return "xml"
-            # Raw format uses JSON events
+            # JSON envelope format: has "agent" and "final" fields
+            if data.startswith("{") and '"agent"' in data and '"final"' in data:
+                return "json"
+            # Raw format uses JSON events (Anthropic event types)
             if data.startswith("{") and '"type"' in data:
                 return "raw"
-    
+
     # Check for meta_init format indicator
     if '"format": "xml"' in sse_content or '"format": \\"xml\\"' in sse_content:
         return "xml"
+    if '"format": "json"' in sse_content or '"format": \\"json\\"' in sse_content:
+        return "json"
     if '"format": "raw"' in sse_content or '"format": \\"raw\\"' in sse_content:
         return "raw"
-    
+
     return "xml"  # Default to xml
 
 
@@ -468,6 +473,8 @@ def parse_sse_stream(
     fmt = detect_format(sse_content)
     if fmt == "xml":
         return parse_xml_stream(sse_content, embedded_tags)
+    if fmt == "json":
+        return parse_json_stream(sse_content)
     return parse_raw_stream(sse_content)
 
 
@@ -488,6 +495,144 @@ def get_tool_calls(parsed: ParsedSSEStream) -> list[ContentBlock]:
         block for block in parsed.blocks
         if block.type in ("tool_call", "server_tool_call")
     ]
+
+
+def parse_json_stream(sse_content: str) -> ParsedSSEStream:
+    """Parse JSON-envelope-formatted SSE stream content.
+
+    Each ``data:`` line is a self-contained JSON object with fields
+    ``type``, ``agent``, ``final``, ``delta`` and optional extra fields.
+    Messages arrive in SSE order; block boundaries are determined by the
+    ``final`` flag.  When ``final`` is ``true``, the current block for
+    that ``(agent, type)`` is closed and the next message of the same
+    type opens a new block.
+
+    Args:
+        sse_content: Raw SSE stream content (from a log file).
+
+    Returns:
+        ParsedSSEStream with extracted content blocks.
+    """
+    blocks: list[ContentBlock] = []
+    metadata: dict[str, Any] = {}
+
+    # Accumulator keyed by a monotonic string key → {type, delta, extras}
+    accum: dict[str, dict[str, Any]] = {}
+    # Track insertion order so blocks appear in stream order
+    order: list[str] = []
+    # Current open (non-final) block key per (agent, type)
+    current_block_key: dict[str, str] = {}
+    block_counter = 0
+
+    lines = sse_content.strip().split("\n")
+    for line in lines:
+        if not line.startswith("data: "):
+            continue
+        payload = line[6:]
+        if payload == "[DONE]":
+            continue
+        try:
+            msg = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+
+        agent = msg.get("agent", "")
+        msg_type = msg.get("type", "")
+        is_final = msg.get("final", False)
+        agent_type_key = f"{agent}:{msg_type}"
+
+        key = current_block_key.get(agent_type_key)
+
+        # If there is no open block for this (agent, type), create one
+        if key is None:
+            key = f"blk_{block_counter}"
+            block_counter += 1
+            current_block_key[agent_type_key] = key
+            accum[key] = {
+                "type": msg_type,
+                "delta": "",
+                "extras": {},
+            }
+            order.append(key)
+
+        accum[key]["delta"] += msg.get("delta", "")
+
+        # Capture extra fields (id, name, citation fields, etc.)
+        for extra_key in ("id", "name", "citation_type",
+                          "document_index", "document_title",
+                          "start_char_index", "end_char_index",
+                          "start_page_number", "end_page_number",
+                          "url", "title", "src", "media_type"):
+            if extra_key in msg:
+                accum[key]["extras"][extra_key] = msg[extra_key]
+
+        # When final, close the tracker so the next message of the
+        # same type opens a fresh block.
+        if is_final:
+            current_block_key.pop(agent_type_key, None)
+
+    # Convert accumulated data into ContentBlock list
+    for key in order:
+        entry = accum[key]
+        msg_type = entry["type"]
+        delta = entry["delta"]
+        extras = entry["extras"]
+
+        if msg_type == "meta_init":
+            try:
+                meta_dict = json.loads(delta)
+                metadata = meta_dict
+                blocks.append(ContentBlock(type="meta_init", content=meta_dict))
+            except json.JSONDecodeError:
+                blocks.append(ContentBlock(type="meta_init", content=delta))
+        elif msg_type == "meta_final":
+            try:
+                blocks.append(ContentBlock(type="meta_init", content=json.loads(delta)))
+            except json.JSONDecodeError:
+                pass
+        elif msg_type in ("thinking", "text", "error"):
+            mapped: ContentBlockType = msg_type  # type: ignore[assignment]
+            blocks.append(ContentBlock(type=mapped, content=delta))
+        elif msg_type in ("tool_call", "server_tool_call"):
+            mapped = msg_type  # type: ignore[assignment]
+            blocks.append(ContentBlock(
+                type=mapped,
+                content=delta,
+                id=extras.get("id"),
+                name=extras.get("name"),
+                attributes=extras,
+            ))
+        elif msg_type in ("tool_result", "server_tool_result"):
+            mapped = msg_type  # type: ignore[assignment]
+            blocks.append(ContentBlock(
+                type=mapped,
+                content=delta,
+                id=extras.get("id"),
+                name=extras.get("name"),
+                attributes=extras,
+            ))
+        elif msg_type == "citation":
+            blocks.append(ContentBlock(
+                type="text",
+                content=delta,
+                attributes=extras,
+            ))
+        elif msg_type == "awaiting_frontend_tools":
+            try:
+                blocks.append(ContentBlock(type="tool_call", content=json.loads(delta)))
+            except json.JSONDecodeError:
+                blocks.append(ContentBlock(type="tool_call", content=delta))
+        elif msg_type == "meta_files":
+            blocks.append(ContentBlock(type="meta_files", content=delta))
+        else:
+            blocks.append(ContentBlock(type="text", content=delta))
+
+    return ParsedSSEStream(
+        format="json",
+        blocks=blocks,
+        metadata=metadata,
+        raw_content=sse_content,
+    )
 
 
 def get_blocks_by_type(

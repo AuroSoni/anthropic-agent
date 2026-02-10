@@ -16,7 +16,7 @@ from .types import AgentResult
 from .retry import anthropic_stream_with_backoff, retry_with_backoff
 from .title_generator import generate_title
 from ..tools.base import ToolRegistry, ToolResultContent
-from ..streaming import FormatterType
+from ..streaming import FormatterType, _chunk_and_emit
 from .compaction import CompactorType, get_compactor, get_default_compactor, Compactor
 from ..memory import MemoryStoreType, get_memory_store, MemoryStore
 from ..storage import (
@@ -54,6 +54,116 @@ def _escape_tool_result_cdata(content: str) -> str:
     safe = content.replace("]]>", "]]]]><![CDATA[>")
     safe = safe.replace("\r\n", "\n").replace("\r", "\n")
     return safe.replace("\n", "\\n")
+
+
+async def _emit_tool_result(
+    queue: asyncio.Queue,
+    active_fmt: "FormatterType",
+    agent_uuid: str,
+    tool_use_id: str,
+    tool_name: str,
+    result_content: Any,
+    image_refs: list[dict[str, Any]] | None = None,
+) -> None:
+    """Emit a backend or frontend tool result to the SSE queue.
+
+    Handles both XML and JSON envelope formats, including multimodal
+    results (text + images).
+
+    Args:
+        queue: Async queue to emit to.
+        active_fmt: The active formatter type ("xml", "json", or "raw").
+        agent_uuid: Agent UUID for JSON envelope ``agent`` field.
+        tool_use_id: The tool_use_id this result responds to.
+        tool_name: Human-readable tool name.
+        result_content: The tool result payload (str, dict, list, or None).
+        image_refs: Optional list of image reference dicts with ``src``
+            and ``media_type`` keys.
+    """
+    if image_refs is None:
+        image_refs = []
+
+    escaped_id = html.escape(str(tool_use_id), quote=True)
+    escaped_name = html.escape(str(tool_name), quote=True)
+
+    if active_fmt == "json":
+        # --- JSON envelope path ---
+        if image_refs:
+            # Emit text portion
+            text_parts: list[str] = []
+            if isinstance(result_content, list):
+                for block in result_content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+            text_payload = "\n".join(text_parts) if text_parts else ""
+            await _chunk_and_emit(
+                queue, "tool_result", agent_uuid,
+                text_payload, final_on_last=False,
+                id=tool_use_id, name=tool_name,
+            )
+            # Emit each image as its own envelope
+            for ref in image_refs:
+                await _chunk_and_emit(
+                    queue, "tool_result_image", agent_uuid,
+                    "", final_on_last=False,
+                    id=tool_use_id, name=tool_name,
+                    src=ref["src"], media_type=ref["media_type"],
+                )
+            # Emit final marker
+            await _chunk_and_emit(
+                queue, "tool_result", agent_uuid,
+                "", final_on_last=True,
+                id=tool_use_id, name=tool_name,
+            )
+        else:
+            # Text-only result
+            if result_content is None:
+                content_str = ""
+            elif isinstance(result_content, str):
+                content_str = result_content
+            else:
+                content_str = json.dumps(result_content, default=str)
+            await _chunk_and_emit(
+                queue, "tool_result", agent_uuid,
+                content_str, final_on_last=True,
+                id=tool_use_id, name=tool_name,
+            )
+    else:
+        # --- XML path (xml / raw) ---
+        if image_refs:
+            text_parts = []
+            if isinstance(result_content, list):
+                for block in result_content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+            text_content = "\n".join(text_parts) if text_parts else ""
+            text_content = _escape_tool_result_cdata(text_content)
+
+            image_tags = "".join(
+                f'<image src="{html.escape(ref["src"], quote=True)}" '
+                f'media_type="{html.escape(ref["media_type"], quote=True)}" />'
+                for ref in image_refs
+            )
+            await queue.put(
+                f'<content-block-tool_result id="{escaped_id}" name="{escaped_name}">'
+                f'<text><![CDATA[{text_content}]]></text>'
+                f'{image_tags}'
+                f'</content-block-tool_result>'
+            )
+        else:
+            if result_content is None:
+                content_str = ""
+            elif isinstance(result_content, str):
+                content_str = result_content
+            else:
+                content_str = json.dumps(result_content, default=str)
+            content_str = _escape_tool_result_cdata(content_str)
+            await queue.put(
+                f'<content-block-tool_result id="{escaped_id}" name="{escaped_name}">'
+                f'<![CDATA[{content_str}]]>'
+                f'</content-block-tool_result>'
+            )
+
 
 # Cache control configuration (Anthropic limits)
 MAX_CACHE_BLOCKS = 4
@@ -508,8 +618,9 @@ class AnthropicAgent:
         
         # Emit meta_init tag to signal stream format and provide metadata
         if queue is not None:
+            active_formatter = formatter if formatter is not None else self.formatter
             meta_init: dict[str, Any] = {
-                "format": formatter if formatter is not None else self.formatter,
+                "format": active_formatter,
                 "user_query": prompt if isinstance(prompt, str) else json.dumps(prompt),
                 "agent_uuid": self.agent_uuid,
                 "model": self.model,
@@ -517,8 +628,17 @@ class AnthropicAgent:
             # Only include message_history when stream_meta_history_and_tool_results is True
             if self.stream_meta_history_and_tool_results:
                 meta_init["message_history"] = self.conversation_history
-            escaped_json = html.escape(json.dumps(meta_init), quote=True)
-            await queue.put(f'<meta_init data="{escaped_json}"></meta_init>')
+
+            if active_formatter == "json":
+                # JSON envelope: chunked meta_init
+                payload = json.dumps(meta_init, ensure_ascii=False)
+                await _chunk_and_emit(
+                    queue, "meta_init", self.agent_uuid, payload, final_on_last=True,
+                )
+            else:
+                # Legacy XML format
+                escaped_json = html.escape(json.dumps(meta_init), quote=True)
+                await queue.put(f'<meta_init data="{escaped_json}"></meta_init>')
         
         # Retrieve and inject semantic memories
         if self.memory_store:
@@ -571,6 +691,7 @@ class AnthropicAgent:
                 base_delay=self.base_delay,
                 formatter=formatter if formatter is not None else self.formatter,
                 stream_tool_results=self.stream_meta_history_and_tool_results,
+                agent_uuid=self.agent_uuid,
             )
             
             # Track token usage from API response
@@ -655,49 +776,17 @@ class AnthropicAgent:
                                 "is_error": True
                             })
                         
-                        # Stream tool result to queue in XML format
+                        # Stream tool result to queue
                         if queue is not None:
-                            tool_use_id = html.escape(str(tool_call.id), quote=True)
-                            tool_name_escaped = html.escape(str(tool_call.name), quote=True)
-                            
-                            # Build streaming output based on content type
-                            if image_refs:
-                                # Multimodal result: stream text + image references
-                                text_parts = []
-                                if isinstance(result_content, list):
-                                    for block in result_content:
-                                        if isinstance(block, dict) and block.get("type") == "text":
-                                            text_parts.append(block.get("text", ""))
-                                text_content = "\n".join(text_parts) if text_parts else ""
-                                text_content = _escape_tool_result_cdata(text_content)
-                                text_content = _escape_tool_result_cdata(text_content)
-                                
-                                # Build image reference tags
-                                image_tags = "".join(
-                                    f'<image src="{html.escape(ref["src"], quote=True)}" media_type="{html.escape(ref["media_type"], quote=True)}" />'
-                                    for ref in image_refs
-                                )
-                                
-                                await queue.put(
-                                    f'<content-block-tool_result id="{tool_use_id}" name="{tool_name_escaped}">'
-                                    f'<text><![CDATA[{text_content}]]></text>'
-                                    f'{image_tags}'
-                                    f'</content-block-tool_result>'
-                                )
-                            else:
-                                # Text-only result: serialize as before
-                                if result_content is None:
-                                    content_str = ""
-                                elif isinstance(result_content, str):
-                                    content_str = result_content
-                                else:
-                                    content_str = json.dumps(result_content, default=str)
-                                content_str = _escape_tool_result_cdata(content_str)
-                                content_str = _escape_tool_result_cdata(content_str)
-                                await queue.put(
-                                    f'<content-block-tool_result id="{tool_use_id}" name="{tool_name_escaped}"><![CDATA[{content_str}]]></content-block-tool_result>'
-                                )
-                        
+                            active_fmt = formatter if formatter is not None else self.formatter
+                            await _emit_tool_result(
+                                queue, active_fmt, self.agent_uuid,
+                                tool_use_id=str(tool_call.id),
+                                tool_name=str(tool_call.name),
+                                result_content=result_content,
+                                image_refs=image_refs if image_refs else None,
+                            )
+
                         # Log: tool execution
                         self._log_action("tool_execution", {
                             "tool_name": tool_call.name,
@@ -705,7 +794,7 @@ class AnthropicAgent:
                             "success": not is_error,
                             "has_images": len(image_refs) > 0,
                         }, step_number=step)
-                    
+
                     # If frontend tools exist, pause and wait for browser execution
                     if frontend_tool_calls:
                         # Store backend results for later (will be combined with frontend results)
@@ -725,8 +814,16 @@ class AnthropicAgent:
                         
                         # Emit all pending frontend tools to client
                         if queue is not None:
-                            tools_json = html.escape(json.dumps(self._pending_frontend_tools), quote=True)
-                            await queue.put(f'<awaiting_frontend_tools data="{tools_json}"></awaiting_frontend_tools>')
+                            active_fmt = formatter if formatter is not None else self.formatter
+                            if active_fmt == "json":
+                                payload = json.dumps(self._pending_frontend_tools, ensure_ascii=False)
+                                await _chunk_and_emit(
+                                    queue, "awaiting_frontend_tools", self.agent_uuid,
+                                    payload, final_on_last=True,
+                                )
+                            else:
+                                tools_json = html.escape(json.dumps(self._pending_frontend_tools), quote=True)
+                                await queue.put(f'<awaiting_frontend_tools data="{tools_json}"></awaiting_frontend_tools>')
                         
                         # Persist state to DB before returning (required for re-hydration)
                         await self._save_agent_config()
@@ -854,7 +951,7 @@ class AnthropicAgent:
             }, step_number=step)
 
             # Finalize file processing (extract, store, stream)
-            await self._finalize_file_processing(queue)
+            await self._finalize_file_processing(queue, formatter=formatter)
 
             # Get updated metadata
             all_files_metadata: list[dict[str, Any]] = list(self.file_registry.values())
@@ -866,7 +963,7 @@ class AnthropicAgent:
             self._save_run_data_async(result, all_files_metadata)
 
             # Emit meta_final tag at end of run (only if stream_meta_history_and_tool_results is True)
-            await self._emit_meta_final(queue, result)
+            await self._emit_meta_final(queue, result, formatter=formatter)
 
             return result
 
@@ -1171,18 +1268,18 @@ class AnthropicAgent:
         
         # Stream frontend tool results to queue (only if stream_meta_history_and_tool_results is True)
         if queue is not None and self.stream_meta_history_and_tool_results:
+            active_fmt = formatter if formatter is not None else self.formatter
             for r in frontend_results:
-                tool_use_id = html.escape(str(r["tool_use_id"]), quote=True)
                 # Find the tool name from pending tools
                 tool_name = next(
                     (t["name"] for t in self._pending_frontend_tools if t["tool_use_id"] == r["tool_use_id"]),
                     "unknown"
                 )
-                tool_name = html.escape(tool_name, quote=True)
-                content_str = r["content"] if isinstance(r["content"], str) else json.dumps(r["content"], default=str)
-                content_str = _escape_tool_result_cdata(content_str)
-                await queue.put(
-                    f'<content-block-tool_result id="{tool_use_id}" name="{tool_name}"><![CDATA[{content_str}]]></content-block-tool_result>'
+                await _emit_tool_result(
+                    queue, active_fmt, self.agent_uuid,
+                    tool_use_id=str(r["tool_use_id"]),
+                    tool_name=tool_name,
+                    result_content=r["content"],
                 )
         
         # Add combined tool results to messages and conversation history
@@ -1251,6 +1348,7 @@ class AnthropicAgent:
                 base_delay=self.base_delay,
                 formatter=formatter if formatter is not None else self.formatter,
                 stream_tool_results=self.stream_meta_history_and_tool_results,
+                agent_uuid=self.agent_uuid,
             )
             
             # Track token usage from API response
@@ -1329,50 +1427,22 @@ class AnthropicAgent:
                         
                         # Stream tool result to queue
                         if queue is not None:
-                            tool_use_id = html.escape(str(tool_call.id), quote=True)
-                            tool_name_escaped = html.escape(str(tool_call.name), quote=True)
-                            
-                            # Build streaming output based on content type
-                            if image_refs:
-                                # Multimodal result: stream text + image references
-                                text_parts = []
-                                if isinstance(result_content, list):
-                                    for block in result_content:
-                                        if isinstance(block, dict) and block.get("type") == "text":
-                                            text_parts.append(block.get("text", ""))
-                                text_content = "\n".join(text_parts) if text_parts else ""
-                                
-                                # Build image reference tags
-                                image_tags = "".join(
-                                    f'<image src="{html.escape(ref["src"], quote=True)}" media_type="{html.escape(ref["media_type"], quote=True)}" />'
-                                    for ref in image_refs
-                                )
-                                
-                                await queue.put(
-                                    f'<content-block-tool_result id="{tool_use_id}" name="{tool_name_escaped}">'
-                                    f'<text><![CDATA[{text_content}]]></text>'
-                                    f'{image_tags}'
-                                    f'</content-block-tool_result>'
-                                )
-                            else:
-                                # Text-only result: serialize as before
-                                if result_content is None:
-                                    content_str = ""
-                                elif isinstance(result_content, str):
-                                    content_str = result_content
-                                else:
-                                    content_str = json.dumps(result_content, default=str)
-                                await queue.put(
-                                    f'<content-block-tool_result id="{tool_use_id}" name="{tool_name_escaped}"><![CDATA[{content_str}]]></content-block-tool_result>'
-                                )
-                        
+                            active_fmt = formatter if formatter is not None else self.formatter
+                            await _emit_tool_result(
+                                queue, active_fmt, self.agent_uuid,
+                                tool_use_id=str(tool_call.id),
+                                tool_name=str(tool_call.name),
+                                result_content=result_content,
+                                image_refs=image_refs if image_refs else None,
+                            )
+
                         self._log_action("tool_execution", {
                             "tool_name": tool_call.name,
                             "tool_use_id": tool_call.id,
                             "success": not is_error,
                             "has_images": len(image_refs) > 0,
                         }, step_number=step)
-                    
+
                     # If frontend tools exist, pause and wait
                     if frontend_tool_calls:
                         self._pending_backend_results = tool_results
@@ -1382,15 +1452,24 @@ class AnthropicAgent:
                         ]
                         self._awaiting_frontend_tools = True
                         self._current_step = step
-                        
+
                         self._log_action("awaiting_frontend_tools", {
                             "frontend_tools": [t.name for t in frontend_tool_calls],
                             "backend_results_count": len(tool_results),
                         }, step_number=step)
-                        
+
+                        # Emit all pending frontend tools to client
                         if queue is not None:
-                            tools_json = html.escape(json.dumps(self._pending_frontend_tools), quote=True)
-                            await queue.put(f'<awaiting_frontend_tools data="{tools_json}"></awaiting_frontend_tools>')
+                            active_fmt = formatter if formatter is not None else self.formatter
+                            if active_fmt == "json":
+                                payload = json.dumps(self._pending_frontend_tools, ensure_ascii=False)
+                                await _chunk_and_emit(
+                                    queue, "awaiting_frontend_tools", self.agent_uuid,
+                                    payload, final_on_last=True,
+                                )
+                            else:
+                                tools_json = html.escape(json.dumps(self._pending_frontend_tools), quote=True)
+                                await queue.put(f'<awaiting_frontend_tools data="{tools_json}"></awaiting_frontend_tools>')
                         
                         # Persist state to DB before returning (required for re-hydration)
                         await self._save_agent_config()
@@ -1496,13 +1575,13 @@ class AnthropicAgent:
             }, step_number=step)
 
             # Finalize file processing
-            await self._finalize_file_processing(queue)
+            await self._finalize_file_processing(queue, formatter=formatter)
             all_files_metadata: list[dict[str, Any]] = list(self.file_registry.values())
             result.generated_files = all_files_metadata
             self._save_run_data_async(result, all_files_metadata)
 
             # Emit meta_final tag at end of run (only if stream_meta_history_and_tool_results is True)
-            await self._emit_meta_final(queue, result)
+            await self._emit_meta_final(queue, result, formatter=formatter)
 
             return result
 
@@ -1615,7 +1694,8 @@ class AnthropicAgent:
     async def _emit_meta_final(
         self,
         queue: Optional[asyncio.Queue],
-        result: AgentResult
+        result: AgentResult,
+        formatter: Optional[FormatterType] = None,
     ) -> None:
         """Emit meta_final tag at end of run when stream_meta_history_and_tool_results is True.
         
@@ -1626,6 +1706,7 @@ class AnthropicAgent:
         Args:
             queue: Optional async queue to emit the meta_final tag to
             result: The AgentResult containing final run data
+            formatter: Active formatter type (determines emission format)
         """
         if queue is None or not self.stream_meta_history_and_tool_results:
             return
@@ -1638,8 +1719,16 @@ class AnthropicAgent:
             "cost": result.cost,
             "cumulative_usage": result.cumulative_usage,
         }
-        escaped_json = html.escape(json.dumps(meta_final), quote=True)
-        await queue.put(f'<meta_final data="{escaped_json}"></meta_final>')
+
+        active_fmt = formatter if formatter is not None else self.formatter
+        if active_fmt == "json":
+            payload = json.dumps(meta_final, ensure_ascii=False)
+            await _chunk_and_emit(
+                queue, "meta_final", self.agent_uuid, payload, final_on_last=True,
+            )
+        else:
+            escaped_json = html.escape(json.dumps(meta_final), quote=True)
+            await queue.put(f'<meta_final data="{escaped_json}"></meta_final>')
 
     async def _generate_final_summary(
         self,
@@ -1716,8 +1805,9 @@ class AnthropicAgent:
             base_delay=self.base_delay,
             formatter=formatter if formatter is not None else self.formatter,
             stream_tool_results=self.stream_meta_history_and_tool_results,
+            agent_uuid=self.agent_uuid,
         )
-        
+
         # Track token usage from API response
         input_tokens = accumulated_message.usage.input_tokens
         output_tokens = accumulated_message.usage.output_tokens
@@ -1796,7 +1886,7 @@ class AnthropicAgent:
         }, step_number=self.max_steps)
 
         # Finalize file processing (extract, store, stream)
-        await self._finalize_file_processing(queue)
+        await self._finalize_file_processing(queue, formatter=formatter)
 
         # Get updated metadata
         all_files_metadata: list[dict[str, Any]] = list(self.file_registry.values())
@@ -1808,7 +1898,7 @@ class AnthropicAgent:
         self._save_run_data_async(result, all_files_metadata)
         
         # Emit meta_final tag at end of run (only if stream_meta_history_and_tool_results is True)
-        await self._emit_meta_final(queue, result)
+        await self._emit_meta_final(queue, result, formatter=formatter)
         
         # Return AgentResult with final summary
         return result
@@ -2531,7 +2621,11 @@ class AnthropicAgent:
                 step=step,
             )
             
-    async def _finalize_file_processing(self, queue: Optional[asyncio.Queue] = None) -> None:
+    async def _finalize_file_processing(
+        self,
+        queue: Optional[asyncio.Queue] = None,
+        formatter: Optional[FormatterType] = None,
+    ) -> None:
         """
         Finalize file processing at the end of a run.
         1. Extract all file IDs from conversation history.
@@ -2543,9 +2637,9 @@ class AnthropicAgent:
         current_step = getattr(self, "total_steps", 0) # total_steps might not be set on self yet
         # Actually run() sets 'step' variable. We can just pass 0 or use a counter if we iterate.
         # Since we are doing this at the end, we can just scan everything.
-        
+
         for i, message in enumerate(self.conversation_history):
-            # rough step approximation or just use 0. 
+            # rough step approximation or just use 0.
             # ideally we would know the step for each message, but history is flat list.
             self._register_files_from_message(message, step=0)
 
@@ -2556,7 +2650,7 @@ class AnthropicAgent:
         # 3. Stream metadata
         all_files_metadata: list[dict[str, Any]] = list(self.file_registry.values())
         if queue and all_files_metadata:
-            await self._stream_file_metadata(queue, all_files_metadata)
+            await self._stream_file_metadata(queue, all_files_metadata, formatter=formatter)
 
     async def _download_file(self, file_id: str) -> tuple[FileMetadata, bytes]:
         """Download file content from Anthropic Files API.
@@ -2712,19 +2806,27 @@ class AnthropicAgent:
     async def _stream_file_metadata(
         self,
         queue: asyncio.Queue,
-        metadata: list[dict]
+        metadata: list[dict],
+        formatter: Optional[FormatterType] = None,
     ) -> None:
-        """Stream file metadata to queue in meta tag format.
-        
+        """Stream file metadata to queue.
+
         Args:
             queue: Async queue to send formatted output
             metadata: List of file metadata dicts to stream
+            formatter: Active formatter type (determines emission format)
         """
         if not metadata:
             return
-        
-        # Format as JSON inside custom content block
+
         files_json = json.dumps({"files": metadata}, default=str, separators=(",", ":"))
-        meta_tag = f'<content-block-meta_files><![CDATA[{files_json}]]></content-block-meta_files>'
-        
-        await queue.put(meta_tag)
+
+        active_fmt = formatter if formatter is not None else self.formatter
+        if active_fmt == "json":
+            await _chunk_and_emit(
+                queue, "meta_files", self.agent_uuid,
+                files_json, final_on_last=True,
+            )
+        else:
+            meta_tag = f'<content-block-meta_files><![CDATA[{files_json}]]></content-block-meta_files>'
+            await queue.put(meta_tag)
