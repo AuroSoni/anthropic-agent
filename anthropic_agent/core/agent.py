@@ -2372,6 +2372,12 @@ class AnthropicAgent:
             self._loaded_conversation_history = config.get("conversation_history", [])
         else:
             self._loaded_conversation_history = []
+
+        # Subagent hierarchy — restore parent link so resumed child agents
+        # continue to emit the correct parent_agent_uuid in meta_init.
+        restored_parent = config.get("parent_agent_uuid")
+        if restored_parent:
+            self._parent_agent_uuid = restored_parent
     
     def _log_action(
         self,
@@ -2430,6 +2436,7 @@ class AnthropicAgent:
         config = StoredAgentConfig(
             agent_uuid=self.agent_uuid,
             system_prompt=self.system_prompt,
+            description=self.description or None,
             model=self.model,
             max_steps=self.max_steps,
             thinking_tokens=self.thinking_tokens,
@@ -2458,6 +2465,16 @@ class AnthropicAgent:
             # can be returned in the AgentResult after continuation. This is distinct from the
             # conversation_history TABLE which stores completed runs across multiple user turns.
             conversation_history=getattr(self, "conversation_history", []),
+            # Subagent hierarchy
+            parent_agent_uuid=self._parent_agent_uuid,
+            subagent_schemas=(
+                [
+                    {"name": name, "description": agent.description, "model": agent.model}
+                    for name, agent in self._sub_agent_tool.agents.items()
+                ]
+                if self._sub_agent_tool
+                else []
+            ),
             title=existing_config.title if existing_config else None,
             # Preserve created_at from existing config, or set to now
             created_at=existing_config.created_at if existing_config else datetime.now().isoformat(),

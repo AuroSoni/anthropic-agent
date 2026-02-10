@@ -89,6 +89,7 @@ def _config_to_row_values(config: AgentConfig) -> tuple:
     return (
         config.agent_uuid,
         config.system_prompt,
+        config.description,
         config.model,
         config.max_steps,
         config.thinking_tokens,
@@ -119,6 +120,8 @@ def _config_to_row_values(config: AgentConfig) -> tuple:
         config.awaiting_frontend_tools,
         config.current_step,
         _to_jsonb(config.conversation_history),
+        config.parent_agent_uuid,
+        _to_jsonb(config.subagent_schemas),
         _to_jsonb(config.extras),
     )
 
@@ -128,6 +131,7 @@ def _row_to_config(row: asyncpg.Record) -> AgentConfig:
     return AgentConfig(
         agent_uuid=str(row["agent_uuid"]),
         system_prompt=row["system_prompt"],
+        description=row.get("description"),
         model=row["model"],
         max_steps=row["max_steps"],
         thinking_tokens=row["thinking_tokens"],
@@ -153,6 +157,8 @@ def _row_to_config(row: asyncpg.Record) -> AgentConfig:
         awaiting_frontend_tools=row["awaiting_frontend_tools"] or False,
         current_step=row["current_step"] or 0,
         conversation_history=_from_jsonb(row["conversation_history"]) or [],
+        parent_agent_uuid=row.get("parent_agent_uuid"),
+        subagent_schemas=_from_jsonb(row.get("subagent_schemas")) or [],
         title=row["title"],
         extras=_from_jsonb(row["extras"]) or {},
         created_at=_parse_datetime(row["created_at"]),
@@ -246,24 +252,27 @@ class PostgresAgentConfigAdapter(AgentConfigAdapter):
         
         query = """
             INSERT INTO agent_config (
-                agent_uuid, system_prompt, model, max_steps, thinking_tokens,
-                max_tokens, container_id, messages, tool_schemas, tool_names,
-                server_tools, beta_headers, api_kwargs, formatter,
+                agent_uuid, system_prompt, description, model, max_steps,
+                thinking_tokens, max_tokens, container_id, messages,
+                tool_schemas, tool_names, server_tools, beta_headers,
+                api_kwargs, formatter,
                 stream_meta_history_and_tool_results, compactor_type,
                 memory_store_type, file_registry, max_retries, base_delay,
                 last_known_input_tokens, last_known_output_tokens,
                 title, created_at, updated_at, last_run_at, total_runs,
                 pending_frontend_tools, pending_backend_results,
                 awaiting_frontend_tools, current_step, conversation_history,
+                parent_agent_uuid, subagent_schemas,
                 extras
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                 $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-                $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32,
-                $33
+                $21, $22, $23, $24, $25, $26, $27, $28, $29, $30,
+                $31, $32, $33, $34, $35, $36
             )
             ON CONFLICT (agent_uuid) DO UPDATE SET
                 system_prompt = EXCLUDED.system_prompt,
+                description = EXCLUDED.description,
                 model = EXCLUDED.model,
                 max_steps = EXCLUDED.max_steps,
                 thinking_tokens = EXCLUDED.thinking_tokens,
@@ -293,6 +302,8 @@ class PostgresAgentConfigAdapter(AgentConfigAdapter):
                 awaiting_frontend_tools = EXCLUDED.awaiting_frontend_tools,
                 current_step = EXCLUDED.current_step,
                 conversation_history = EXCLUDED.conversation_history,
+                parent_agent_uuid = EXCLUDED.parent_agent_uuid,
+                subagent_schemas = EXCLUDED.subagent_schemas,
                 extras = EXCLUDED.extras
         """
         

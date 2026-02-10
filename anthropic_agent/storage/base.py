@@ -31,6 +31,7 @@ class AgentConfig:
     
     # Core configuration
     system_prompt: str | None = None
+    description: str | None = None
     model: str = "claude-sonnet-4-20250514"
     max_steps: int = 50
     thinking_tokens: int = 0
@@ -74,6 +75,10 @@ class AgentConfig:
     awaiting_frontend_tools: bool = False
     current_step: int = 0
     conversation_history: list[dict] = field(default_factory=list)
+
+    # Subagent hierarchy
+    parent_agent_uuid: str | None = None
+    subagent_schemas: list[dict] = field(default_factory=list)
     
     # UI metadata
     title: str | None = None
