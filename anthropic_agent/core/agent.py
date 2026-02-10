@@ -175,6 +175,7 @@ class AnthropicAgent:
     def __init__(
         self,
         system_prompt: Optional[str] = None,
+        description: Optional[str] = None,
         model: Optional[str] = None,
         max_steps: Optional[int] = None,
         thinking_tokens: Optional[int] = None,
@@ -182,6 +183,7 @@ class AnthropicAgent:
         stream_meta_history_and_tool_results: Optional[bool] = None,
         tools: list[Callable[..., Any]] | None = None,
         frontend_tools: list[Callable[..., Any]] | None = None,
+        subagents: dict[str, "AnthropicAgent"] | None = None,
         server_tools: list[dict[str, Any]] | None = None,
         beta_headers: list[str] | None = None,
         container_id: str | None = None,
@@ -202,9 +204,13 @@ class AnthropicAgent:
         **api_kwargs: Any,
     ):
         """Initialize AnthropicAgent with configuration.
-        
+
         Args:
             system_prompt: System prompt to guide the agent's behavior
+            description: Short user-facing description of this agent's purpose.
+                Used by SubAgentTool to document available subagents in tool schemas.
+                This is NOT the system prompt — keep it concise (e.g., "Researches topics
+                and provides analysis"). Defaults to empty string.
             model: Anthropic model name (default: "claude-sonnet-4-5")
             max_steps: Maximum conversation turns before stopping (default: 50)
             thinking_tokens: Budget for extended thinking tokens (default: 0 / disabled)
@@ -215,6 +221,12 @@ class AnthropicAgent:
                 browser-side execution. These tools are schema-only on the server; when Claude
                 calls them, the agent pauses and emits an awaiting_frontend_tools event. The
                 browser executes the tool and POSTs the result back via /agent/tool_results.
+            subagents: Optional dict mapping agent names to pre-configured AnthropicAgent
+                instances. When provided, creates a SubAgentTool dispatcher that Claude can
+                call to delegate tasks to specialized child agents. Each subagent must have
+                a `description` attribute. The parent agent's queue and formatter are injected
+                into the SubAgentTool at the start of each run().
+                Example: {"researcher": researcher_agent, "coder": coder_agent}
             beta_headers: Beta feature headers for Anthropic API (default: None)
             container_id: Container ID for multi-turn conversations (default: None)
             messages: Initial message history (default: None)
@@ -271,6 +283,13 @@ class AnthropicAgent:
         self.conversation_adapter = conversation_adapter or MemoryConversationAdapter()
         self.run_adapter = run_adapter or MemoryAgentRunAdapter()
         
+        # Short description for SubAgentTool schema definitions (not the system prompt)
+        self.description: str = description or ""
+
+        # Parent agent UUID for hierarchy tracking in nested subagent SSE streams.
+        # Set by SubAgentTool._create_child_agent() when this agent is spawned as a child.
+        self._parent_agent_uuid: str | None = None
+
         # Initialization state - tracks whether state has been loaded from DB
         # Use initialize() to load state, or run() will call it automatically
         self._initialized = False
@@ -319,12 +338,25 @@ class AnthropicAgent:
                         f"Frontend tool '{fn.__name__}' must be decorated with @tool(executor='frontend')"
                     )
 
+        # Subagent tool (single dispatcher wrapping multiple child agents)
+        self._sub_agent_tool: Optional[Any] = None
+        if subagents:
+            from ..common_tools.sub_agent_tool import SubAgentTool
+            self._sub_agent_tool = SubAgentTool(agents=subagents)
+            subagent_func = self._sub_agent_tool.get_tool()
+            # Ensure tool registry exists
+            if not self.tool_registry:
+                self.tool_registry = ToolRegistry()
+            self.tool_registry.register_tools([subagent_func])
+            self.tool_schemas = self.tool_registry.get_schemas()
+            self._tool_functions.append(subagent_func)
+
         # Agent UUID for session tracking
-        # If agent_uuid provided, state will be loaded from DB via initialize() 
+        # If agent_uuid provided, state will be loaded from DB via initialize()
         # (called automatically in run() or explicitly by caller)
         self.agent_uuid = agent_uuid or str(uuid.uuid4())
-        
-        # Inject agent UUID into tools that need it (e.g., CodeExecutionTool)
+
+        # Inject agent UUID into tools that need it (e.g., CodeExecutionTool, SubAgentTool)
         self._inject_agent_uuid_to_tools()
         
         # db_config is empty at construction - state is loaded asynchronously via initialize()
@@ -495,7 +527,24 @@ class AnthropicAgent:
                         logger.debug(f"Injected agent_uuid into tool instance: {type(tool_instance).__name__}")
                     except Exception as e:
                         logger.warning("Failed to inject agent_uuid into tool", exc_info=True)
-    
+
+    def _inject_subagent_context(
+        self,
+        queue: Optional[asyncio.Queue],
+        formatter: Optional[FormatterType],
+    ) -> None:
+        """Inject or clear the parent's queue and formatter into the SubAgentTool.
+
+        Called at the start of run()/_resume_run() to share streaming context,
+        and before each return path to clear it (avoids stale references).
+
+        Args:
+            queue: The async queue for SSE streaming (or None to clear).
+            formatter: The formatter type (or None to clear).
+        """
+        if self._sub_agent_tool is not None:
+            self._sub_agent_tool.set_run_context(queue, formatter)
+
     @property
     def is_initialized(self) -> bool:
         """Check if agent has been initialized (state loaded from DB).
@@ -628,6 +677,7 @@ class AnthropicAgent:
                 "format": active_formatter,
                 "user_query": prompt if isinstance(prompt, str) else json.dumps(prompt),
                 "agent_uuid": self.agent_uuid,
+                "parent_agent_uuid": self._parent_agent_uuid,
                 "model": self.model,
             }
             # Only include message_history when stream_meta_history_and_tool_results is True
@@ -675,7 +725,10 @@ class AnthropicAgent:
             container=self.container_id,
         )
         self._last_known_input_tokens = estimated_tokens
-        
+
+        # Inject parent's queue/formatter into SubAgentTool for SSE forwarding
+        self._inject_subagent_context(queue, formatter)
+
         step = 0
         while step < self.max_steps:
             step += 1
@@ -787,7 +840,10 @@ class AnthropicAgent:
                         
                         # Persist state to DB before returning (required for re-hydration)
                         await self._save_agent_config()
-                        
+
+                        # Clear subagent context before returning
+                        self._inject_subagent_context(None, None)
+
                         # Return early with partial result (agent is paused)
                         return AgentResult(
                             final_message=accumulated_message,
@@ -925,10 +981,14 @@ class AnthropicAgent:
             # Emit meta_final tag at end of run (only if stream_meta_history_and_tool_results is True)
             await self._emit_meta_final(queue, result, formatter=formatter)
 
+            # Clear subagent context before returning
+            self._inject_subagent_context(None, None)
+
             return result
 
         # Max steps reached - generate final summary
         logger.warning("Max steps reached, generating final summary", max_steps=self.max_steps)
+        self._inject_subagent_context(None, None)
         return await self._generate_final_summary(queue=queue, formatter=formatter)
     
     def _apply_cache_control(
@@ -1415,12 +1475,15 @@ class AnthropicAgent:
         formatter: Optional[FormatterType] = None,
     ) -> AgentResult:
         """Internal method to resume the agent loop after frontend tool completion.
-        
+
         This continues from the current step, streaming responses and handling
         any subsequent tool calls.
         """
+        # Inject parent's queue/formatter into SubAgentTool for SSE forwarding
+        self._inject_subagent_context(queue, formatter)
+
         step = self._current_step
-        
+
         while step < self.max_steps:
             step += 1
             self._current_step = step
@@ -1525,7 +1588,10 @@ class AnthropicAgent:
                         
                         # Persist state to DB before returning (required for re-hydration)
                         await self._save_agent_config()
-                        
+
+                        # Clear subagent context before returning
+                        self._inject_subagent_context(None, None)
+
                         return AgentResult(
                             final_message=accumulated_message,
                             final_answer="",
@@ -1635,12 +1701,16 @@ class AnthropicAgent:
             # Emit meta_final tag at end of run (only if stream_meta_history_and_tool_results is True)
             await self._emit_meta_final(queue, result, formatter=formatter)
 
+            # Clear subagent context before returning
+            self._inject_subagent_context(None, None)
+
             return result
 
         # Max steps reached
         logger.warning("Max steps reached in resume", max_steps=self.max_steps)
+        self._inject_subagent_context(None, None)
         return await self._generate_final_summary(queue=queue, formatter=formatter)
-    
+
     def _apply_compaction(self, step_number: int = 0) -> None:
         """Apply compaction to self.messages and log the event.
         

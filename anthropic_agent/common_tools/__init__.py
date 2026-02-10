@@ -94,6 +94,7 @@ from .glob_file_search import GlobFileSearchTool
 from .grep_search import GrepSearchTool
 from .list_dir import ListDirTool
 from .code_execution_tool import CodeExecutionTool
+from .sub_agent_tool import SubAgentTool
 
 __all__ = [
     # Extension utilities
@@ -108,4 +109,5 @@ __all__ = [
     "GrepSearchTool",
     "ListDirTool",
     "CodeExecutionTool",
+    "SubAgentTool",
 ]
