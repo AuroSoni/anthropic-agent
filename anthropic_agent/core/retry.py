@@ -16,7 +16,7 @@ async def anthropic_stream_with_backoff(
     queue: Optional[asyncio.Queue] = None,
     max_retries: int = 5,
     base_delay: float = 5.0,
-    formatter: FormatterType = "xml",
+    formatter: FormatterType = "json",
     stream_tool_results: bool = True,
     agent_uuid: str = "",
 ) -> BetaMessage:

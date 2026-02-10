@@ -22,7 +22,7 @@ Example:
     ...     system_prompt="You are a helpful assistant",
     ...     model="claude-sonnet-4-5"
     ... )
-    >>> result = await agent.run("Hello!", formatter="xml")
+    >>> result = await agent.run("Hello!")
 """
 # Optional: Load environment variables if dotenv is available
 try:

@@ -71,7 +71,11 @@ async def xml_formatter(
     stream_tool_results: bool = True
 ) -> BetaMessage:
     """Format Anthropic streaming response with custom XML tags.
-    
+
+    .. deprecated::
+        The xml_formatter is deprecated. Use :func:`json_formatter` instead.
+        It will be removed in a future release.
+
     This formatter wraps different content types in custom XML tags:
     - Thinking: <content-block-thinking>...</content-block-thinking>
     - Text: <content-block-text>...</content-block-text>
@@ -660,7 +664,11 @@ async def raw_formatter(
     stream_tool_results: bool = True
 ) -> BetaMessage:
     """Format Anthropic streaming response with raw/minimal formatting.
-    
+
+    .. deprecated::
+        The raw_formatter is deprecated. Use :func:`json_formatter` instead.
+        It will be removed in a future release.
+
     This formatter streams raw Anthropic events with minimal processing.
     When stream_tool_results is False, all events related to *_tool_result blocks
     are filtered out (content_block_start, content_block_delta, content_block_stop).
@@ -726,19 +734,28 @@ FORMATTERS: dict[str, Callable[..., Awaitable[BetaMessage]]] = {
 
 def get_formatter(name: FormatterType) -> Callable[..., Awaitable[BetaMessage]]:
     """Get a formatter function by name.
-    
+
     Args:
-        name: Formatter name ("xml", "raw", or "json")
-        
+        name: Formatter name ("json", "xml", or "raw"). The "xml" and "raw"
+            formatters are deprecated; prefer "json".
+
     Returns:
         The formatter function
-        
+
     Raises:
         ValueError: If formatter name is not recognized
     """
     if name not in FORMATTERS:
         raise ValueError(
             f"Unknown formatter '{name}'. Available formatters: {list(FORMATTERS.keys())}"
+        )
+    if name in ("xml", "raw"):
+        import warnings
+        warnings.warn(
+            f"The '{name}' formatter is deprecated. Use 'json' instead. "
+            "It will be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=2,
         )
     return FORMATTERS[name]
 

@@ -42,7 +42,7 @@ DEFAULT_MAX_STEPS = 50
 DEFAULT_THINKING_TOKENS = 0
 DEFAULT_MAX_TOKENS = 2048  # TODO: Model specific limits per model
 DEFAULT_STREAM_META = False
-DEFAULT_FORMATTER: FormatterType = "xml"
+DEFAULT_FORMATTER: FormatterType = "json"
 DEFAULT_MAX_RETRIES = 5
 DEFAULT_BASE_DELAY = 1.0
 
@@ -218,7 +218,8 @@ class AnthropicAgent:
             messages: Initial message history (default: None)
             max_retries: Maximum retry attempts for API calls (default: 5)
             base_delay: Base delay in seconds for exponential backoff (default: 5.0)
-            formatter: Default formatter for stream output ("xml" or "raw", default: "xml")
+            formatter: Default formatter for stream output ("json", "xml", or "raw", default: "json").
+                The "xml" and "raw" formatters are deprecated and will be removed in a future release.
             enable_cache_control: Enable cache_control injection for message content blocks
                 (default: True). When enabled, adds cache_control to supported content block
                 types (text, image, document) in both user and assistant messages.
@@ -553,7 +554,7 @@ class AnthropicAgent:
         Args:
             prompt: Either a string or a list of content blocks (for multimodal input)
             queue: Optional async queue to stream formatted output chunks
-            formatter: Formatter to use for stream output ("xml" or "raw"). 
+            formatter: Formatter to use for stream output ("json", "xml", or "raw").
                       If None, uses the default formatter set at agent initialization.
         
         Returns:

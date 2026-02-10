@@ -126,7 +126,7 @@ class AgentConfig(BaseModel):
     config_adapter: Any = None
     conversation_adapter: Any = None
     run_adapter: Any = None
-    formatter: str = "raw"
+    formatter: str = "json"
     stream_meta_history_and_tool_results: bool = False  # Include tool results in stream output
 
 
@@ -228,7 +228,7 @@ agent_no_tools = AgentConfig(
     config_adapter=config_adapter,
     conversation_adapter=conversation_adapter,
     run_adapter=run_adapter,
-    formatter="raw",
+    formatter="json",
     stream_meta_history_and_tool_results=True,
 )
 
@@ -242,7 +242,7 @@ agent_client_tools = AgentConfig(
     config_adapter=config_adapter,
     conversation_adapter=conversation_adapter,
     run_adapter=run_adapter,
-    formatter="raw",
+    formatter="json",
     stream_meta_history_and_tool_results=True,
 )
 
@@ -295,7 +295,7 @@ agent_all_raw = AgentConfig(
     config_adapter=config_adapter,
     conversation_adapter=conversation_adapter,
     run_adapter=run_adapter,
-    formatter="raw",
+    formatter="json",
     stream_meta_history_and_tool_results=True,
 )
 
@@ -348,7 +348,7 @@ agent_all_xml = AgentConfig(
     config_adapter=config_adapter,
     conversation_adapter=conversation_adapter,
     run_adapter=run_adapter,
-    formatter="xml",
+    formatter="json",
     stream_meta_history_and_tool_results=True,
 )
 
@@ -366,7 +366,7 @@ any action that could have consequences, ask for user confirmation using the use
     config_adapter=config_adapter,
     conversation_adapter=conversation_adapter,
     run_adapter=run_adapter,
-    formatter="xml",  # XML formatter for proper tag streaming
+    formatter="json",
     stream_meta_history_and_tool_results=True,
 )
 
@@ -384,7 +384,7 @@ any action that could have consequences, ask for user confirmation using the use
     config_adapter=config_adapter,
     conversation_adapter=conversation_adapter,
     run_adapter=run_adapter,
-    formatter="raw",  # Raw JSON format for testing
+    formatter="json",
     stream_meta_history_and_tool_results=True,
 )
 
