@@ -30,22 +30,40 @@ class ImageBlock:
     media_type: Literal["image/png", "image/jpeg", "image/gif", "image/webp"]
 
 @dataclass
+class DocumentBlock:
+    """Document content block for tool results (e.g. PDFs).
+
+    The Anthropic API natively renders PDFs — each page is converted
+    to an image + text extraction internally by the API.
+
+    Attributes:
+        data: Raw document bytes
+        media_type: MIME type of the document
+    """
+    data: bytes
+    media_type: Literal["application/pdf"]
+
+@dataclass
 class ToolResult:
-    """Wrapper for tool execution results supporting text and images.
-    
+    """Wrapper for tool execution results supporting text, images, and documents.
+
     This class provides a type-safe way to return multimodal content from tools.
     For text-only results, use the `text()` class method. For results with images,
-    use `with_image()` or construct directly with a list of content.
-    
+    use `with_image()`. For documents (PDFs), use `with_document()`.
+
     Example:
         >>> # Text-only result
         >>> return ToolResult.text("Operation completed successfully")
-        >>> 
+        >>>
         >>> # Result with image
         >>> screenshot = capture_screenshot()
         >>> return ToolResult.with_image("Here's the screenshot:", screenshot, "image/png")
+        >>>
+        >>> # Result with PDF document
+        >>> pdf_bytes = Path("report.pdf").read_bytes()
+        >>> return ToolResult.with_document("Here's the PDF:", pdf_bytes, "application/pdf")
     """
-    content: str | list[str | ImageBlock]
+    content: str | list[str | ImageBlock | DocumentBlock]
     
     @classmethod
     def text(cls, text: str) -> "ToolResult":
@@ -77,7 +95,29 @@ class ToolResult:
             ToolResult with text and image content
         """
         return cls(content=[text, ImageBlock(image_data, media_type)])
-    
+
+    @classmethod
+    def with_document(
+        cls,
+        text: str,
+        doc_data: bytes,
+        media_type: Literal["application/pdf"],
+    ) -> "ToolResult":
+        """Create a result with text and one document (e.g. PDF).
+
+        The Anthropic API natively processes PDFs, extracting text and
+        rendering pages as images for visual analysis.
+
+        Args:
+            text: Text description or context for the document
+            doc_data: Raw document bytes
+            media_type: MIME type of the document
+
+        Returns:
+            ToolResult with text and document content
+        """
+        return cls(content=[text, DocumentBlock(doc_data, media_type)])
+
     async def to_api_format(
         self,
         file_backend: "FileStorageBackend | None" = None,
@@ -151,7 +191,17 @@ class ToolResult:
                         "src": src,
                         "media_type": item.media_type,
                     })
-        
+            elif isinstance(item, DocumentBlock):
+                b64_data = base64.standard_b64encode(item.data).decode("utf-8")
+                api_blocks.append({
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": item.media_type,
+                        "data": b64_data,
+                    }
+                })
+
         return api_blocks, image_refs
 
 class ToolExecutor(Protocol):
