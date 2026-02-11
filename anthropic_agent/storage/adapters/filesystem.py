@@ -52,14 +52,17 @@ def _dict_to_config(data: dict) -> AgentConfig:
     """Convert dict to AgentConfig, handling unknown fields via extras."""
     # Known fields from AgentConfig dataclass
     known_fields = {
-        "agent_uuid", "system_prompt", "model", "max_steps", "thinking_tokens",
-        "max_tokens", "container_id", "messages", "tool_schemas", "tool_names",
-        "server_tools", "beta_headers", "api_kwargs", "formatter",
-        "stream_meta_history_and_tool_results", "compactor_type", "memory_store_type",
-        "file_registry", "max_retries", "base_delay", "last_known_input_tokens",
-        "last_known_output_tokens", "pending_frontend_tools", "pending_backend_results",
-        "awaiting_frontend_tools", "current_step", "conversation_history", "title",
-        "created_at", "updated_at", "last_run_at", "total_runs", "extras"
+        "agent_uuid", "system_prompt", "description", "model", "max_steps",
+        "thinking_tokens", "max_tokens", "container_id", "messages",
+        "tool_schemas", "tool_names", "server_tools", "beta_headers",
+        "api_kwargs", "formatter", "stream_meta_history_and_tool_results",
+        "compactor_type", "memory_store_type", "file_registry", "max_retries",
+        "base_delay", "last_known_input_tokens", "last_known_output_tokens",
+        "pending_frontend_tools", "pending_backend_results",
+        "awaiting_frontend_tools", "current_step", "conversation_history",
+        "parent_agent_uuid", "subagent_schemas",
+        "title", "created_at", "updated_at", "last_run_at", "total_runs",
+        "extras",
     }
     
     # Separate known fields from extras

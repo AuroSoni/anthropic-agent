@@ -94,6 +94,9 @@ from .glob_file_search import GlobFileSearchTool
 from .grep_search import GrepSearchTool
 from .list_dir import ListDirTool
 from .code_execution_tool import CodeExecutionTool
+from .sub_agent_tool import SubAgentTool
+from .todo_tool import TodoWriteTool, CheckTodoTool
+from .plan_tools import EnterPlanModeTool, ExitPlanModeTool, CreatePlanTool, EditPlanTool
 
 __all__ = [
     # Extension utilities
@@ -108,4 +111,12 @@ __all__ = [
     "GrepSearchTool",
     "ListDirTool",
     "CodeExecutionTool",
+    "SubAgentTool",
+    "TodoWriteTool",
+    "CheckTodoTool",
+    # Plan tools
+    "EnterPlanModeTool",
+    "ExitPlanModeTool",
+    "CreatePlanTool",
+    "EditPlanTool",
 ]

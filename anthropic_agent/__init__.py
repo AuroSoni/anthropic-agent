@@ -9,7 +9,7 @@ Main exports:
     - AgentResult: Result dataclass from agent.run()
     - anthropic_stream_with_backoff: Streaming with retry logic
     - render_stream: Stream renderer with custom formatting
-    - FormatterType: Type alias for formatter options ("xml" | "raw")
+    - FormatterType: Type alias for formatter options ("xml" | "raw" | "json")
 
 Logging:
     - configure_logging: Configure the logging framework
@@ -22,7 +22,7 @@ Example:
     ...     system_prompt="You are a helpful assistant",
     ...     model="claude-sonnet-4-5"
     ... )
-    >>> result = await agent.run("Hello!", formatter="xml")
+    >>> result = await agent.run("Hello!")
 """
 # Optional: Load environment variables if dotenv is available
 try:
@@ -33,7 +33,7 @@ except ImportError:
 
 # Core exports
 from .core import AgentResult, AnthropicAgent, anthropic_stream_with_backoff
-from .streaming import render_stream, stream_to_aqueue, FormatterType
+from .streaming import render_stream, stream_to_aqueue, json_formatter, FormatterType
 
 # Logging exports
 from .logging import (
@@ -62,6 +62,7 @@ __all__ = [
     'anthropic_stream_with_backoff',
     'render_stream',
     'stream_to_aqueue',
+    'json_formatter',
     'FormatterType',
     # Logging
     'configure_logging',

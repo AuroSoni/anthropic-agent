@@ -16,42 +16,44 @@ async def anthropic_stream_with_backoff(
     queue: Optional[asyncio.Queue] = None,
     max_retries: int = 5,
     base_delay: float = 5.0,
-    formatter: FormatterType = "xml",
+    formatter: FormatterType = "json",
     stream_tool_results: bool = True,
+    agent_uuid: str = "",
 ) -> BetaMessage:
     """Execute Anthropic streaming with exponential backoff for transient failures.
-    
+
     Handles transient failures (rate limits, network issues, server errors) with
     exponential backoff and jitter. Retries the entire stream on failure to ensure
     consistent state.
-    
+
     Retryable errors:
     - RateLimitError: API rate limits exceeded
     - APIConnectionError: Network connectivity issues
     - APITimeoutError: Request timeout
     - InternalServerError: Server errors (5xx)
     - APIStatusError with 5xx status codes
-    
+
     Non-retryable errors (will raise immediately):
     - BadRequestError (400): Invalid request parameters
     - AuthenticationError (401): Invalid API key
     - PermissionDeniedError (403): Insufficient permissions
     - NotFoundError (404): Resource not found
     - UnprocessableEntityError (422): Validation errors
-    
+
     Args:
         client: Anthropic client instance
         request_params: Parameters dict for client.beta.messages.stream(**params)
         queue: Optional async queue for streaming formatted output
         max_retries: Maximum number of retry attempts (default: 5)
         base_delay: Base delay in seconds for exponential backoff (default: 5.0)
-        formatter: Formatter to use for stream output ("xml" or "raw", default: "xml")
+        formatter: Formatter to use for stream output ("xml", "raw", or "json")
         stream_tool_results: Whether to stream tool results to the queue (default: True).
             When False, server tool results are not streamed to reduce output volume.
-        
+        agent_uuid: UUID of the emitting agent (used by json_formatter).
+
     Returns:
         The final accumulated message from stream.get_final_message()
-        
+
     Raises:
         anthropic.BadRequestError: Invalid request (not retried)
         anthropic.AuthenticationError: Auth failure (not retried)
@@ -59,7 +61,7 @@ async def anthropic_stream_with_backoff(
         anthropic.NotFoundError: Resource not found (not retried)
         anthropic.UnprocessableEntityError: Validation error (not retried)
         Exception: Re-raises the final exception after all retries exhausted
-        
+
     Example:
         >>> message = await anthropic_stream_with_backoff(
         ...     client=client,
@@ -68,11 +70,11 @@ async def anthropic_stream_with_backoff(
         ...     max_retries=3,
         ...     base_delay=2.0
         ... )
-        
+
     Note:
         The delay between retries follows the formula:
         delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
-        
+
         For base_delay=5.0:
         - Attempt 1: ~5 seconds
         - Attempt 2: ~10 seconds
@@ -90,7 +92,9 @@ async def anthropic_stream_with_backoff(
                     # Use render_stream for formatted output with specified formatter
                     formatter_fn = get_formatter(formatter)
                     accumulated_message = await render_stream(
-                        stream, queue, formatter=formatter_fn, stream_tool_results=stream_tool_results
+                        stream, queue, formatter=formatter_fn,
+                        stream_tool_results=stream_tool_results,
+                        agent_uuid=agent_uuid,
                     )
                 else:
                     # Simple iteration without queue

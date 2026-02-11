@@ -16,7 +16,7 @@ from .types import AgentResult
 from .retry import anthropic_stream_with_backoff, retry_with_backoff
 from .title_generator import generate_title
 from ..tools.base import ToolRegistry, ToolResultContent
-from ..streaming import FormatterType
+from ..streaming import FormatterType, _chunk_and_emit
 from .compaction import CompactorType, get_compactor, get_default_compactor, Compactor
 from ..memory import MemoryStoreType, get_memory_store, MemoryStore
 from ..storage import (
@@ -42,9 +42,10 @@ DEFAULT_MAX_STEPS = 50
 DEFAULT_THINKING_TOKENS = 0
 DEFAULT_MAX_TOKENS = 2048  # TODO: Model specific limits per model
 DEFAULT_STREAM_META = False
-DEFAULT_FORMATTER: FormatterType = "xml"
+DEFAULT_FORMATTER: FormatterType = "json"
 DEFAULT_MAX_RETRIES = 5
 DEFAULT_BASE_DELAY = 1.0
+MAX_PARALLEL_TOOL_CALLS = 5
 
 # Escape tool result content for SSE + CDATA safety.
 def _escape_tool_result_cdata(content: str) -> str:
@@ -55,6 +56,116 @@ def _escape_tool_result_cdata(content: str) -> str:
     safe = safe.replace("\r\n", "\n").replace("\r", "\n")
     return safe.replace("\n", "\\n")
 
+
+async def _emit_tool_result(
+    queue: asyncio.Queue,
+    active_fmt: "FormatterType",
+    agent_uuid: str,
+    tool_use_id: str,
+    tool_name: str,
+    result_content: Any,
+    image_refs: list[dict[str, Any]] | None = None,
+) -> None:
+    """Emit a backend or frontend tool result to the SSE queue.
+
+    Handles both XML and JSON envelope formats, including multimodal
+    results (text + images).
+
+    Args:
+        queue: Async queue to emit to.
+        active_fmt: The active formatter type ("xml", "json", or "raw").
+        agent_uuid: Agent UUID for JSON envelope ``agent`` field.
+        tool_use_id: The tool_use_id this result responds to.
+        tool_name: Human-readable tool name.
+        result_content: The tool result payload (str, dict, list, or None).
+        image_refs: Optional list of image reference dicts with ``src``
+            and ``media_type`` keys.
+    """
+    if image_refs is None:
+        image_refs = []
+
+    escaped_id = html.escape(str(tool_use_id), quote=True)
+    escaped_name = html.escape(str(tool_name), quote=True)
+
+    if active_fmt == "json":
+        # --- JSON envelope path ---
+        if image_refs:
+            # Emit text portion
+            text_parts: list[str] = []
+            if isinstance(result_content, list):
+                for block in result_content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+            text_payload = "\n".join(text_parts) if text_parts else ""
+            await _chunk_and_emit(
+                queue, "tool_result", agent_uuid,
+                text_payload, final_on_last=False,
+                id=tool_use_id, name=tool_name,
+            )
+            # Emit each image as its own envelope
+            for ref in image_refs:
+                await _chunk_and_emit(
+                    queue, "tool_result_image", agent_uuid,
+                    "", final_on_last=False,
+                    id=tool_use_id, name=tool_name,
+                    src=ref["src"], media_type=ref["media_type"],
+                )
+            # Emit final marker
+            await _chunk_and_emit(
+                queue, "tool_result", agent_uuid,
+                "", final_on_last=True,
+                id=tool_use_id, name=tool_name,
+            )
+        else:
+            # Text-only result
+            if result_content is None:
+                content_str = ""
+            elif isinstance(result_content, str):
+                content_str = result_content
+            else:
+                content_str = json.dumps(result_content, default=str)
+            await _chunk_and_emit(
+                queue, "tool_result", agent_uuid,
+                content_str, final_on_last=True,
+                id=tool_use_id, name=tool_name,
+            )
+    else:
+        # --- XML path (xml / raw) ---
+        if image_refs:
+            text_parts = []
+            if isinstance(result_content, list):
+                for block in result_content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+            text_content = "\n".join(text_parts) if text_parts else ""
+            text_content = _escape_tool_result_cdata(text_content)
+
+            image_tags = "".join(
+                f'<image src="{html.escape(ref["src"], quote=True)}" '
+                f'media_type="{html.escape(ref["media_type"], quote=True)}" />'
+                for ref in image_refs
+            )
+            await queue.put(
+                f'<content-block-tool_result id="{escaped_id}" name="{escaped_name}">'
+                f'<text><![CDATA[{text_content}]]></text>'
+                f'{image_tags}'
+                f'</content-block-tool_result>'
+            )
+        else:
+            if result_content is None:
+                content_str = ""
+            elif isinstance(result_content, str):
+                content_str = result_content
+            else:
+                content_str = json.dumps(result_content, default=str)
+            content_str = _escape_tool_result_cdata(content_str)
+            await queue.put(
+                f'<content-block-tool_result id="{escaped_id}" name="{escaped_name}">'
+                f'<![CDATA[{content_str}]]>'
+                f'</content-block-tool_result>'
+            )
+
+
 # Cache control configuration (Anthropic limits)
 MAX_CACHE_BLOCKS = 4
 MIN_CACHE_TOKENS_SONNET = 1024  # Claude Sonnet/Opus minimum
@@ -64,6 +175,7 @@ class AnthropicAgent:
     def __init__(
         self,
         system_prompt: Optional[str] = None,
+        description: Optional[str] = None,
         model: Optional[str] = None,
         max_steps: Optional[int] = None,
         thinking_tokens: Optional[int] = None,
@@ -71,12 +183,14 @@ class AnthropicAgent:
         stream_meta_history_and_tool_results: Optional[bool] = None,
         tools: list[Callable[..., Any]] | None = None,
         frontend_tools: list[Callable[..., Any]] | None = None,
+        subagents: dict[str, "AnthropicAgent"] | None = None,
         server_tools: list[dict[str, Any]] | None = None,
         beta_headers: list[str] | None = None,
         container_id: str | None = None,
         messages: list[dict] | None = None,    # TODO: Add Message Type.
         max_retries: Optional[int] = None,
         base_delay: Optional[float] = None,
+        max_parallel_tool_calls: int | None = None,
         formatter: FormatterType | None = None,
         enable_cache_control: Optional[bool] = None,
         compactor: CompactorType | Compactor | None = None,
@@ -90,9 +204,13 @@ class AnthropicAgent:
         **api_kwargs: Any,
     ):
         """Initialize AnthropicAgent with configuration.
-        
+
         Args:
             system_prompt: System prompt to guide the agent's behavior
+            description: Short user-facing description of this agent's purpose.
+                Used by SubAgentTool to document available subagents in tool schemas.
+                This is NOT the system prompt — keep it concise (e.g., "Researches topics
+                and provides analysis"). Defaults to empty string.
             model: Anthropic model name (default: "claude-sonnet-4-5")
             max_steps: Maximum conversation turns before stopping (default: 50)
             thinking_tokens: Budget for extended thinking tokens (default: 0 / disabled)
@@ -103,12 +221,19 @@ class AnthropicAgent:
                 browser-side execution. These tools are schema-only on the server; when Claude
                 calls them, the agent pauses and emits an awaiting_frontend_tools event. The
                 browser executes the tool and POSTs the result back via /agent/tool_results.
+            subagents: Optional dict mapping agent names to pre-configured AnthropicAgent
+                instances. When provided, creates a SubAgentTool dispatcher that Claude can
+                call to delegate tasks to specialized child agents. Each subagent must have
+                a `description` attribute. The parent agent's queue and formatter are injected
+                into the SubAgentTool at the start of each run().
+                Example: {"researcher": researcher_agent, "coder": coder_agent}
             beta_headers: Beta feature headers for Anthropic API (default: None)
             container_id: Container ID for multi-turn conversations (default: None)
             messages: Initial message history (default: None)
             max_retries: Maximum retry attempts for API calls (default: 5)
             base_delay: Base delay in seconds for exponential backoff (default: 5.0)
-            formatter: Default formatter for stream output ("xml" or "raw", default: "xml")
+            formatter: Default formatter for stream output ("json", "xml", or "raw", default: "json").
+                The "xml" and "raw" formatters are deprecated and will be removed in a future release.
             enable_cache_control: Enable cache_control injection for message content blocks
                 (default: True). When enabled, adds cache_control to supported content block
                 types (text, image, document) in both user and assistant messages.
@@ -158,6 +283,13 @@ class AnthropicAgent:
         self.conversation_adapter = conversation_adapter or MemoryConversationAdapter()
         self.run_adapter = run_adapter or MemoryAgentRunAdapter()
         
+        # Short description for SubAgentTool schema definitions (not the system prompt)
+        self.description: str = description or ""
+
+        # Parent agent UUID for hierarchy tracking in nested subagent SSE streams.
+        # Set by SubAgentTool._create_child_agent() when this agent is spawned as a child.
+        self._parent_agent_uuid: str | None = None
+
         # Initialization state - tracks whether state has been loaded from DB
         # Use initialize() to load state, or run() will call it automatically
         self._initialized = False
@@ -181,6 +313,8 @@ class AnthropicAgent:
             # Pre-configured FileStorageBackend instance provided
             self.file_backend = file_backend
         
+        self.max_parallel_tool_calls = max_parallel_tool_calls or MAX_PARALLEL_TOOL_CALLS
+
         self.tool_registry: Optional[ToolRegistry] = None
         self.tool_schemas: list[dict[str, Any]] = []
         self._tool_functions: list[Callable[..., Any]] = []  # Store for UUID injection
@@ -204,12 +338,25 @@ class AnthropicAgent:
                         f"Frontend tool '{fn.__name__}' must be decorated with @tool(executor='frontend')"
                     )
 
+        # Subagent tool (single dispatcher wrapping multiple child agents)
+        self._sub_agent_tool: Optional[Any] = None
+        if subagents:
+            from ..common_tools.sub_agent_tool import SubAgentTool
+            self._sub_agent_tool = SubAgentTool(agents=subagents)
+            subagent_func = self._sub_agent_tool.get_tool()
+            # Ensure tool registry exists
+            if not self.tool_registry:
+                self.tool_registry = ToolRegistry()
+            self.tool_registry.register_tools([subagent_func])
+            self.tool_schemas = self.tool_registry.get_schemas()
+            self._tool_functions.append(subagent_func)
+
         # Agent UUID for session tracking
-        # If agent_uuid provided, state will be loaded from DB via initialize() 
+        # If agent_uuid provided, state will be loaded from DB via initialize()
         # (called automatically in run() or explicitly by caller)
         self.agent_uuid = agent_uuid or str(uuid.uuid4())
-        
-        # Inject agent UUID into tools that need it (e.g., CodeExecutionTool)
+
+        # Inject agent UUID into tools that need it (e.g., CodeExecutionTool, SubAgentTool)
         self._inject_agent_uuid_to_tools()
         
         # db_config is empty at construction - state is loaded asynchronously via initialize()
@@ -380,7 +527,24 @@ class AnthropicAgent:
                         logger.debug(f"Injected agent_uuid into tool instance: {type(tool_instance).__name__}")
                     except Exception as e:
                         logger.warning("Failed to inject agent_uuid into tool", exc_info=True)
-    
+
+    def _inject_subagent_context(
+        self,
+        queue: Optional[asyncio.Queue],
+        formatter: Optional[FormatterType],
+    ) -> None:
+        """Inject or clear the parent's queue and formatter into the SubAgentTool.
+
+        Called at the start of run()/_resume_run() to share streaming context,
+        and before each return path to clear it (avoids stale references).
+
+        Args:
+            queue: The async queue for SSE streaming (or None to clear).
+            formatter: The formatter type (or None to clear).
+        """
+        if self._sub_agent_tool is not None:
+            self._sub_agent_tool.set_run_context(queue, formatter)
+
     @property
     def is_initialized(self) -> bool:
         """Check if agent has been initialized (state loaded from DB).
@@ -443,7 +607,7 @@ class AnthropicAgent:
         Args:
             prompt: Either a string or a list of content blocks (for multimodal input)
             queue: Optional async queue to stream formatted output chunks
-            formatter: Formatter to use for stream output ("xml" or "raw"). 
+            formatter: Formatter to use for stream output ("json", "xml", or "raw").
                       If None, uses the default formatter set at agent initialization.
         
         Returns:
@@ -508,17 +672,28 @@ class AnthropicAgent:
         
         # Emit meta_init tag to signal stream format and provide metadata
         if queue is not None:
+            active_formatter = formatter if formatter is not None else self.formatter
             meta_init: dict[str, Any] = {
-                "format": formatter if formatter is not None else self.formatter,
+                "format": active_formatter,
                 "user_query": prompt if isinstance(prompt, str) else json.dumps(prompt),
                 "agent_uuid": self.agent_uuid,
+                "parent_agent_uuid": self._parent_agent_uuid,
                 "model": self.model,
             }
             # Only include message_history when stream_meta_history_and_tool_results is True
             if self.stream_meta_history_and_tool_results:
                 meta_init["message_history"] = self.conversation_history
-            escaped_json = html.escape(json.dumps(meta_init), quote=True)
-            await queue.put(f'<meta_init data="{escaped_json}"></meta_init>')
+
+            if active_formatter == "json":
+                # JSON envelope: chunked meta_init
+                payload = json.dumps(meta_init, ensure_ascii=False)
+                await _chunk_and_emit(
+                    queue, "meta_init", self.agent_uuid, payload, final_on_last=True,
+                )
+            else:
+                # Legacy XML format
+                escaped_json = html.escape(json.dumps(meta_init), quote=True)
+                await queue.put(f'<meta_init data="{escaped_json}"></meta_init>')
         
         # Retrieve and inject semantic memories
         if self.memory_store:
@@ -550,7 +725,10 @@ class AnthropicAgent:
             container=self.container_id,
         )
         self._last_known_input_tokens = estimated_tokens
-        
+
+        # Inject parent's queue/formatter into SubAgentTool for SSE forwarding
+        self._inject_subagent_context(queue, formatter)
+
         step = 0
         while step < self.max_steps:
             step += 1
@@ -571,6 +749,7 @@ class AnthropicAgent:
                 base_delay=self.base_delay,
                 formatter=formatter if formatter is not None else self.formatter,
                 stream_tool_results=self.stream_meta_history_and_tool_results,
+                agent_uuid=self.agent_uuid,
             )
             
             # Track token usage from API response
@@ -624,88 +803,11 @@ class AnthropicAgent:
                     backend_tool_calls = [t for t in tool_calls if t.name not in self.frontend_tool_names]
                     frontend_tool_calls = [t for t in tool_calls if t.name in self.frontend_tool_names]
                     
-                    # Execute ALL backend tools first
-                    tool_results = []
-                    for tool_call in backend_tool_calls:
-                        is_error = False
-                        result_content: ToolResultContent = ""
-                        image_refs: list[dict[str, Any]] = []
-                        try:
-                            # Execute the tool (support both sync and async executors)
-                            result = self.execute_tool_call(tool_call.name, tool_call.input)
-                            # Check if result is a coroutine (async function)
-                            if asyncio.iscoroutine(result):
-                                result = await result
-                            # Unpack result tuple (content, image_refs)
-                            result_content, image_refs = result
-                            tool_results.append({
-                                "type": "tool_result",
-                                "tool_use_id": tool_call.id,
-                                "content": result_content
-                            })
-                        except Exception as e:
-                            # Handle tool execution errors
-                            is_error = True
-                            result_content = f"Error executing tool: {str(e)}"
-                            image_refs = []
-                            tool_results.append({
-                                "type": "tool_result",
-                                "tool_use_id": tool_call.id,
-                                "content": result_content,
-                                "is_error": True
-                            })
-                        
-                        # Stream tool result to queue in XML format
-                        if queue is not None:
-                            tool_use_id = html.escape(str(tool_call.id), quote=True)
-                            tool_name_escaped = html.escape(str(tool_call.name), quote=True)
-                            
-                            # Build streaming output based on content type
-                            if image_refs:
-                                # Multimodal result: stream text + image references
-                                text_parts = []
-                                if isinstance(result_content, list):
-                                    for block in result_content:
-                                        if isinstance(block, dict) and block.get("type") == "text":
-                                            text_parts.append(block.get("text", ""))
-                                text_content = "\n".join(text_parts) if text_parts else ""
-                                text_content = _escape_tool_result_cdata(text_content)
-                                text_content = _escape_tool_result_cdata(text_content)
-                                
-                                # Build image reference tags
-                                image_tags = "".join(
-                                    f'<image src="{html.escape(ref["src"], quote=True)}" media_type="{html.escape(ref["media_type"], quote=True)}" />'
-                                    for ref in image_refs
-                                )
-                                
-                                await queue.put(
-                                    f'<content-block-tool_result id="{tool_use_id}" name="{tool_name_escaped}">'
-                                    f'<text><![CDATA[{text_content}]]></text>'
-                                    f'{image_tags}'
-                                    f'</content-block-tool_result>'
-                                )
-                            else:
-                                # Text-only result: serialize as before
-                                if result_content is None:
-                                    content_str = ""
-                                elif isinstance(result_content, str):
-                                    content_str = result_content
-                                else:
-                                    content_str = json.dumps(result_content, default=str)
-                                content_str = _escape_tool_result_cdata(content_str)
-                                content_str = _escape_tool_result_cdata(content_str)
-                                await queue.put(
-                                    f'<content-block-tool_result id="{tool_use_id}" name="{tool_name_escaped}"><![CDATA[{content_str}]]></content-block-tool_result>'
-                                )
-                        
-                        # Log: tool execution
-                        self._log_action("tool_execution", {
-                            "tool_name": tool_call.name,
-                            "tool_use_id": tool_call.id,
-                            "success": not is_error,
-                            "has_images": len(image_refs) > 0,
-                        }, step_number=step)
-                    
+                    # Execute all backend tools (parallel when multiple)
+                    tool_results = await self._execute_tools_parallel(
+                        backend_tool_calls, queue, formatter, step,
+                    )
+
                     # If frontend tools exist, pause and wait for browser execution
                     if frontend_tool_calls:
                         # Store backend results for later (will be combined with frontend results)
@@ -725,12 +827,23 @@ class AnthropicAgent:
                         
                         # Emit all pending frontend tools to client
                         if queue is not None:
-                            tools_json = html.escape(json.dumps(self._pending_frontend_tools), quote=True)
-                            await queue.put(f'<awaiting_frontend_tools data="{tools_json}"></awaiting_frontend_tools>')
+                            active_fmt = formatter if formatter is not None else self.formatter
+                            if active_fmt == "json":
+                                payload = json.dumps(self._pending_frontend_tools, ensure_ascii=False)
+                                await _chunk_and_emit(
+                                    queue, "awaiting_frontend_tools", self.agent_uuid,
+                                    payload, final_on_last=True,
+                                )
+                            else:
+                                tools_json = html.escape(json.dumps(self._pending_frontend_tools), quote=True)
+                                await queue.put(f'<awaiting_frontend_tools data="{tools_json}"></awaiting_frontend_tools>')
                         
                         # Persist state to DB before returning (required for re-hydration)
                         await self._save_agent_config()
-                        
+
+                        # Clear subagent context before returning
+                        self._inject_subagent_context(None, None)
+
                         # Return early with partial result (agent is paused)
                         return AgentResult(
                             final_message=accumulated_message,
@@ -854,7 +967,7 @@ class AnthropicAgent:
             }, step_number=step)
 
             # Finalize file processing (extract, store, stream)
-            await self._finalize_file_processing(queue)
+            await self._finalize_file_processing(queue, formatter=formatter)
 
             # Get updated metadata
             all_files_metadata: list[dict[str, Any]] = list(self.file_registry.values())
@@ -866,12 +979,16 @@ class AnthropicAgent:
             self._save_run_data_async(result, all_files_metadata)
 
             # Emit meta_final tag at end of run (only if stream_meta_history_and_tool_results is True)
-            await self._emit_meta_final(queue, result)
+            await self._emit_meta_final(queue, result, formatter=formatter)
+
+            # Clear subagent context before returning
+            self._inject_subagent_context(None, None)
 
             return result
 
         # Max steps reached - generate final summary
         logger.warning("Max steps reached, generating final summary", max_steps=self.max_steps)
+        self._inject_subagent_context(None, None)
         return await self._generate_final_summary(queue=queue, formatter=formatter)
     
     def _apply_cache_control(
@@ -1100,7 +1217,140 @@ class AnthropicAgent:
             file_backend=self.file_backend,
             agent_uuid=self.agent_uuid,
         )
-    
+
+    async def _execute_tools_sequential(
+        self,
+        backend_tool_calls: list,
+        queue: asyncio.Queue | None,
+        formatter: "FormatterType | None",
+        step: int,
+    ) -> list[dict]:
+        """Execute backend tool calls one at a time.
+
+        Used as the fast-path when there is only a single tool call
+        (avoids semaphore / lock / task overhead).
+        """
+        tool_results: list[dict] = []
+        for tool_call in backend_tool_calls:
+            is_error = False
+            result_content: ToolResultContent = ""
+            image_refs: list[dict[str, Any]] = []
+            try:
+                result_content, image_refs = await self.execute_tool_call(
+                    tool_call.name, tool_call.input,
+                )
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_call.id,
+                    "content": result_content,
+                })
+            except Exception as e:
+                is_error = True
+                result_content = f"Error executing tool: {str(e)}"
+                image_refs = []
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_call.id,
+                    "content": result_content,
+                    "is_error": True,
+                })
+
+            # Stream tool result to SSE queue
+            if queue is not None:
+                active_fmt = formatter if formatter is not None else self.formatter
+                await _emit_tool_result(
+                    queue, active_fmt, self.agent_uuid,
+                    tool_use_id=str(tool_call.id),
+                    tool_name=str(tool_call.name),
+                    result_content=result_content,
+                    image_refs=image_refs if image_refs else None,
+                )
+
+            self._log_action("tool_execution", {
+                "tool_name": tool_call.name,
+                "tool_use_id": tool_call.id,
+                "success": not is_error,
+                "has_images": len(image_refs) > 0,
+            }, step_number=step)
+
+        return tool_results
+
+    async def _execute_tools_parallel(
+        self,
+        backend_tool_calls: list,
+        queue: asyncio.Queue | None,
+        formatter: "FormatterType | None",
+        step: int,
+    ) -> list[dict]:
+        """Execute backend tool calls with bounded parallelism.
+
+        Results are streamed to the SSE *queue* as each tool completes.
+        The returned list preserves the original order of *backend_tool_calls*
+        so the Anthropic API contract (tool_result ordering matches tool_use
+        ordering) is maintained.
+        """
+        # Fast-path: single or zero tool calls — skip concurrency overhead.
+        if len(backend_tool_calls) <= 1:
+            return await self._execute_tools_sequential(
+                backend_tool_calls, queue, formatter, step,
+            )
+
+        semaphore = asyncio.Semaphore(self.max_parallel_tool_calls)
+        emit_lock = asyncio.Lock()
+        results: list[dict | None] = [None] * len(backend_tool_calls)
+
+        async def _run_one(index: int, tool_call: Any) -> None:
+            async with semaphore:
+                is_error = False
+                result_content: ToolResultContent = ""
+                image_refs: list[dict[str, Any]] = []
+                try:
+                    result_content, image_refs = await self.execute_tool_call(
+                        tool_call.name, tool_call.input,
+                    )
+                    results[index] = {
+                        "type": "tool_result",
+                        "tool_use_id": tool_call.id,
+                        "content": result_content,
+                    }
+                except Exception as e:
+                    is_error = True
+                    result_content = f"Error executing tool: {str(e)}"
+                    image_refs = []
+                    results[index] = {
+                        "type": "tool_result",
+                        "tool_use_id": tool_call.id,
+                        "content": result_content,
+                        "is_error": True,
+                    }
+
+                # Stream to SSE queue — lock ensures each tool's
+                # multi-put sequence is not interleaved with another's.
+                if queue is not None:
+                    active_fmt = formatter if formatter is not None else self.formatter
+                    async with emit_lock:
+                        await _emit_tool_result(
+                            queue, active_fmt, self.agent_uuid,
+                            tool_use_id=str(tool_call.id),
+                            tool_name=str(tool_call.name),
+                            result_content=result_content,
+                            image_refs=image_refs if image_refs else None,
+                        )
+
+                self._log_action("tool_execution", {
+                    "tool_name": tool_call.name,
+                    "tool_use_id": tool_call.id,
+                    "success": not is_error,
+                    "has_images": len(image_refs) > 0,
+                }, step_number=step)
+
+        tasks = [
+            asyncio.create_task(_run_one(i, tc))
+            for i, tc in enumerate(backend_tool_calls)
+        ]
+        await asyncio.gather(*tasks)
+        return results  # type: ignore[return-value]
+
     async def continue_with_tool_results(
         self,
         frontend_results: list[dict],
@@ -1171,18 +1421,18 @@ class AnthropicAgent:
         
         # Stream frontend tool results to queue (only if stream_meta_history_and_tool_results is True)
         if queue is not None and self.stream_meta_history_and_tool_results:
+            active_fmt = formatter if formatter is not None else self.formatter
             for r in frontend_results:
-                tool_use_id = html.escape(str(r["tool_use_id"]), quote=True)
                 # Find the tool name from pending tools
                 tool_name = next(
                     (t["name"] for t in self._pending_frontend_tools if t["tool_use_id"] == r["tool_use_id"]),
                     "unknown"
                 )
-                tool_name = html.escape(tool_name, quote=True)
-                content_str = r["content"] if isinstance(r["content"], str) else json.dumps(r["content"], default=str)
-                content_str = _escape_tool_result_cdata(content_str)
-                await queue.put(
-                    f'<content-block-tool_result id="{tool_use_id}" name="{tool_name}"><![CDATA[{content_str}]]></content-block-tool_result>'
+                await _emit_tool_result(
+                    queue, active_fmt, self.agent_uuid,
+                    tool_use_id=str(r["tool_use_id"]),
+                    tool_name=tool_name,
+                    result_content=r["content"],
                 )
         
         # Add combined tool results to messages and conversation history
@@ -1225,12 +1475,15 @@ class AnthropicAgent:
         formatter: Optional[FormatterType] = None,
     ) -> AgentResult:
         """Internal method to resume the agent loop after frontend tool completion.
-        
+
         This continues from the current step, streaming responses and handling
         any subsequent tool calls.
         """
+        # Inject parent's queue/formatter into SubAgentTool for SSE forwarding
+        self._inject_subagent_context(queue, formatter)
+
         step = self._current_step
-        
+
         while step < self.max_steps:
             step += 1
             self._current_step = step
@@ -1251,6 +1504,7 @@ class AnthropicAgent:
                 base_delay=self.base_delay,
                 formatter=formatter if formatter is not None else self.formatter,
                 stream_tool_results=self.stream_meta_history_and_tool_results,
+                agent_uuid=self.agent_uuid,
             )
             
             # Track token usage from API response
@@ -1299,80 +1553,11 @@ class AnthropicAgent:
                     backend_tool_calls = [t for t in tool_calls if t.name not in self.frontend_tool_names]
                     frontend_tool_calls = [t for t in tool_calls if t.name in self.frontend_tool_names]
                     
-                    # Execute ALL backend tools first
-                    tool_results = []
-                    for tool_call in backend_tool_calls:
-                        is_error = False
-                        result_content: ToolResultContent = ""
-                        image_refs: list[dict[str, Any]] = []
-                        try:
-                            result = self.execute_tool_call(tool_call.name, tool_call.input)
-                            if asyncio.iscoroutine(result):
-                                result = await result
-                            # Unpack result tuple (content, image_refs)
-                            result_content, image_refs = result
-                            tool_results.append({
-                                "type": "tool_result",
-                                "tool_use_id": tool_call.id,
-                                "content": result_content
-                            })
-                        except Exception as e:
-                            is_error = True
-                            result_content = f"Error executing tool: {str(e)}"
-                            image_refs = []
-                            tool_results.append({
-                                "type": "tool_result",
-                                "tool_use_id": tool_call.id,
-                                "content": result_content,
-                                "is_error": True
-                            })
-                        
-                        # Stream tool result to queue
-                        if queue is not None:
-                            tool_use_id = html.escape(str(tool_call.id), quote=True)
-                            tool_name_escaped = html.escape(str(tool_call.name), quote=True)
-                            
-                            # Build streaming output based on content type
-                            if image_refs:
-                                # Multimodal result: stream text + image references
-                                text_parts = []
-                                if isinstance(result_content, list):
-                                    for block in result_content:
-                                        if isinstance(block, dict) and block.get("type") == "text":
-                                            text_parts.append(block.get("text", ""))
-                                text_content = "\n".join(text_parts) if text_parts else ""
-                                
-                                # Build image reference tags
-                                image_tags = "".join(
-                                    f'<image src="{html.escape(ref["src"], quote=True)}" media_type="{html.escape(ref["media_type"], quote=True)}" />'
-                                    for ref in image_refs
-                                )
-                                
-                                await queue.put(
-                                    f'<content-block-tool_result id="{tool_use_id}" name="{tool_name_escaped}">'
-                                    f'<text><![CDATA[{text_content}]]></text>'
-                                    f'{image_tags}'
-                                    f'</content-block-tool_result>'
-                                )
-                            else:
-                                # Text-only result: serialize as before
-                                if result_content is None:
-                                    content_str = ""
-                                elif isinstance(result_content, str):
-                                    content_str = result_content
-                                else:
-                                    content_str = json.dumps(result_content, default=str)
-                                await queue.put(
-                                    f'<content-block-tool_result id="{tool_use_id}" name="{tool_name_escaped}"><![CDATA[{content_str}]]></content-block-tool_result>'
-                                )
-                        
-                        self._log_action("tool_execution", {
-                            "tool_name": tool_call.name,
-                            "tool_use_id": tool_call.id,
-                            "success": not is_error,
-                            "has_images": len(image_refs) > 0,
-                        }, step_number=step)
-                    
+                    # Execute all backend tools (parallel when multiple)
+                    tool_results = await self._execute_tools_parallel(
+                        backend_tool_calls, queue, formatter, step,
+                    )
+
                     # If frontend tools exist, pause and wait
                     if frontend_tool_calls:
                         self._pending_backend_results = tool_results
@@ -1382,19 +1567,31 @@ class AnthropicAgent:
                         ]
                         self._awaiting_frontend_tools = True
                         self._current_step = step
-                        
+
                         self._log_action("awaiting_frontend_tools", {
                             "frontend_tools": [t.name for t in frontend_tool_calls],
                             "backend_results_count": len(tool_results),
                         }, step_number=step)
-                        
+
+                        # Emit all pending frontend tools to client
                         if queue is not None:
-                            tools_json = html.escape(json.dumps(self._pending_frontend_tools), quote=True)
-                            await queue.put(f'<awaiting_frontend_tools data="{tools_json}"></awaiting_frontend_tools>')
+                            active_fmt = formatter if formatter is not None else self.formatter
+                            if active_fmt == "json":
+                                payload = json.dumps(self._pending_frontend_tools, ensure_ascii=False)
+                                await _chunk_and_emit(
+                                    queue, "awaiting_frontend_tools", self.agent_uuid,
+                                    payload, final_on_last=True,
+                                )
+                            else:
+                                tools_json = html.escape(json.dumps(self._pending_frontend_tools), quote=True)
+                                await queue.put(f'<awaiting_frontend_tools data="{tools_json}"></awaiting_frontend_tools>')
                         
                         # Persist state to DB before returning (required for re-hydration)
                         await self._save_agent_config()
-                        
+
+                        # Clear subagent context before returning
+                        self._inject_subagent_context(None, None)
+
                         return AgentResult(
                             final_message=accumulated_message,
                             final_answer="",
@@ -1496,20 +1693,24 @@ class AnthropicAgent:
             }, step_number=step)
 
             # Finalize file processing
-            await self._finalize_file_processing(queue)
+            await self._finalize_file_processing(queue, formatter=formatter)
             all_files_metadata: list[dict[str, Any]] = list(self.file_registry.values())
             result.generated_files = all_files_metadata
             self._save_run_data_async(result, all_files_metadata)
 
             # Emit meta_final tag at end of run (only if stream_meta_history_and_tool_results is True)
-            await self._emit_meta_final(queue, result)
+            await self._emit_meta_final(queue, result, formatter=formatter)
+
+            # Clear subagent context before returning
+            self._inject_subagent_context(None, None)
 
             return result
 
         # Max steps reached
         logger.warning("Max steps reached in resume", max_steps=self.max_steps)
+        self._inject_subagent_context(None, None)
         return await self._generate_final_summary(queue=queue, formatter=formatter)
-    
+
     def _apply_compaction(self, step_number: int = 0) -> None:
         """Apply compaction to self.messages and log the event.
         
@@ -1615,7 +1816,8 @@ class AnthropicAgent:
     async def _emit_meta_final(
         self,
         queue: Optional[asyncio.Queue],
-        result: AgentResult
+        result: AgentResult,
+        formatter: Optional[FormatterType] = None,
     ) -> None:
         """Emit meta_final tag at end of run when stream_meta_history_and_tool_results is True.
         
@@ -1626,6 +1828,7 @@ class AnthropicAgent:
         Args:
             queue: Optional async queue to emit the meta_final tag to
             result: The AgentResult containing final run data
+            formatter: Active formatter type (determines emission format)
         """
         if queue is None or not self.stream_meta_history_and_tool_results:
             return
@@ -1638,8 +1841,16 @@ class AnthropicAgent:
             "cost": result.cost,
             "cumulative_usage": result.cumulative_usage,
         }
-        escaped_json = html.escape(json.dumps(meta_final), quote=True)
-        await queue.put(f'<meta_final data="{escaped_json}"></meta_final>')
+
+        active_fmt = formatter if formatter is not None else self.formatter
+        if active_fmt == "json":
+            payload = json.dumps(meta_final, ensure_ascii=False)
+            await _chunk_and_emit(
+                queue, "meta_final", self.agent_uuid, payload, final_on_last=True,
+            )
+        else:
+            escaped_json = html.escape(json.dumps(meta_final), quote=True)
+            await queue.put(f'<meta_final data="{escaped_json}"></meta_final>')
 
     async def _generate_final_summary(
         self,
@@ -1716,8 +1927,9 @@ class AnthropicAgent:
             base_delay=self.base_delay,
             formatter=formatter if formatter is not None else self.formatter,
             stream_tool_results=self.stream_meta_history_and_tool_results,
+            agent_uuid=self.agent_uuid,
         )
-        
+
         # Track token usage from API response
         input_tokens = accumulated_message.usage.input_tokens
         output_tokens = accumulated_message.usage.output_tokens
@@ -1796,7 +2008,7 @@ class AnthropicAgent:
         }, step_number=self.max_steps)
 
         # Finalize file processing (extract, store, stream)
-        await self._finalize_file_processing(queue)
+        await self._finalize_file_processing(queue, formatter=formatter)
 
         # Get updated metadata
         all_files_metadata: list[dict[str, Any]] = list(self.file_registry.values())
@@ -1808,7 +2020,7 @@ class AnthropicAgent:
         self._save_run_data_async(result, all_files_metadata)
         
         # Emit meta_final tag at end of run (only if stream_meta_history_and_tool_results is True)
-        await self._emit_meta_final(queue, result)
+        await self._emit_meta_final(queue, result, formatter=formatter)
         
         # Return AgentResult with final summary
         return result
@@ -2063,6 +2275,7 @@ class AnthropicAgent:
         ]
         config_snapshot = {
             "agent_uuid": self.agent_uuid,
+            "description": self.description,
             "system_prompt": self.system_prompt,
             "model": self.model,
             "max_steps": self.max_steps,
@@ -2076,12 +2289,17 @@ class AnthropicAgent:
             "agent_logs_count": len(getattr(self, "agent_logs", [])),
             "max_retries": self.max_retries,
             "base_delay": self.base_delay,
+            "max_parallel_tool_calls": self.max_parallel_tool_calls,
+            "enable_cache_control": self.enable_cache_control,
             "api_kwargs": self.api_kwargs,
             "formatter": self.formatter,
             "compactor": self.compactor.__class__.__name__ if self.compactor else None,
             "memory_store": self.memory_store.__class__.__name__ if self.memory_store else None,
             "final_answer_check": self.final_answer_check is not None,
-            "db_backend": self.db_backend.__class__.__name__,
+            "config_adapter": self.config_adapter.__class__.__name__,
+            "conversation_adapter": self.conversation_adapter.__class__.__name__,
+            "run_adapter": self.run_adapter.__class__.__name__,
+            "file_backend": self.file_backend.__class__.__name__ if self.file_backend else None,
             "tools": tool_names,
         }
         return json.dumps(config_snapshot, indent=2)
@@ -2160,6 +2378,12 @@ class AnthropicAgent:
             self._loaded_conversation_history = config.get("conversation_history", [])
         else:
             self._loaded_conversation_history = []
+
+        # Subagent hierarchy — restore parent link so resumed child agents
+        # continue to emit the correct parent_agent_uuid in meta_init.
+        restored_parent = config.get("parent_agent_uuid")
+        if restored_parent:
+            self._parent_agent_uuid = restored_parent
     
     def _log_action(
         self,
@@ -2218,6 +2442,7 @@ class AnthropicAgent:
         config = StoredAgentConfig(
             agent_uuid=self.agent_uuid,
             system_prompt=self.system_prompt,
+            description=self.description or None,
             model=self.model,
             max_steps=self.max_steps,
             thinking_tokens=self.thinking_tokens,
@@ -2246,6 +2471,16 @@ class AnthropicAgent:
             # can be returned in the AgentResult after continuation. This is distinct from the
             # conversation_history TABLE which stores completed runs across multiple user turns.
             conversation_history=getattr(self, "conversation_history", []),
+            # Subagent hierarchy
+            parent_agent_uuid=self._parent_agent_uuid,
+            subagent_schemas=(
+                [
+                    {"name": name, "description": agent.description, "model": agent.model}
+                    for name, agent in self._sub_agent_tool.agents.items()
+                ]
+                if self._sub_agent_tool
+                else []
+            ),
             title=existing_config.title if existing_config else None,
             # Preserve created_at from existing config, or set to now
             created_at=existing_config.created_at if existing_config else datetime.now().isoformat(),
@@ -2398,7 +2633,7 @@ class AnthropicAgent:
         
         # Schedule title generation as background task
         # The _generate_and_save_title method checks if title already exists before generating
-        if self.db_backend:
+        if self.config_adapter:
             user_message = self._extract_first_user_message()
             if user_message:
                 title_task = asyncio.create_task(
@@ -2531,7 +2766,11 @@ class AnthropicAgent:
                 step=step,
             )
             
-    async def _finalize_file_processing(self, queue: Optional[asyncio.Queue] = None) -> None:
+    async def _finalize_file_processing(
+        self,
+        queue: Optional[asyncio.Queue] = None,
+        formatter: Optional[FormatterType] = None,
+    ) -> None:
         """
         Finalize file processing at the end of a run.
         1. Extract all file IDs from conversation history.
@@ -2543,9 +2782,9 @@ class AnthropicAgent:
         current_step = getattr(self, "total_steps", 0) # total_steps might not be set on self yet
         # Actually run() sets 'step' variable. We can just pass 0 or use a counter if we iterate.
         # Since we are doing this at the end, we can just scan everything.
-        
+
         for i, message in enumerate(self.conversation_history):
-            # rough step approximation or just use 0. 
+            # rough step approximation or just use 0.
             # ideally we would know the step for each message, but history is flat list.
             self._register_files_from_message(message, step=0)
 
@@ -2556,7 +2795,7 @@ class AnthropicAgent:
         # 3. Stream metadata
         all_files_metadata: list[dict[str, Any]] = list(self.file_registry.values())
         if queue and all_files_metadata:
-            await self._stream_file_metadata(queue, all_files_metadata)
+            await self._stream_file_metadata(queue, all_files_metadata, formatter=formatter)
 
     async def _download_file(self, file_id: str) -> tuple[FileMetadata, bytes]:
         """Download file content from Anthropic Files API.
@@ -2712,19 +2951,27 @@ class AnthropicAgent:
     async def _stream_file_metadata(
         self,
         queue: asyncio.Queue,
-        metadata: list[dict]
+        metadata: list[dict],
+        formatter: Optional[FormatterType] = None,
     ) -> None:
-        """Stream file metadata to queue in meta tag format.
-        
+        """Stream file metadata to queue.
+
         Args:
             queue: Async queue to send formatted output
             metadata: List of file metadata dicts to stream
+            formatter: Active formatter type (determines emission format)
         """
         if not metadata:
             return
-        
-        # Format as JSON inside custom content block
+
         files_json = json.dumps({"files": metadata}, default=str, separators=(",", ":"))
-        meta_tag = f'<content-block-meta_files><![CDATA[{files_json}]]></content-block-meta_files>'
-        
-        await queue.put(meta_tag)
+
+        active_fmt = formatter if formatter is not None else self.formatter
+        if active_fmt == "json":
+            await _chunk_and_emit(
+                queue, "meta_files", self.agent_uuid,
+                files_json, final_on_last=True,
+            )
+        else:
+            meta_tag = f'<content-block-meta_files><![CDATA[{files_json}]]></content-block-meta_files>'
+            await queue.put(meta_tag)
