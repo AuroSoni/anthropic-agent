@@ -1113,8 +1113,8 @@ Args:
 
 Returns:
     JSON with result:
-    - Success: {"status": "ok", "op": "update", "path": "...", ...}
-    - Error:   {"status": "error", "error": "...", "hint": "..."}
+    - Success: {{"status": "ok", "op": "update", "path": "...", ...}}
+    - Error:   {{"status": "error", "error": "...", "hint": "..."}}
 """
 
     def __init__(
