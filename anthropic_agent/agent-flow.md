@@ -2,7 +2,7 @@
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │ AnthropicAgent.__init__(...)                                                 │
 ├──────────────────────────────────────────────────────────────────────────────┤
-│ - db_backend: filesystem/sql (always present)                                │
+│ - config_adapter, conversation_adapter, run_adapter (storage adapters, default: memory) │
 │ - optional: tool_registry (backend tools), frontend_tools (browser-executed)│
 │ - optional: compactor, memory_store, file_backend                            │
 │ - optional: server_tools (Anthropic-executed), beta_headers, api_kwargs      │

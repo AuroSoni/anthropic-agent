@@ -1,7 +1,7 @@
 """Example usage of AnthropicAgent with math tools."""
 import asyncio
 from anthropic_agent.core import AnthropicAgent
-from anthropic_agent.database import FilesystemBackend
+from anthropic_agent.storage import create_adapters
 from anthropic_agent.tools import SAMPLE_TOOL_FUNCTIONS
 
 
@@ -11,15 +11,19 @@ async def main():
     print("Anthropic Agent - Math Tools Example")
     print("=" * 80)
     
-    # Create filesystem backend for persistence
-    file_backend = FilesystemBackend(base_path="./data")
+    # Create filesystem adapters for persistence
+    config_adapter, conv_adapter, run_adapter = create_adapters(
+        "filesystem", base_path="./data"
+    )
     
     # Create agent with math tools
     agent = AnthropicAgent(
         system_prompt="You are a helpful assistant that can perform mathematical calculations. Use the available tools to solve math problems.",
         model="claude-sonnet-4-5",
         tools=SAMPLE_TOOL_FUNCTIONS,
-        db_backend=file_backend,
+        config_adapter=config_adapter,
+        conversation_adapter=conv_adapter,
+        run_adapter=run_adapter,
     )
     
     print(f"Agent UUID: {agent.agent_uuid}")

@@ -5,7 +5,7 @@
 ```python
 import asyncio
 from anthropic_agent.core import AnthropicAgent
-from anthropic_agent.database import FilesystemBackend
+from anthropic_agent.storage import create_adapters
 from anthropic_agent.tools import tool
 
 @tool
@@ -18,11 +18,14 @@ def get_weather(city: str) -> str:
     return f"<weather city='{city}'>Sunny, 72°F</weather>"
 
 async def main():
+    config_adapter, conv_adapter, run_adapter = create_adapters("filesystem", base_path="./data")
     agent = AnthropicAgent(
         system_prompt="You are a helpful assistant.",
         model="claude-sonnet-4-5",
         tools=[get_weather],
-        db_backend=FilesystemBackend(base_path="./data"),
+        config_adapter=config_adapter,
+        conversation_adapter=conv_adapter,
+        run_adapter=run_adapter,
     )
     
     result = await agent.run("What's the weather in Tokyo?")
@@ -45,7 +48,9 @@ asyncio.run(main())
 | `tools` | `list[Callable]` | `None` | Backend tools decorated with `@tool` |
 | `frontend_tools` | `list[Callable]` | `None` | Browser-executed tools (schema-only on server) |
 | `server_tools` | `list[dict]` | `None` | Anthropic-executed tools (MCP, code_execution) |
-| `db_backend` | `str \| DatabaseBackend` | `"filesystem"` | Database for persistence |
+| `config_adapter` | `AgentConfigAdapter` | `MemoryAgentConfigAdapter` | Agent config persistence |
+| `conversation_adapter` | `ConversationAdapter` | `MemoryConversationAdapter` | Conversation history persistence |
+| `run_adapter` | `AgentRunAdapter` | `MemoryAgentRunAdapter` | Run logs persistence |
 | `file_backend` | `str \| FileStorageBackend` | `None` | File storage for generated files |
 | `agent_uuid` | `str` | Auto-generated | Session UUID for resuming agents |
 | `compactor` | `str \| Compactor` | `None` | Context compaction strategy |
@@ -110,41 +115,58 @@ class AgentResult:
 Agents automatically persist state after each run. To resume a session:
 
 ```python
+from anthropic_agent.storage import create_adapters
+
+config_adapter, conv_adapter, run_adapter = create_adapters("filesystem", base_path="./data")
+
 # First run - creates new session
 agent = AnthropicAgent(
     system_prompt="You are a helpful assistant.",
     tools=[my_tool],
-    db_backend=FilesystemBackend(base_path="./data"),
+    config_adapter=config_adapter,
+    conversation_adapter=conv_adapter,
+    run_adapter=run_adapter,
 )
 print(f"Session: {agent.agent_uuid}")  # Save this UUID
 result = await agent.run("Hello!")
 
-# Later - resume the same session
+# Later - resume the same session (same adapters or same base_path)
 agent = AnthropicAgent(
     agent_uuid="<saved-uuid>",  # Resume this session
     tools=[my_tool],            # Must provide same tools
-    db_backend=FilesystemBackend(base_path="./data"),
+    config_adapter=config_adapter,
+    conversation_adapter=conv_adapter,
+    run_adapter=run_adapter,
 )
 result = await agent.run("What did I say earlier?")  # Has context
 ```
 
-#### Database Backends
+#### Storage Adapters
 
-| Backend | Usage | Best For |
-|---------|-------|----------|
-| `"filesystem"` | `FilesystemBackend(base_path="./data")` | Development, single-server |
-| `"sql"` | `SQLBackend(connection_string="...")` | Production, multi-server |
+| Adapter Type | Usage | Best For |
+|--------------|-------|----------|
+| `"memory"` | Default (in-memory) | Testing, ephemeral |
+| `"filesystem"` | `create_adapters("filesystem", base_path="./data")` | Development, single-server |
+| `"postgres"` | `create_adapters("postgres", connection_string="...")` | Production, multi-server |
 
 ```python
-from anthropic_agent.database import FilesystemBackend, SQLBackend
+from anthropic_agent.storage import create_adapters
 
-# Filesystem (default)
-db = FilesystemBackend(base_path="./data")
+# Filesystem (development)
+config_adapter, conv_adapter, run_adapter = create_adapters("filesystem", base_path="./data")
 
-# PostgreSQL
-db = SQLBackend(connection_string="postgresql://user:pass@host/db")
+# PostgreSQL (production)
+config_adapter, conv_adapter, run_adapter = create_adapters(
+    "postgres",
+    connection_string="postgresql://user:pass@host/db",
+)
 
-agent = AnthropicAgent(db_backend=db, ...)
+agent = AnthropicAgent(
+    config_adapter=config_adapter,
+    conversation_adapter=conv_adapter,
+    run_adapter=run_adapter,
+    ...,
+)
 ```
 
 #### Background Task Management
@@ -402,7 +424,7 @@ for log in result.agent_logs or []:
 - [ ] `max_steps` set appropriately (default 50 may be too high/low)
 - [ ] `max_tokens` sufficient for expected response length
 - [ ] All required tools registered and tested
-- [ ] `db_backend` configured for production persistence
+- [ ] `config_adapter`, `conversation_adapter`, `run_adapter` configured for production persistence
 - [ ] `file_backend` configured if agent generates files
 - [ ] `compactor` configured for long conversations
 - [ ] `drain_background_tasks()` called before shutdown

@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
 from datetime import datetime
 
 # Add project root to path
@@ -23,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from anthropic_agent.tools import tool
 from anthropic_agent.core import AnthropicAgent
+from anthropic_agent.storage import create_adapters
 
 
 # Define a frontend tool - executed by the browser
@@ -88,6 +90,11 @@ async def run_integration_test():
     
     # Step 1: Create agent with both backend and frontend tools
     print("\n[Step 1] Creating agent with backend + frontend tools...")
+    base_path = tempfile.mkdtemp()
+    config_adapter, conv_adapter, run_adapter = create_adapters("filesystem", base_path=base_path)
+    await config_adapter.connect()
+    await conv_adapter.connect()
+    await run_adapter.connect()
     agent = AnthropicAgent(
         system_prompt="""You are a helpful assistant. When asked to perform calculations,
         use the calculate tool. When you get a result that seems significant (like any 
@@ -98,7 +105,9 @@ async def run_integration_test():
         max_tokens=4096,
         tools=[calculate],
         frontend_tools=[user_confirm],
-        db_backend="filesystem",
+        config_adapter=config_adapter,
+        conversation_adapter=conv_adapter,
+        run_adapter=run_adapter,
     )
     
     print(f"   Agent UUID: {agent.agent_uuid}")
@@ -149,6 +158,8 @@ async def run_integration_test():
             saved_uuid = agent.agent_uuid
             
             # Create new agent instance with same UUID (simulates new request)
+            # Use same base_path so state is loaded from storage
+            config_adapter2, conv_adapter2, run_adapter2 = create_adapters("filesystem", base_path=base_path)
             agent2 = AnthropicAgent(
                 system_prompt=agent.system_prompt,
                 model=agent.model,
@@ -156,7 +167,9 @@ async def run_integration_test():
                 max_tokens=agent.max_tokens,
                 tools=[calculate],
                 frontend_tools=[user_confirm],
-                db_backend="filesystem",
+                config_adapter=config_adapter2,
+                conversation_adapter=conv_adapter2,
+                run_adapter=run_adapter2,
                 agent_uuid=saved_uuid,
             )
             

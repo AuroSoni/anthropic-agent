@@ -2275,6 +2275,7 @@ class AnthropicAgent:
         ]
         config_snapshot = {
             "agent_uuid": self.agent_uuid,
+            "description": self.description,
             "system_prompt": self.system_prompt,
             "model": self.model,
             "max_steps": self.max_steps,
@@ -2288,12 +2289,17 @@ class AnthropicAgent:
             "agent_logs_count": len(getattr(self, "agent_logs", [])),
             "max_retries": self.max_retries,
             "base_delay": self.base_delay,
+            "max_parallel_tool_calls": self.max_parallel_tool_calls,
+            "enable_cache_control": self.enable_cache_control,
             "api_kwargs": self.api_kwargs,
             "formatter": self.formatter,
             "compactor": self.compactor.__class__.__name__ if self.compactor else None,
             "memory_store": self.memory_store.__class__.__name__ if self.memory_store else None,
             "final_answer_check": self.final_answer_check is not None,
-            "db_backend": self.db_backend.__class__.__name__,
+            "config_adapter": self.config_adapter.__class__.__name__,
+            "conversation_adapter": self.conversation_adapter.__class__.__name__,
+            "run_adapter": self.run_adapter.__class__.__name__,
+            "file_backend": self.file_backend.__class__.__name__ if self.file_backend else None,
             "tools": tool_names,
         }
         return json.dumps(config_snapshot, indent=2)
@@ -2627,7 +2633,7 @@ class AnthropicAgent:
         
         # Schedule title generation as background task
         # The _generate_and_save_title method checks if title already exists before generating
-        if self.db_backend:
+        if self.config_adapter:
             user_message = self._extract_first_user_message()
             if user_message:
                 title_task = asyncio.create_task(
