@@ -4,6 +4,7 @@ from .base import (
     ToolRegistry,
     ToolResult,
     ImageBlock,
+    DocumentBlock,
     ToolResultContent,
     ConfigurableToolBase,
 )
@@ -26,6 +27,7 @@ __all__ = [
     # Multimodal tool results
     'ToolResult',
     'ImageBlock',
+    'DocumentBlock',
     'ToolResultContent',
     # Decorator
     'tool',
