@@ -4,6 +4,7 @@ import json
 import logging
 import mimetypes
 import os
+import traceback
 from typing import Any, AsyncGenerator, Literal, Optional
 from urllib.parse import urlparse
 
@@ -14,6 +15,14 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from anthropic_agent.core import AnthropicAgent
+from anthropic_agent.common_tools import (
+    ReadFileTool, GlobFileSearchTool, GrepSearchTool,
+    ListDirTool, ApplyPatchTool, CodeExecutionTool,
+)
+from anthropic_agent.cowork_style_tools import (
+    BashTool, create_read_tool, create_write_tool,
+    create_edit_tool, create_glob_tool, create_grep_tool,
+)
 from anthropic_agent.file_backends import S3Backend
 from anthropic_agent.tools import SAMPLE_TOOL_FUNCTIONS, tool, ToolResult
 from storage import config_adapter, conversation_adapter, run_adapter
@@ -126,12 +135,20 @@ class AgentConfig(BaseModel):
     config_adapter: Any = None
     conversation_adapter: Any = None
     run_adapter: Any = None
+    subagents: dict | None = None  # dict[str, AnthropicAgent] for subagent delegation
     formatter: str = "json"
     stream_meta_history_and_tool_results: bool = False  # Include tool results in stream output
 
 
 # Agent type literal for request validation
-AgentType = Literal["agent_no_tools", "agent_client_tools", "agent_all_raw", "agent_all_xml", "agent_frontend_tools", "agent_frontend_tools_raw"]
+AgentType = Literal[
+    "agent_no_tools",
+    "agent_client_tools",
+    "agent_frontend_tools",
+    "agent_all_json",
+    "agent_subagents",
+    "agent_cowork",
+]
 
 
 class AgentRunRequest(BaseModel):
@@ -219,12 +236,38 @@ class AgentSessionListResponse(BaseModel):
 ########################################################
 # AGENT CONFIGURATIONS
 ########################################################
+
+# Shared config
+WORKSPACE_PATH = os.getenv("WORKSPACE_PATH", "./workspace")
+_s3 = S3Backend(bucket=os.getenv("S3_BUCKET"))
+
+# Common tools (sandboxed to WORKSPACE_PATH, .md/.mmd files)
+COMMON_TOOL_FUNCTIONS = [
+    ReadFileTool(base_path=WORKSPACE_PATH).get_tool(),
+    GlobFileSearchTool(base_path=WORKSPACE_PATH).get_tool(),
+    GrepSearchTool(base_path=WORKSPACE_PATH).get_tool(),
+    ListDirTool(base_path=WORKSPACE_PATH).get_tool(),
+    ApplyPatchTool(base_path=WORKSPACE_PATH).get_tool(),
+    CodeExecutionTool(output_base_path=os.path.join(WORKSPACE_PATH, "code_outputs")).get_tool(),
+]
+
+# Cowork-style tools (unrestricted, absolute paths)
+COWORK_TOOL_FUNCTIONS = [
+    create_read_tool(),
+    create_write_tool(),
+    create_edit_tool(),
+    create_glob_tool(),
+    create_grep_tool(),
+    BashTool(base_path=WORKSPACE_PATH).get_tool(),
+]
+
+# --- 1. Plain chat (no tools) ---
 agent_no_tools = AgentConfig(
     system_prompt="You are a helpful assistant that should help the user with their questions.",
     model="claude-sonnet-4-5",
     thinking_tokens=1024,
     max_tokens=64000,
-    file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
+    file_backend=_s3,
     config_adapter=config_adapter,
     conversation_adapter=conversation_adapter,
     run_adapter=run_adapter,
@@ -232,13 +275,14 @@ agent_no_tools = AgentConfig(
     stream_meta_history_and_tool_results=True,
 )
 
+# --- 2. Calculator tools only ---
 agent_client_tools = AgentConfig(
     system_prompt="You are a helpful assistant that should help the user with their questions.",
     model="claude-sonnet-4-5",
     thinking_tokens=1024,
     max_tokens=64000,
     tools=SAMPLE_TOOL_FUNCTIONS,
-    file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
+    file_backend=_s3,
     config_adapter=config_adapter,
     conversation_adapter=conversation_adapter,
     run_adapter=run_adapter,
@@ -246,141 +290,118 @@ agent_client_tools = AgentConfig(
     stream_meta_history_and_tool_results=True,
 )
 
-agent_all_raw = AgentConfig(
-    system_prompt="You are a helpful assistant that should help the user with their questions.",
-    model="claude-sonnet-4-5",
-    thinking_tokens=1024,
-    max_tokens=64000,
-    tools=SAMPLE_TOOL_FUNCTIONS + [read_image_raw],
-    server_tools=[{
-        "type": "code_execution_20250825",
-        "name": "code_execution"
-    },
-    {
-        "type": "web_search_20250305",
-        "name": "web_search",
-        "max_uses": 50
-    },
-    {
-        "type": "web_fetch_20250910",
-        "name": "web_fetch",
-        "max_uses": 50
-    }],
-    context_management={
-        "edits": [
-            {
-                "type": "clear_tool_uses_20250919",
-                # Trigger clearing when threshold is exceeded
-                "trigger": {
-                    "type": "input_tokens",
-                    "value": 30000
-                },
-                # Number of tool uses to keep after clearing
-                "keep": {
-                    "type": "tool_uses",
-                    "value": 3
-                },
-                # Optional: Clear at least this many tokens
-                "clear_at_least": {
-                    "type": "input_tokens",
-                    "value": 5000
-                },
-                # Exclude these tools from being cleared
-                "exclude_tools": ["web_search"]
-            }
-        ]
-    },
-    beta_headers=["code-execution-2025-08-25", "web-fetch-2025-09-10", "files-api-2025-04-14", "context-management-2025-06-27"],
-    file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
-    config_adapter=config_adapter,
-    conversation_adapter=conversation_adapter,
-    run_adapter=run_adapter,
-    formatter="json",
-    stream_meta_history_and_tool_results=True,
-)
-
-agent_all_xml = AgentConfig(
-    system_prompt="You are a helpful assistant that should help the user with their questions.",
-    model="claude-sonnet-4-5",
-    thinking_tokens=1024,
-    max_tokens=64000,
-    tools=SAMPLE_TOOL_FUNCTIONS + [read_image_raw],
-    server_tools=[{
-        "type": "code_execution_20250825",
-        "name": "code_execution"
-    },
-    {
-        "type": "web_search_20250305",
-        "name": "web_search",
-        "max_uses": 50
-    },
-    {
-        "type": "web_fetch_20250910",
-        "name": "web_fetch",
-        "max_uses": 50
-    }],
-    context_management={
-        "edits": [
-            {
-                "type": "clear_tool_uses_20250919",
-                # Trigger clearing when threshold is exceeded
-                "trigger": {
-                    "type": "input_tokens",
-                    "value": 30000
-                },
-                # Number of tool uses to keep after clearing
-                "keep": {
-                    "type": "tool_uses",
-                    "value": 3
-                },
-                # Optional: Clear at least this many tokens
-                "clear_at_least": {
-                    "type": "input_tokens",
-                    "value": 5000
-                },
-                # Exclude these tools from being cleared
-                "exclude_tools": ["web_search"]
-            }
-        ]
-    },
-    beta_headers=["code-execution-2025-08-25", "web-fetch-2025-09-10", "files-api-2025-04-14", "context-management-2025-06-27"],
-    file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
-    config_adapter=config_adapter,
-    conversation_adapter=conversation_adapter,
-    run_adapter=run_adapter,
-    formatter="json",
-    stream_meta_history_and_tool_results=True,
-)
-
-# Agent with frontend tools (for browser-executed tools like user_confirm)
+# --- 3. Frontend tools (browser-executed, pause/resume) ---
 agent_frontend_tools = AgentConfig(
     system_prompt="""You are a helpful assistant that should help the user with their questions.
-When performing calculations that result in significant values (over 50), or when taking 
+When performing calculations that result in significant values (over 50), or when taking
 any action that could have consequences, ask for user confirmation using the user_confirm tool.""",
-    model="claude-sonnet-4-20250514",
-    thinking_tokens=1024,
-    max_tokens=64000,
-    tools=SAMPLE_TOOL_FUNCTIONS + [read_image_raw],
-    frontend_tools=FRONTEND_TOOL_FUNCTIONS,  # Include frontend tools
-    file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
-    config_adapter=config_adapter,
-    conversation_adapter=conversation_adapter,
-    run_adapter=run_adapter,
-    formatter="json",
-    stream_meta_history_and_tool_results=True,
-)
-
-# Agent with frontend tools - RAW format (for testing parser compatibility)
-agent_frontend_tools_raw = AgentConfig(
-    system_prompt="""You are a helpful assistant that should help the user with their questions.
-When performing calculations that result in significant values (over 50), or when taking 
-any action that could have consequences, ask for user confirmation using the user_confirm tool.""",
-    model="claude-sonnet-4-20250514",
+    model="claude-sonnet-4-5",
     thinking_tokens=1024,
     max_tokens=64000,
     tools=SAMPLE_TOOL_FUNCTIONS + [read_image_raw],
     frontend_tools=FRONTEND_TOOL_FUNCTIONS,
-    file_backend=S3Backend(bucket=os.getenv("S3_BUCKET")),
+    file_backend=_s3,
+    config_adapter=config_adapter,
+    conversation_adapter=conversation_adapter,
+    run_adapter=run_adapter,
+    formatter="json",
+    stream_meta_history_and_tool_results=True,
+)
+
+# --- 4. All common tools + server tools ---
+agent_all_json = AgentConfig(
+    system_prompt="You are a helpful assistant that should help the user with their questions.",
+    model="claude-sonnet-4-5",
+    thinking_tokens=1024,
+    max_tokens=64000,
+    tools=COMMON_TOOL_FUNCTIONS + [read_image_raw],
+    server_tools=[
+        {"type": "web_search_20250305", "name": "web_search", "max_uses": 50},
+        {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 50},
+    ],
+    context_management={
+        "edits": [
+            {
+                "type": "clear_tool_uses_20250919",
+                "trigger": {"type": "input_tokens", "value": 30000},
+                "keep": {"type": "tool_uses", "value": 3},
+                "clear_at_least": {"type": "input_tokens", "value": 5000},
+                "exclude_tools": ["web_search"],
+            }
+        ]
+    },
+    beta_headers=[
+        "web-fetch-2025-09-10",
+        "files-api-2025-04-14",
+        "context-management-2025-06-27",
+    ],
+    file_backend=_s3,
+    config_adapter=config_adapter,
+    conversation_adapter=conversation_adapter,
+    run_adapter=run_adapter,
+    formatter="json",
+    stream_meta_history_and_tool_results=True,
+)
+
+# --- 5. Subagent orchestration ---
+_calculator_agent = AnthropicAgent(
+    system_prompt="You are a calculator specialist. Use the provided math tools to perform calculations accurately.",
+    description="Performs arithmetic calculations using add, subtract, multiply, and divide tools",
+    model="claude-sonnet-4-5",
+    tools=SAMPLE_TOOL_FUNCTIONS,
+    config_adapter=config_adapter,
+    conversation_adapter=conversation_adapter,
+    run_adapter=run_adapter,
+)
+
+_researcher_agent = AnthropicAgent(
+    system_prompt="You are a research specialist. Search the web for information and provide comprehensive answers.",
+    description="Searches the web for information and provides summarised results",
+    model="claude-sonnet-4-5",
+    server_tools=[
+        {"type": "web_search_20250305", "name": "web_search", "max_uses": 50},
+        {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 50},
+    ],
+    beta_headers=["web-fetch-2025-09-10"],
+    config_adapter=config_adapter,
+    conversation_adapter=conversation_adapter,
+    run_adapter=run_adapter,
+)
+
+agent_subagents = AgentConfig(
+    system_prompt=(
+        "You are a coordinator agent. You MUST delegate tasks to your specialist subagents:\n"
+        "- Use the 'calculator' subagent for any arithmetic or math questions.\n"
+        "- Use the 'researcher' subagent for any questions requiring web search or factual lookup.\n"
+        "After receiving results from subagents, synthesise and present them to the user."
+    ),
+    model="claude-sonnet-4-5",
+    thinking_tokens=1024,
+    max_tokens=64000,
+    subagents={
+        "calculator": _calculator_agent,
+        "researcher": _researcher_agent,
+    },
+    file_backend=_s3,
+    config_adapter=config_adapter,
+    conversation_adapter=conversation_adapter,
+    run_adapter=run_adapter,
+    formatter="json",
+    stream_meta_history_and_tool_results=True,
+)
+
+# --- 6. Cowork-style coding agent (unrestricted file I/O + bash) ---
+agent_cowork = AgentConfig(
+    system_prompt=(
+        "You are a coding assistant with full access to the workspace. "
+        "Use your tools to explore, read, write, edit, and search files, "
+        "and execute bash commands to help the user with coding tasks."
+    ),
+    model="claude-sonnet-4-5",
+    thinking_tokens=1024,
+    max_tokens=64000,
+    tools=COWORK_TOOL_FUNCTIONS,
+    file_backend=_s3,
     config_adapter=config_adapter,
     conversation_adapter=conversation_adapter,
     run_adapter=run_adapter,
@@ -392,10 +413,10 @@ any action that could have consequences, ask for user confirmation using the use
 AGENT_CONFIGS: dict[AgentType, AgentConfig] = {
     "agent_no_tools": agent_no_tools,
     "agent_client_tools": agent_client_tools,
-    "agent_all_raw": agent_all_raw,
-    "agent_all_xml": agent_all_xml,
     "agent_frontend_tools": agent_frontend_tools,
-    "agent_frontend_tools_raw": agent_frontend_tools_raw,
+    "agent_all_json": agent_all_json,
+    "agent_subagents": agent_subagents,
+    "agent_cowork": agent_cowork,
 }
 
 async def stream_agent_response(
@@ -414,8 +435,8 @@ async def stream_agent_response(
         SSE-formatted strings containing raw agent output chunks
     """
     try:
-        # Get config from registry (default to agent_all_raw)
-        config = AGENT_CONFIGS[agent_type or "agent_all_raw"]
+        # Get config from registry (default to agent_all_json)
+        config = AGENT_CONFIGS[agent_type or "agent_all_json"]
         
         # Create the agent with config
         agent = AnthropicAgent(
@@ -428,9 +449,11 @@ async def stream_agent_response(
         
         # Run the agent in background (this will populate the queue)
         async def run_agent_and_signal():
-            result = await agent.run(user_prompt, queue)
-            await queue.put(None)  # Signal completion
-            return result
+            try:
+                result = await agent.run(user_prompt, queue)
+                return result
+            finally:
+                await queue.put(None)  # Always signal completion
         
         agent_task = asyncio.create_task(run_agent_and_signal())
         
@@ -446,7 +469,7 @@ async def stream_agent_response(
             agent_task.cancel()
             raise
         
-        # Wait for agent to complete
+        # Wait for agent to complete (re-raises if agent.run() failed)
         await agent_task
         
         # Wait for background persistence tasks to complete
@@ -462,8 +485,14 @@ async def stream_agent_response(
         yield "data: [DONE]\n\n"
         
     except Exception as e:
-        logger.error(f"Error in agent stream: {e}", exc_info=True)
-        yield f"data: Error: {str(e)}\n\n"
+        tb = traceback.format_exception(type(e), e, e.__traceback__)
+        logger.error(f"Error in agent stream: {e}\n{''.join(tb)}")
+        error_detail = {
+            "error": type(e).__name__,
+            "message": str(e),
+            "traceback": "".join(tb),
+        }
+        yield f"data: {json.dumps(error_detail)}\n\n"
 
 
 async def stream_tool_results_response(
@@ -496,12 +525,14 @@ async def stream_tool_results_response(
         
         # Continue the agent with frontend tool results
         async def run_continuation():
-            result = await agent.continue_with_tool_results(
-                [r.model_dump() for r in request.tool_results],
-                queue=queue,
-            )
-            await queue.put(None)  # Signal completion
-            return result
+            try:
+                result = await agent.continue_with_tool_results(
+                    [r.model_dump() for r in request.tool_results],
+                    queue=queue,
+                )
+                return result
+            finally:
+                await queue.put(None)  # Always signal completion
         
         agent_task = asyncio.create_task(run_continuation())
         
@@ -517,7 +548,7 @@ async def stream_tool_results_response(
             agent_task.cancel()
             raise
         
-        # Wait for agent to complete
+        # Wait for agent to complete (re-raises if continuation failed)
         await agent_task
         
         # Wait for background persistence tasks to complete
@@ -533,8 +564,14 @@ async def stream_tool_results_response(
         yield "data: [DONE]\n\n"
         
     except Exception as e:
-        logger.error(f"Error in tool results stream: {e}", exc_info=True)
-        yield f"data: Error: {str(e)}\n\n"
+        tb = traceback.format_exception(type(e), e, e.__traceback__)
+        logger.error(f"Error in tool results stream: {e}\n{''.join(tb)}")
+        error_detail = {
+            "error": type(e).__name__,
+            "message": str(e),
+            "traceback": "".join(tb),
+        }
+        yield f"data: {json.dumps(error_detail)}\n\n"
 
 
 @router.post("/run")
@@ -545,7 +582,7 @@ async def run_agent(request: AgentRunRequest) -> StreamingResponse:
     its responses in real-time using Server-Sent Events (SSE).
     
     Only one of agent_type or agent_uuid can be provided. If neither is provided,
-    defaults to agent_all_raw.
+    defaults to agent_all_json.
     
     Args:
         request: Agent run request containing user_prompt and optional agent_uuid/agent_type
@@ -558,7 +595,7 @@ async def run_agent(request: AgentRunRequest) -> StreamingResponse:
         POST /agent/run
         {
             "user_prompt": "Calculate (15 + 27) * 3 - 8",
-            "agent_type": "agent_all_raw"
+            "agent_type": "agent_all_json"
         }
         ```
     """

@@ -1,6 +1,11 @@
 Major Upgrades:
     ✔ Make DB Backends and File Backends easily pluggable and extendable. @done(26-02-05 04:21)
-    ☐ Test the new storage architecture.
+    ✔ Test the new storage architecture. @done(26-02-17 15:26)
+    ☐ JSON formatter parsing for frontend.
+    ☐ Frontend UI State with new primitives: Todo, Planning, Subagents.
+
+Critical Bugs:
+    ☐ Abrupt stream end in Server tools with web search tools. In special cases for web fetch? 
 
 Minor Fixes:
     ☐ Improve title generation logic. Save it per conversation.
