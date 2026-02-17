@@ -27,6 +27,7 @@ CREATE TABLE agent_config (
     tool_schemas JSONB,  -- Client-side tool schemas [{name, description, input_schema}]
     tool_names TEXT[],  -- Quick reference list of tool names
     server_tools JSONB,  -- Anthropic server tools (code_execution, web_search, etc.)
+    skills JSONB DEFAULT '[]'::jsonb,  -- Anthropic Agent Skills [{type, skill_id, version}]
 
     -- Beta features
     beta_headers TEXT[],  -- e.g., ["code-execution-2025-08-25"]
@@ -118,6 +119,9 @@ CREATE INDEX idx_agent_config_parent ON agent_config(parent_agent_uuid) WHERE pa
   "tool_names": ["web_search", "calculator"],
   "server_tools": [
     {"type": "code_execution_20250825"}  # Anthropic server tools
+  ],
+  "skills": [
+    {"type": "anthropic", "skill_id": "xlsx", "version": "latest"}  # Anthropic Agent Skills
   ],
 
   # Beta features

@@ -185,6 +185,7 @@ class AnthropicAgent:
         frontend_tools: list[Callable[..., Any]] | None = None,
         subagents: dict[str, "AnthropicAgent"] | None = None,
         server_tools: list[dict[str, Any]] | None = None,
+        skills: list[dict[str, Any]] | None = None,
         beta_headers: list[str] | None = None,
         container_id: str | None = None,
         messages: list[dict] | None = None,    # TODO: Add Message Type.
@@ -404,7 +405,14 @@ class AnthropicAgent:
             if server_tools is not None
             else db_config.get("server_tools", [])
         )
-        
+        # Anthropic Agent Skills configuration (e.g., pptx, xlsx, custom skills).
+        # Passed in the container parameter alongside container_id.
+        self.skills: list[dict[str, Any]] = (
+            skills
+            if skills is not None
+            else db_config.get("skills", [])
+        )
+
         # Messages and container state - initialized to defaults or constructor args.
         # For resumed agents (with agent_uuid), these will be overwritten by
         # _restore_state_from_config() when initialize() is called.
@@ -789,15 +797,19 @@ class AnthropicAgent:
             logger.debug("Assistant message: %s", assistant_message)
             if accumulated_message.container != None:
                 self.container_id = accumulated_message.container.id
-            
+
+            # Handle pause_turn from Skills (long-running operations)
+            if accumulated_message.stop_reason == "pause_turn":
+                continue
+
             # Check if there are tool calls to execute
             # Only process tool calls if stop_reason is "tool_use"
             if accumulated_message.stop_reason == "tool_use":
                 tool_calls = [
-                    block for block in accumulated_message.content 
+                    block for block in accumulated_message.content
                     if block.type == 'tool_use'
                 ]
-                
+
                 if tool_calls:
                     # Separate tool calls into backend vs frontend
                     backend_tool_calls = [t for t in tool_calls if t.name not in self.frontend_tool_names]
@@ -1183,15 +1195,21 @@ class AnthropicAgent:
         if self.beta_headers:
             request_params["betas"] = self.beta_headers
         
+        # Build container parameter (supports Skills + multi-turn container ID)
+        container: dict[str, Any] = {}
         if self.container_id:
-            request_params["container"] = self.container_id
-        
+            container["id"] = self.container_id
+        if self.skills:
+            container["skills"] = self.skills
+        if container:
+            request_params["container"] = container
+
         # Merge arbitrary API kwargs (e.g., temperature, top_p, stop_sequences)
         if self.api_kwargs:
             request_params.update(self.api_kwargs)
-        
+
         return request_params
-    
+
     async def execute_tool_call(
         self,
         tool_name: str,
@@ -1540,14 +1558,18 @@ class AnthropicAgent:
             logger.debug("Assistant message: %s", assistant_message)
             if accumulated_message.container is not None:
                 self.container_id = accumulated_message.container.id
-            
+
+            # Handle pause_turn from Skills (long-running operations)
+            if accumulated_message.stop_reason == "pause_turn":
+                continue
+
             # Check if there are tool calls to execute
             if accumulated_message.stop_reason == "tool_use":
                 tool_calls = [
-                    block for block in accumulated_message.content 
+                    block for block in accumulated_message.content
                     if block.type == 'tool_use'
                 ]
-                
+
                 if tool_calls:
                     # Separate backend vs frontend tools
                     backend_tool_calls = [t for t in tool_calls if t.name not in self.frontend_tool_names]
@@ -2283,6 +2305,7 @@ class AnthropicAgent:
             "max_tokens": self.max_tokens,
             "stream_meta_history_and_tool_results": self.stream_meta_history_and_tool_results,
             "beta_headers": self.beta_headers,
+            "skills": self.skills,
             "container_id": self.container_id,
             "messages_count": len(self.messages),
             "conversation_history_count": len(getattr(self, "conversation_history", [])),
@@ -2355,9 +2378,10 @@ class AnthropicAgent:
         Args:
             config: Configuration dict loaded from storage
         """
-        # Restore messages and container state
+        # Restore messages, container, and skills state
         self.messages = config.get("messages", [])
         self.container_id = config.get("container_id")
+        self.skills = config.get("skills", [])
         self.file_registry = config.get("file_registry", {})
         self._last_known_input_tokens = config.get("last_known_input_tokens", 0)
         self._last_known_output_tokens = config.get("last_known_output_tokens", 0)
@@ -2453,6 +2477,7 @@ class AnthropicAgent:
             tool_names=[t["name"] for t in self.tool_schemas] if self.tool_schemas else [],
             beta_headers=self.beta_headers or [],
             server_tools=self.server_tools or [],
+            skills=self.skills or [],
             formatter=self.formatter,
             stream_meta_history_and_tool_results=self.stream_meta_history_and_tool_results,
             file_registry=self.file_registry,

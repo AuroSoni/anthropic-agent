@@ -1,5 +1,6 @@
 """Agent endpoint for streaming responses via SSE."""
 import asyncio
+import base64
 import json
 import logging
 import mimetypes
@@ -28,6 +29,19 @@ from anthropic_agent.tools import SAMPLE_TOOL_FUNCTIONS, tool, ToolResult
 from storage import config_adapter, conversation_adapter, run_adapter
 
 logger = logging.getLogger(__name__)
+
+
+########################################################
+# FILE UPLOAD CONSTANTS
+########################################################
+
+SUPPORTED_IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+SUPPORTED_DOCUMENT_TYPES = frozenset({"application/pdf", "text/plain"})
+SUPPORTED_MIME_TYPES = SUPPORTED_IMAGE_TYPES | SUPPORTED_DOCUMENT_TYPES
+
+MAX_IMAGE_SIZE = 20 * 1024 * 1024    # 20 MB
+MAX_PDF_SIZE = 32 * 1024 * 1024      # 32 MB
+MAX_TEXT_SIZE = 5 * 1024 * 1024      # 5 MB
 
 
 ########################################################
@@ -574,6 +588,108 @@ async def stream_tool_results_response(
         yield f"data: {json.dumps(error_detail)}\n\n"
 
 
+async def build_content_blocks_from_files(
+    files: list[UploadFile],
+    user_prompt: str,
+) -> list[dict]:
+    """Convert uploaded files + text prompt into Anthropic API content blocks.
+
+    Reads each file, validates MIME type and size, then constructs the
+    appropriate content block (image or document) with base64 encoding.
+    Text files use source.type="text" (raw text, no base64).
+    File blocks come first; the user's text prompt is appended last.
+
+    Args:
+        files: List of FastAPI UploadFile objects.
+        user_prompt: The user's text message.
+
+    Returns:
+        List of content block dicts ready for Anthropic API.
+
+    Raises:
+        HTTPException: On unsupported MIME type or file too large.
+    """
+    content_blocks: list[dict] = []
+
+    for upload_file in files:
+        file_bytes = await upload_file.read()
+        file_size = len(file_bytes)
+
+        # Determine MIME type (fall back to guessing from filename)
+        mime_type = upload_file.content_type
+        if not mime_type or mime_type == "application/octet-stream":
+            guessed, _ = mimetypes.guess_type(upload_file.filename or "")
+            mime_type = guessed or "application/octet-stream"
+
+        # Validate MIME type
+        if mime_type not in SUPPORTED_MIME_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Unsupported file type '{mime_type}' for file "
+                    f"'{upload_file.filename}'. Supported types: "
+                    f"{', '.join(sorted(SUPPORTED_MIME_TYPES))}"
+                ),
+            )
+
+        # Validate file size
+        size_limits = {
+            "application/pdf": ("PDF", MAX_PDF_SIZE),
+            "text/plain": ("Text file", MAX_TEXT_SIZE),
+        }
+        if mime_type in SUPPORTED_IMAGE_TYPES:
+            limit_label, limit = "Image", MAX_IMAGE_SIZE
+        else:
+            limit_label, limit = size_limits[mime_type]
+
+        if file_size > limit:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{limit_label} '{upload_file.filename}' is "
+                    f"{file_size / (1024 * 1024):.1f} MB, exceeding the "
+                    f"{limit / (1024 * 1024):.0f} MB limit."
+                ),
+            )
+
+        # Build content block
+        if mime_type in SUPPORTED_IMAGE_TYPES:
+            content_blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": mime_type,
+                    "data": base64.standard_b64encode(file_bytes).decode("utf-8"),
+                },
+            })
+        elif mime_type == "application/pdf":
+            content_blocks.append({
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": base64.standard_b64encode(file_bytes).decode("utf-8"),
+                },
+            })
+        elif mime_type == "text/plain":
+            try:
+                text_content = file_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                text_content = file_bytes.decode("utf-8", errors="replace")
+            content_blocks.append({
+                "type": "document",
+                "source": {
+                    "type": "text",
+                    "media_type": "text/plain",
+                    "data": text_content,
+                },
+            })
+
+    # User's text prompt is always the final block
+    content_blocks.append({"type": "text", "text": user_prompt})
+    return content_blocks
+
+
 @router.post("/run")
 async def run_agent(request: AgentRunRequest) -> StreamingResponse:
     """Run an agent with the given prompt and stream responses via SSE.
@@ -610,6 +726,68 @@ async def run_agent(request: AgentRunRequest) -> StreamingResponse:
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",  # Disable buffering in nginx
+        },
+    )
+
+
+@router.post("/run/multipart")
+async def run_agent_multipart(
+    user_prompt: str = Form(...),
+    agent_uuid: Optional[str] = Form(default=None),
+    agent_type: Optional[AgentType] = Form(default=None),
+    files: list[UploadFile] = File(default=[]),
+) -> StreamingResponse:
+    """Run an agent with text prompt and file attachments via multipart/form-data.
+
+    Files are base64-encoded server-side and sent as Anthropic content blocks.
+    Supported file types:
+    - Images: image/png, image/jpeg, image/gif, image/webp (max 20 MB each)
+    - PDF documents: application/pdf (max 32 MB each)
+    - Text documents: text/plain (max 5 MB each)
+
+    The text prompt is always included as the final content block.
+    If no files are attached, only the text prompt is sent.
+
+    Args:
+        user_prompt: The user's text message (required)
+        agent_uuid: Optional UUID to resume an existing agent session
+        agent_type: Optional agent type for configuration
+        files: Optional list of file attachments
+
+    Returns:
+        StreamingResponse with text/event-stream content type
+
+    Example:
+        ```
+        POST /agent/run/multipart
+        Content-Type: multipart/form-data
+
+        user_prompt: "What's in this image?"
+        agent_type: "agent_all_json"
+        files: <image.png>
+        ```
+    """
+    # Apply default agent_type (same logic as AgentRunRequest.validate_agent_source)
+    if not agent_uuid and not agent_type:
+        agent_type = "agent_frontend_tools"
+
+    # Build content blocks from files + prompt
+    if files:
+        prompt: str | list[dict] = await build_content_blocks_from_files(files, user_prompt)
+    else:
+        prompt = user_prompt
+
+    return StreamingResponse(
+        stream_agent_response(
+            user_prompt=prompt,
+            agent_uuid=agent_uuid,
+            agent_type=agent_type,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
         },
     )
 

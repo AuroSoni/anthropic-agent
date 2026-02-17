@@ -99,6 +99,7 @@ def _config_to_row_values(config: AgentConfig) -> tuple:
         _to_jsonb(config.tool_schemas),
         config.tool_names,
         _to_jsonb(config.server_tools),
+        _to_jsonb(config.skills),
         config.beta_headers,
         _to_jsonb(config.api_kwargs),
         config.formatter,
@@ -141,6 +142,7 @@ def _row_to_config(row: asyncpg.Record) -> AgentConfig:
         tool_schemas=_from_jsonb(row["tool_schemas"]) or [],
         tool_names=list(row["tool_names"]) if row["tool_names"] else [],
         server_tools=_from_jsonb(row["server_tools"]) or [],
+        skills=_from_jsonb(row.get("skills")) or [],
         beta_headers=list(row["beta_headers"]) if row["beta_headers"] else [],
         api_kwargs=_from_jsonb(row["api_kwargs"]) or {},
         formatter=row["formatter"],
@@ -254,7 +256,7 @@ class PostgresAgentConfigAdapter(AgentConfigAdapter):
             INSERT INTO agent_config (
                 agent_uuid, system_prompt, description, model, max_steps,
                 thinking_tokens, max_tokens, container_id, messages,
-                tool_schemas, tool_names, server_tools, beta_headers,
+                tool_schemas, tool_names, server_tools, skills, beta_headers,
                 api_kwargs, formatter,
                 stream_meta_history_and_tool_results, compactor_type,
                 memory_store_type, file_registry, max_retries, base_delay,
@@ -268,7 +270,7 @@ class PostgresAgentConfigAdapter(AgentConfigAdapter):
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                 $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
                 $21, $22, $23, $24, $25, $26, $27, $28, $29, $30,
-                $31, $32, $33, $34, $35, $36
+                $31, $32, $33, $34, $35, $36, $37
             )
             ON CONFLICT (agent_uuid) DO UPDATE SET
                 system_prompt = EXCLUDED.system_prompt,
@@ -282,6 +284,7 @@ class PostgresAgentConfigAdapter(AgentConfigAdapter):
                 tool_schemas = EXCLUDED.tool_schemas,
                 tool_names = EXCLUDED.tool_names,
                 server_tools = EXCLUDED.server_tools,
+                skills = EXCLUDED.skills,
                 beta_headers = EXCLUDED.beta_headers,
                 api_kwargs = EXCLUDED.api_kwargs,
                 formatter = EXCLUDED.formatter,
@@ -323,10 +326,10 @@ class PostgresAgentConfigAdapter(AgentConfigAdapter):
         pool = await self._get_pool()
         
         query = """
-            SELECT 
+            SELECT
                 agent_uuid, system_prompt, model, max_steps, thinking_tokens,
                 max_tokens, container_id, messages, tool_schemas, tool_names,
-                server_tools, beta_headers, api_kwargs, formatter,
+                server_tools, skills, beta_headers, api_kwargs, formatter,
                 stream_meta_history_and_tool_results, compactor_type,
                 memory_store_type, file_registry, max_retries, base_delay,
                 last_known_input_tokens, last_known_output_tokens,
