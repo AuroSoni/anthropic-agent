@@ -57,6 +57,47 @@ def _escape_tool_result_cdata(content: str) -> str:
     return safe.replace("\n", "\\n")
 
 
+def _strip_binary_data(obj: Any) -> Any:
+    """Return a deep copy of *obj* with base64 data replaced by size placeholders.
+
+    Targets content blocks shaped like::
+
+        {"type": "image"|"document",
+         "source": {"type": "base64", "data": "<huge_string>", ...}}
+
+    The ``data`` value is replaced with ``"[base64, X.X MB]"`` (or KB for
+    smaller payloads).  All other values are passed through unchanged.
+
+    The original object is never mutated.
+    """
+    if isinstance(obj, list):
+        return [_strip_binary_data(item) for item in obj]
+
+    if isinstance(obj, dict):
+        source = obj.get("source")
+        if (
+            isinstance(source, dict)
+            and source.get("type") == "base64"
+            and "data" in source
+        ):
+            # Approximate original byte size: base64 chars × 3/4
+            b64_len = len(source["data"]) if isinstance(source["data"], str) else 0
+            byte_size = b64_len * 3 / 4
+            if byte_size >= 1024 * 1024:
+                size_label = f"{byte_size / (1024 * 1024):.1f} MB"
+            else:
+                size_label = f"{byte_size / 1024:.1f} KB"
+
+            new_source = {k: v for k, v in source.items() if k != "data"}
+            new_source["data"] = f"[base64, {size_label}]"
+            return {**obj, "source": new_source}
+
+        # Recurse into all values
+        return {k: _strip_binary_data(v) for k, v in obj.items()}
+
+    return obj
+
+
 async def _emit_tool_result(
     queue: asyncio.Queue,
     active_fmt: "FormatterType",
@@ -683,14 +724,14 @@ class AnthropicAgent:
             active_formatter = formatter if formatter is not None else self.formatter
             meta_init: dict[str, Any] = {
                 "format": active_formatter,
-                "user_query": prompt if isinstance(prompt, str) else json.dumps(prompt),
+                "user_query": prompt if isinstance(prompt, str) else json.dumps(_strip_binary_data(prompt)),
                 "agent_uuid": self.agent_uuid,
                 "parent_agent_uuid": self._parent_agent_uuid,
                 "model": self.model,
             }
             # Only include message_history when stream_meta_history_and_tool_results is True
             if self.stream_meta_history_and_tool_results:
-                meta_init["message_history"] = self.conversation_history
+                meta_init["message_history"] = _strip_binary_data(self.conversation_history)
 
             if active_formatter == "json":
                 # JSON envelope: chunked meta_init
@@ -1856,7 +1897,7 @@ class AnthropicAgent:
             return
         
         meta_final: dict[str, Any] = {
-            "conversation_history": result.conversation_history,
+            "conversation_history": _strip_binary_data(result.conversation_history),
             "stop_reason": result.stop_reason,
             "total_steps": result.total_steps,
             "generated_files": result.generated_files,

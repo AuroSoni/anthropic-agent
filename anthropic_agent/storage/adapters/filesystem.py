@@ -134,6 +134,7 @@ class FilesystemAgentConfigAdapter(AgentConfigAdapter):
     
     async def save(self, config: AgentConfig) -> None:
         """Save agent configuration to JSON file with atomic write."""
+        self._config_dir.mkdir(parents=True, exist_ok=True)
         config_file = self._config_dir / f"{config.agent_uuid}.json"
         temp_file = config_file.with_suffix(".tmp")
         

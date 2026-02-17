@@ -143,6 +143,7 @@ class AgentConfig(BaseModel):
     tools: list = []
     frontend_tools: list = []  # Frontend-executed tools (schema only on server)
     server_tools: list = []
+    skills: list = []
     context_management: dict | None = None
     beta_headers: list[str] = []
     file_backend: Any = None
@@ -160,6 +161,7 @@ AgentType = Literal[
     "agent_client_tools",
     "agent_frontend_tools",
     "agent_all_json",
+    "agent_skills",
     "agent_subagents",
     "agent_cowork",
 ]
@@ -423,12 +425,41 @@ agent_cowork = AgentConfig(
     stream_meta_history_and_tool_results=True,
 )
 
+# --- 7. Anthropic Agent Skills (code execution + document generation) ---
+agent_skills = AgentConfig(
+    system_prompt="You are a helpful assistant that can generate documents and run code using Anthropic Skills.",
+    model="claude-sonnet-4-5",
+    thinking_tokens=1024,
+    max_tokens=64000,
+    server_tools=[
+        {"type": "code_execution_20250825", "name": "code_execution"},
+    ],
+    skills=[
+        {"type": "anthropic", "skill_id": "xlsx", "version": "latest"},
+        {"type": "anthropic", "skill_id": "pptx", "version": "latest"},
+        {"type": "anthropic", "skill_id": "docx", "version": "latest"},
+        {"type": "anthropic", "skill_id": "pdf", "version": "latest"},
+    ],
+    beta_headers=[
+        "code-execution-2025-08-25",
+        "skills-2025-10-02",
+        "files-api-2025-04-14",
+    ],
+    file_backend=_s3,
+    config_adapter=config_adapter,
+    conversation_adapter=conversation_adapter,
+    run_adapter=run_adapter,
+    formatter="json",
+    stream_meta_history_and_tool_results=True,
+)
+
 # Agent config registry
 AGENT_CONFIGS: dict[AgentType, AgentConfig] = {
     "agent_no_tools": agent_no_tools,
     "agent_client_tools": agent_client_tools,
     "agent_frontend_tools": agent_frontend_tools,
     "agent_all_json": agent_all_json,
+    "agent_skills": agent_skills,
     "agent_subagents": agent_subagents,
     "agent_cowork": agent_cowork,
 }
