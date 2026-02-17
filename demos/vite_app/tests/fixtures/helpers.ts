@@ -9,7 +9,7 @@ import type { AgentNode } from '../../src/lib/parsers';
  */
 export interface Scenario {
   name: string;
-  format: 'raw' | 'xml';
+  format: 'raw' | 'xml' | 'json';
   stream: string;
   expectedNodeTypes: string[]; // Just tag names for easy assertion
 }

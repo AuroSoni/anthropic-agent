@@ -4,15 +4,14 @@
 import type { AgentNode } from '../../src/lib/parsers';
 
 /**
- * Agent types supported by the FastAPI backend.
+ * Agent types supported by the FastAPI backend (JSON format only).
  */
-export type AgentType = 
-  | 'agent_no_tools' 
-  | 'agent_client_tools' 
-  | 'agent_all_raw' 
-  | 'agent_all_xml'
+export type AgentType =
+  | 'agent_no_tools'
+  | 'agent_client_tools'
+  | 'agent_all_json'
   | 'agent_frontend_tools'
-  | 'agent_frontend_tools_raw';
+  | 'agent_skills';
 
 /**
  * Test case definition.
@@ -26,6 +25,19 @@ export interface TestCase {
   agentType: AgentType;
   /** Optional description of what the test validates */
   description?: string;
+  /** Which endpoint to call: 'json' (default) = POST /agent/run, 'multipart' = POST /agent/run/multipart */
+  endpoint?: 'json' | 'multipart';
+  /** Files for multipart upload: each has filename, mimeType, and a source (url or inline content) */
+  files?: Array<{
+    filename: string;
+    mimeType: string;
+    /** HTTP URL or local file path to fetch the file from */
+    url?: string;
+    /** Inline base64-encoded content (for small text fixtures like CSV) */
+    content?: string;
+  }>;
+  /** If set, the test expects an HTTP error with this status code instead of a successful SSE stream */
+  expectError?: number;
 }
 
 /**
@@ -38,8 +50,8 @@ export interface TestResult {
   agentType: string;
   /** ISO timestamp when test was run */
   timestamp: string;
-  /** Detected stream format (xml or raw) */
-  streamFormat: string;
+  /** Stream format (always json) */
+  streamFormat: 'json';
   /** Parsed node tree */
   nodes: AgentNode[];
   /** Number of SSE chunks received */
@@ -48,5 +60,6 @@ export interface TestResult {
   parseTimeMs: number;
   /** Error message if test failed */
   error?: string;
+  /** HTTP status code (for expected-error tests) */
+  httpStatus?: number;
 }
-

@@ -52,10 +52,14 @@ export type {
 // Parsers
 export { AnthropicStreamParser } from './anthropic-parser';
 export { XmlStreamParser } from './xml-stream-parser';
+export { JsonStreamParser } from './json-stream-parser';
 export { parseMixedContent } from './xml-parser';
 
+// JSON envelope types
+export type { JsonEnvelope } from './json-types';
+
 // Meta-init utilities
-export { parseMetaInit, stripMetaInit, hasMetaInit, parseMetaFinal, stripMetaFinal, createMetaFinalConsumer } from './meta-init';
+export { parseJsonMetaInit, parseMetaInit, stripMetaInit, hasMetaInit, parseMetaFinal, stripMetaFinal, createMetaFinalConsumer } from './meta-init';
 
 // Shared utilities
 export { decodeHtmlEntities, unescapeSseNewlines } from './utils';

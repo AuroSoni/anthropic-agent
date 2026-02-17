@@ -5,9 +5,12 @@ import {
   type StreamFormat,
   type PendingFrontendTool,
   type FrontendToolResult,
+  type JsonEnvelope,
   AnthropicStreamParser,
   XmlStreamParser,
+  JsonStreamParser,
   parseMetaInit,
+  parseJsonMetaInit,
   stripMetaInit,
   createMetaFinalConsumer,
   decodeHtmlEntities,
@@ -44,7 +47,13 @@ export interface AgentCompletion {
 /**
  * Available agent types matching the backend configuration.
  */
-export type AgentType = 'agent_no_tools' | 'agent_client_tools' | 'agent_all_raw' | 'agent_all_xml' | 'agent_frontend_tools';
+export type AgentType =
+  | 'agent_no_tools'
+  | 'agent_client_tools'
+  | 'agent_frontend_tools'
+  | 'agent_all_json'
+  | 'agent_subagents'
+  | 'agent_cowork';
 
 /**
  * User prompt can be a simple string or a complex JSON structure (array or object)
@@ -54,10 +63,11 @@ export type UserPrompt = string | unknown[] | Record<string, unknown>;
 
 export const AGENT_TYPES: { value: AgentType; label: string; description: string }[] = [
   { value: 'agent_no_tools', label: 'No Tools', description: 'Basic assistant without tools' },
-  { value: 'agent_client_tools', label: 'Client Tools', description: 'With client-side tools only' },
-  { value: 'agent_all_raw', label: 'All Tools (Raw)', description: 'All tools with raw JSON streaming' },
-  { value: 'agent_all_xml', label: 'All Tools (XML)', description: 'All tools with XML streaming' },
-  { value: 'agent_frontend_tools', label: 'Frontend Tools', description: 'With browser-executed tools (user_confirm)' },
+  { value: 'agent_client_tools', label: 'Client Tools', description: 'Client-side calculator tools' },
+  { value: 'agent_frontend_tools', label: 'Frontend Tools', description: 'Browser-executed tools (user_confirm)' },
+  { value: 'agent_all_json', label: 'All Tools', description: 'Common tools + web search/fetch' },
+  { value: 'agent_subagents', label: 'Subagents', description: 'Orchestrator with calculator + researcher' },
+  { value: 'agent_cowork', label: 'Cowork', description: 'Coding assistant with file I/O + bash' },
 ];
 
 export interface AgentConfig {
@@ -78,7 +88,7 @@ export type AgentStreamCallbacks = {
 /**
  * Union type for both parser implementations.
  */
-type StreamParser = AnthropicStreamParser | XmlStreamParser;
+type StreamParser = AnthropicStreamParser | XmlStreamParser | JsonStreamParser;
 
 function getToolNodeId(node: AgentNode): string | undefined {
   if (node.type !== 'element') return undefined;
@@ -183,6 +193,7 @@ export async function streamAgent(
   let metaInitProcessed = false;
   let xmlAccumulationInProgress = false;
   let xmlAccumulationBuffer = '';
+  let metaFinalBuffer = ''; // For JSON format: accumulate meta_final deltas
   const metaFinalConsumer = createMetaFinalConsumer((metaFinal) => {
     if (!currentState.metadata) {
       return;
@@ -198,21 +209,61 @@ export async function streamAgent(
    */
   function processContent(content: string) {
     if (!parser || !content.trim()) return;
-    
+
     // Accumulate raw content for debugging
     currentState.rawContent += content;
 
     // Process content based on format
-    if (streamFormat === 'raw') {
+    if (streamFormat === 'json') {
+      // JSON envelope format: each SSE data line is a self-contained JSON object
+      try {
+        const envelope = JSON.parse(content) as JsonEnvelope;
+
+        // Handle meta_final upstream (buffer chunks until final:true)
+        if (envelope.type === 'meta_final') {
+          metaFinalBuffer += envelope.delta;
+          if (envelope.final) {
+            try {
+              const metaFinal = JSON.parse(metaFinalBuffer);
+              if (currentState.metadata) {
+                currentState.metadata = {
+                  ...currentState.metadata,
+                  message_history: metaFinal.conversation_history ?? metaFinal.message_history ?? currentState.metadata.message_history,
+                };
+              }
+            } catch (e) {
+              console.warn('Failed to parse meta_final delta:', e);
+            }
+            metaFinalBuffer = '';
+          }
+          return;
+        }
+
+        // Handle awaiting_frontend_tools upstream
+        if (envelope.type === 'awaiting_frontend_tools' && envelope.final) {
+          try {
+            const tools = JSON.parse(envelope.delta) as PendingFrontendTool[];
+            currentState.status = 'awaiting_tools';
+            currentState.pendingFrontendTools = tools;
+          } catch (e) {
+            console.warn('Failed to parse awaiting_frontend_tools delta:', e);
+          }
+        }
+
+        (parser as JsonStreamParser).processEnvelope(envelope);
+      } catch (e) {
+        console.warn('Failed to parse JSON envelope:', content.slice(0, 100), e);
+      }
+    } else if (streamFormat === 'raw') {
       const trimmed = content.trim();
-      
+
       // Special-case complete awaiting_frontend_tools tags even during XML accumulation
       const awaitingFromDirectParse = tryParseAwaitingFrontendTools(content);
       if (awaitingFromDirectParse) {
         currentState.status = 'awaiting_tools';
         currentState.pendingFrontendTools = awaitingFromDirectParse;
       }
-      
+
       const shouldAppendToXml = xmlAccumulationInProgress || trimmed.startsWith('<');
       if (shouldAppendToXml) {
         xmlAccumulationInProgress = true;
@@ -224,14 +275,10 @@ export async function streamAgent(
         }
       } else {
         // Raw format: content is JSON-encoded Anthropic events
-        // model_dump_json() produces valid compact JSON; stream_to_aqueue() only
-        // escapes literal newlines as a safety net (no-op for valid JSON).
-        // No client-side unescaping is needed — parse the content as-is.
         try {
           const anthropicEvent = JSON.parse(content) as AnthropicEvent;
           (parser as AnthropicStreamParser).processEvent(anthropicEvent);
         } catch (e) {
-          // Not valid JSON - might be an error message or other text
           console.warn('Failed to parse Anthropic event JSON:', content.slice(0, 100), e);
         }
       }
@@ -239,28 +286,30 @@ export async function streamAgent(
       // XML format: content is plain XML text (unescaping happens in normalizeNodes)
       (parser as XmlStreamParser).appendChunk(content);
     }
-    
+
     // Update nodes from parser state (aggressive real-time updates)
     // Merge main parser nodes with XML fallback nodes for raw mode
     const mainNodes = parser.getNodes();
     const xmlNodes = xmlFallbackParser?.getNodes() || [];
     currentState.nodes = mergeNodesWithToolResults([...mainNodes, ...xmlNodes]);
-    
-    // Check for awaiting_frontend_tools tag (frontend tool relay)
-    const awaitingNode = currentState.nodes.find(
-      n => n.type === 'element' && n.tagName === 'awaiting_frontend_tools'
-    );
-    if (awaitingNode?.attributes?.data) {
-      try {
-        const decodedData = decodeHtmlEntities(awaitingNode.attributes.data);
-        const toolsData = JSON.parse(decodedData) as PendingFrontendTool[];
-        currentState.status = 'awaiting_tools';
-        currentState.pendingFrontendTools = toolsData;
-      } catch (e) {
-        console.warn('Failed to parse awaiting_frontend_tools data:', e);
+
+    // Check for awaiting_frontend_tools tag (frontend tool relay) — XML/raw modes
+    if (streamFormat !== 'json') {
+      const awaitingNode = currentState.nodes.find(
+        n => n.type === 'element' && n.tagName === 'awaiting_frontend_tools'
+      );
+      if (awaitingNode?.attributes?.data) {
+        try {
+          const decodedData = decodeHtmlEntities(awaitingNode.attributes.data);
+          const toolsData = JSON.parse(decodedData) as PendingFrontendTool[];
+          currentState.status = 'awaiting_tools';
+          currentState.pendingFrontendTools = toolsData;
+        } catch (e) {
+          console.warn('Failed to parse awaiting_frontend_tools data:', e);
+        }
       }
     }
-    
+
     currentState = { ...currentState }; // Trigger update
     callbacks.onUpdate(currentState);
   }
@@ -296,22 +345,42 @@ export async function streamAgent(
           return;
         }
         
-        // Strip meta_final tags (may be split across chunks) and update metadata
-        const dataStr = metaFinalConsumer(dataStrRaw);
+        // For XML/raw formats, strip meta_final tags (may be split across chunks)
+        // For JSON format, meta_final is handled in processContent as an envelope
+        const dataStr = (streamFormat === 'json') ? dataStrRaw : metaFinalConsumer(dataStrRaw);
         if (!dataStr.trim()) {
           return;
         }
 
         // Check for meta_init on first data chunk
         if (!metaInitProcessed) {
-          // Don't unescape before parseMetaInit - the JSON uses standard escaping
-          // that JSON.parse() handles correctly. Unescaping would break newlines in strings.
+          // Try JSON envelope format first (new default)
+          const jsonMetaInit = parseJsonMetaInit(dataStr);
+          if (jsonMetaInit) {
+            streamFormat = jsonMetaInit.format;
+            currentState.streamFormat = streamFormat;
+
+            currentState.metadata = {
+              ...currentState.metadata,
+              agent_uuid: jsonMetaInit.agent_uuid,
+              model: jsonMetaInit.model,
+              user_query: jsonMetaInit.user_query,
+              message_history: jsonMetaInit.message_history,
+            };
+
+            // JSON format uses JsonStreamParser — no XML fallback needed
+            parser = new JsonStreamParser();
+            metaInitProcessed = true;
+            callbacks.onUpdate(currentState);
+            return;
+          }
+
+          // Try legacy XML meta_init format
           const metaInit = parseMetaInit(dataStr);
           if (metaInit) {
             streamFormat = metaInit.format;
             currentState.streamFormat = streamFormat;
-            
-            // Update metadata from meta_init
+
             currentState.metadata = {
               ...currentState.metadata,
               agent_uuid: metaInit.agent_uuid,
@@ -319,35 +388,47 @@ export async function streamAgent(
               user_query: metaInit.user_query,
               message_history: metaInit.message_history,
             };
-            
+
             // Initialize parser based on format
             if (streamFormat === 'raw') {
               parser = new AnthropicStreamParser();
-              xmlFallbackParser = new XmlStreamParser(); // For XML chunks in raw mode
+              xmlFallbackParser = new XmlStreamParser();
             } else {
               parser = new XmlStreamParser();
             }
-            
+
             metaInitProcessed = true;
-            
-            // Strip meta_init and continue with remaining content (use raw dataStr)
+
             const remaining = stripMetaInit(dataStr);
             if (!remaining.trim()) {
               callbacks.onUpdate(currentState);
               return;
             }
-            
-            // Process remaining content after meta_init
+
             processContent(remaining);
             return;
           }
-          
+
           // No meta_init found - detect format from content
-          // If it starts with '{', assume raw JSON; otherwise XML
           if (dataStr.trim().startsWith('{')) {
-            parser = new AnthropicStreamParser();
-            xmlFallbackParser = new XmlStreamParser(); // For XML chunks in raw mode
-            streamFormat = 'raw';
+            // Could be JSON envelope or raw Anthropic event — check for envelope shape
+            try {
+              const parsed = JSON.parse(dataStr.trim());
+              if (parsed.type && parsed.agent && 'final' in parsed && 'delta' in parsed) {
+                // JSON envelope format
+                parser = new JsonStreamParser();
+                streamFormat = 'json';
+              } else {
+                // Raw Anthropic event
+                parser = new AnthropicStreamParser();
+                xmlFallbackParser = new XmlStreamParser();
+                streamFormat = 'raw';
+              }
+            } catch {
+              parser = new AnthropicStreamParser();
+              xmlFallbackParser = new XmlStreamParser();
+              streamFormat = 'raw';
+            }
           } else {
             parser = new XmlStreamParser();
             streamFormat = 'xml';
@@ -411,9 +492,10 @@ export async function streamToolResults(
   // Parser for continuation stream - reuse format from existing state
   let parser: StreamParser | null = null;
   let xmlFallbackParser: XmlStreamParser | null = null; // For XML chunks in raw mode
-  const streamFormat = existingState.streamFormat || 'xml';
+  const streamFormat = existingState.streamFormat || 'json';
   let xmlAccumulationInProgress = false;
   let xmlAccumulationBuffer = '';
+  let metaFinalBuffer = ''; // For JSON format: accumulate meta_final deltas
   const metaFinalConsumer = createMetaFinalConsumer((metaFinal) => {
     if (!currentState.metadata) {
       return;
@@ -423,10 +505,12 @@ export async function streamToolResults(
       message_history: metaFinal.message_history ?? currentState.metadata?.message_history,
     };
   });
-  
-  if (streamFormat === 'raw') {
+
+  if (streamFormat === 'json') {
+    parser = new JsonStreamParser();
+  } else if (streamFormat === 'raw') {
     parser = new AnthropicStreamParser();
-    xmlFallbackParser = new XmlStreamParser(); // For XML chunks in raw mode
+    xmlFallbackParser = new XmlStreamParser();
   } else {
     parser = new XmlStreamParser();
   }
@@ -436,19 +520,57 @@ export async function streamToolResults(
    */
   function processContent(content: string) {
     if (!parser || !content.trim()) return;
-    
+
     currentState.rawContent += content;
 
-    if (streamFormat === 'raw') {
+    if (streamFormat === 'json') {
+      try {
+        const envelope = JSON.parse(content) as JsonEnvelope;
+
+        // Handle meta_final upstream
+        if (envelope.type === 'meta_final') {
+          metaFinalBuffer += envelope.delta;
+          if (envelope.final) {
+            try {
+              const metaFinal = JSON.parse(metaFinalBuffer);
+              if (currentState.metadata) {
+                currentState.metadata = {
+                  ...currentState.metadata,
+                  message_history: metaFinal.conversation_history ?? metaFinal.message_history ?? currentState.metadata.message_history,
+                };
+              }
+            } catch (e) {
+              console.warn('Failed to parse meta_final delta:', e);
+            }
+            metaFinalBuffer = '';
+          }
+          return;
+        }
+
+        // Handle awaiting_frontend_tools upstream
+        if (envelope.type === 'awaiting_frontend_tools' && envelope.final) {
+          try {
+            const tools = JSON.parse(envelope.delta) as PendingFrontendTool[];
+            currentState.status = 'awaiting_tools';
+            currentState.pendingFrontendTools = tools;
+          } catch (e) {
+            console.warn('Failed to parse awaiting_frontend_tools delta:', e);
+          }
+        }
+
+        (parser as JsonStreamParser).processEnvelope(envelope);
+      } catch (e) {
+        console.warn('Failed to parse JSON envelope:', content.slice(0, 100), e);
+      }
+    } else if (streamFormat === 'raw') {
       const trimmed = content.trim();
-      
-      // Special-case complete awaiting_frontend_tools tags even during XML accumulation
+
       const awaitingFromDirectParse = tryParseAwaitingFrontendTools(content);
       if (awaitingFromDirectParse) {
         currentState.status = 'awaiting_tools';
         currentState.pendingFrontendTools = awaitingFromDirectParse;
       }
-      
+
       const shouldAppendToXml = xmlAccumulationInProgress || trimmed.startsWith('<');
       if (shouldAppendToXml) {
         xmlAccumulationInProgress = true;
@@ -469,29 +591,30 @@ export async function streamToolResults(
     } else {
       (parser as XmlStreamParser).appendChunk(content);
     }
-    
+
     // Merge new nodes with existing nodes
-    // Include XML fallback nodes for raw mode
     const mainNodes = parser.getNodes();
     const xmlNodes = xmlFallbackParser?.getNodes() || [];
     const newNodes = mergeNodesWithToolResults([...mainNodes, ...xmlNodes]);
     currentState.nodes = mergeNodesWithToolResults([...existingState.nodes, ...newNodes]);
-    
-    // Check for another awaiting_frontend_tools (nested tool calls)
-    const awaitingNode = newNodes.find(
-      (n: AgentNode) => n.type === 'element' && n.tagName === 'awaiting_frontend_tools'
-    );
-    if (awaitingNode?.attributes?.data) {
-      try {
-        const decodedData = decodeHtmlEntities(awaitingNode.attributes.data);
-        const toolsData = JSON.parse(decodedData) as PendingFrontendTool[];
-        currentState.status = 'awaiting_tools';
-        currentState.pendingFrontendTools = toolsData;
-      } catch (e) {
-        console.warn('Failed to parse awaiting_frontend_tools data:', e);
+
+    // Check for another awaiting_frontend_tools (nested tool calls) — XML/raw modes
+    if (streamFormat !== 'json') {
+      const awaitingNode = newNodes.find(
+        (n: AgentNode) => n.type === 'element' && n.tagName === 'awaiting_frontend_tools'
+      );
+      if (awaitingNode?.attributes?.data) {
+        try {
+          const decodedData = decodeHtmlEntities(awaitingNode.attributes.data);
+          const toolsData = JSON.parse(decodedData) as PendingFrontendTool[];
+          currentState.status = 'awaiting_tools';
+          currentState.pendingFrontendTools = toolsData;
+        } catch (e) {
+          console.warn('Failed to parse awaiting_frontend_tools data:', e);
+        }
       }
     }
-    
+
     currentState = { ...currentState };
     callbacks.onUpdate(currentState);
   }
@@ -514,7 +637,7 @@ export async function streamToolResults(
 
       onmessage: (ev) => {
         const dataStrRaw = ev.data;
-        
+
         if (dataStrRaw === '[DONE]') {
           if (currentState.status === 'streaming') {
             currentState = { ...currentState, status: 'complete' };
@@ -523,7 +646,21 @@ export async function streamToolResults(
           return;
         }
 
-        const dataStr = metaFinalConsumer(dataStrRaw);
+        // For JSON format, skip XML metaFinalConsumer — meta_final is handled in processContent
+        let dataStr: string;
+        if (streamFormat === 'json') {
+          dataStr = dataStrRaw;
+
+          // Skip meta_init envelopes in continuation stream (metadata already set)
+          if (dataStr.trim().startsWith('{')) {
+            try {
+              const peek = JSON.parse(dataStr.trim());
+              if (peek.type === 'meta_init') return;
+            } catch { /* not JSON, proceed */ }
+          }
+        } else {
+          dataStr = metaFinalConsumer(dataStrRaw);
+        }
         if (!dataStr.trim()) {
           return;
         }
