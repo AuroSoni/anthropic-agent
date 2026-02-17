@@ -142,7 +142,7 @@ export type AnthropicEvent =
 /**
  * Stream format type: "xml" or "raw"
  */
-export type StreamFormat = 'xml' | 'raw';
+export type StreamFormat = 'xml' | 'raw' | 'json';
 
 /**
  * MetaInit contains initialization metadata sent at the start of a stream.

@@ -54,7 +54,7 @@ def _dict_to_config(data: dict) -> AgentConfig:
     known_fields = {
         "agent_uuid", "system_prompt", "description", "model", "max_steps",
         "thinking_tokens", "max_tokens", "container_id", "messages",
-        "tool_schemas", "tool_names", "server_tools", "beta_headers",
+        "tool_schemas", "tool_names", "server_tools", "skills", "beta_headers",
         "api_kwargs", "formatter", "stream_meta_history_and_tool_results",
         "compactor_type", "memory_store_type", "file_registry", "max_retries",
         "base_delay", "last_known_input_tokens", "last_known_output_tokens",
@@ -134,6 +134,7 @@ class FilesystemAgentConfigAdapter(AgentConfigAdapter):
     
     async def save(self, config: AgentConfig) -> None:
         """Save agent configuration to JSON file with atomic write."""
+        self._config_dir.mkdir(parents=True, exist_ok=True)
         config_file = self._config_dir / f"{config.agent_uuid}.json"
         temp_file = config_file.with_suffix(".tmp")
         

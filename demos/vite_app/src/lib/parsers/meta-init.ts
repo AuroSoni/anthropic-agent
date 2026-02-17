@@ -3,7 +3,26 @@
  * initialization and final metadata before routing the stream to the correct parser.
  */
 import type { MetaFinal, MetaInit } from './types';
+import type { JsonEnvelope } from './json-types';
 import { decodeHtmlEntities } from './utils';
+
+/**
+ * Parse meta_init from a JSON envelope.
+ * JSON format: {"type":"meta_init","agent":"...","final":true,"delta":"{...}"}
+ *
+ * @param content - The raw SSE data string (JSON envelope)
+ * @returns MetaInit object if valid, null otherwise
+ */
+export function parseJsonMetaInit(content: string): MetaInit | null {
+  try {
+    const envelope: JsonEnvelope = JSON.parse(content);
+    if (envelope.type !== 'meta_init') return null;
+    const metaData = JSON.parse(envelope.delta);
+    return metaData as MetaInit;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Parse meta_init tag from content string.

@@ -1,11 +1,25 @@
 /**
- * Test case definitions for parser integration tests.
+ * Test case definitions for parser integration tests (JSON format only).
  * Ported from demos/fastapi_server/agent_api_test.ipynb
- * 
+ *
  * NOTE: Image tests use read_image_raw tool which reads from a relative path.
  * Ensure the test image exists at the expected path relative to fastapi_server.
  */
 import type { TestCase } from './types';
+
+// =============================================================================
+// File URLs for test fixtures
+// =============================================================================
+
+/** Real receipt image (relative to repo root, resolved by the test runner) */
+const IMAGE_PATH = '../../../../currency_receipt_usd_jpy.png';
+
+/** Anthropic Claude model card PDF */
+const PDF_URL =
+  'https://assets.anthropic.com/m/1cd9d098ac3e6467/original/Claude-3-Model-Card-October-Addendum.pdf';
+
+/** Simple CSV for unsupported file type test (inline is fine — it's text, not arbitrary binary) */
+const CSV_B64 = btoa('name,age\nAlice,30\nBob,25\n');
 
 // =============================================================================
 // Prompts
@@ -13,56 +27,61 @@ import type { TestCase } from './types';
 
 const PROMPTS = {
   // Basic prompts
-  whatIsAi: "Hi, what is AI?",
-  mathExpression: "Hi, what is 5*(3+2/4)?",
-  ycombinator: "Fetch me the latest happenings in the Y Combinator ecosystem",
-  markdownReport: "Produce a markdown report with a table + code block + nested bullets about 'How to reduce latency in an API.'",
-  fileGeneration: "Generate a JSON file named `users.json` with 20 synthetic users: id, name, email, country.",
-  
+  whatIsAi: 'Hi, what is AI?',
+  mathExpression: 'Hi, what is 5*(3+2/4)?',
+  ycombinator: 'Fetch me the latest happenings in the Y Combinator ecosystem',
+  markdownReport:
+    "Produce a markdown report with a table + code block + nested bullets about 'How to reduce latency in an API.'",
+  fileGeneration:
+    'Generate a JSON file named `users.json` with 20 synthetic users: id, name, email, country.',
+
   // Image tool result prompt (triggers read_image_raw tool)
-  imageToolResult: "Read and analyze the image at ../../currency_receipt_usd_jpy.png",
-  
+  imageToolResult: 'Read and analyze the image at ../../currency_receipt_usd_jpy.png',
+
+  // Inline base64 image in prompt (image data resolved at runtime by the test runner)
+  imageBase64InPrompt: 'Describe this image briefly.',
+
   // PDF citations prompt
   pdfCitations: [
     {
-      type: "document",
+      type: 'document',
       source: {
-        type: "url",
-        url: "https://assets.anthropic.com/m/1cd9d098ac3e6467/original/Claude-3-Model-Card-October-Addendum.pdf",
+        type: 'url',
+        url: 'https://assets.anthropic.com/m/1cd9d098ac3e6467/original/Claude-3-Model-Card-October-Addendum.pdf',
       },
       citations: { enabled: true },
     },
     {
-      type: "text",
-      text: "What are the key findings in this document?",
+      type: 'text',
+      text: 'What are the key findings in this document?',
     },
   ],
-  
+
   // Content citations prompt
   contentCitations: {
-    role: "user",
+    role: 'user',
     content: [
       {
-        type: "document",
+        type: 'document',
         source: {
-          type: "text",
-          media_type: "text/plain",
-          data: "The grass is green. The sky is blue.",
+          type: 'text',
+          media_type: 'text/plain',
+          data: 'The grass is green. The sky is blue.',
         },
-        title: "My Document",
-        context: "This is a trustworthy document.",
+        title: 'My Document',
+        context: 'This is a trustworthy document.',
         citations: { enabled: true },
       },
       {
-        type: "text",
-        text: "What color is the grass and sky?",
+        type: 'text',
+        text: 'What color is the grass and sky?',
       },
     ],
   },
-  
+
   // Frontend tools prompt (triggers user_confirm)
-  frontendToolsConfirm: "Calculate 25 * 4 for me. Confirm with user before proceeding.",
-  
+  frontendToolsConfirm: 'Calculate 25 * 4 for me. Confirm with user before proceeding.',
+
   // Chart embedded tags prompt
   chartEmbedded: `
 <chart_config>
@@ -144,6 +163,22 @@ To show charts, embed Chart.js JSON config between \`<chart>\` tags.
 Present world population demographic data in a chart.
 </user_prompt>
 `,
+
+  // Literal newlines / backslash behavior
+  literalNewlines:
+    'Explain the behavior of backslash (\\) in a string. Also explain what \\n does. How is it different from \\\\n or \\r\\n?',
+
+  // Multipart prompts (text portion only; files are in TestCase.files)
+  multipartImageUpload: 'I paid the receipt in USD. What is the amount in INR?',
+  multipartPdfUpload: 'What are the key findings in this document?',
+  multipartTextOnly: 'Hello, what is 2 + 2?',
+  multipartUnsupportedFile: 'Analyze this data',
+
+  // Anthropic Skills prompts
+  skillsXlsx:
+    'Create an Excel spreadsheet with a simple monthly budget: categories (Rent, Food, Transport, Entertainment, Savings) and amounts for 3 months.',
+  skillsPptx:
+    'Create a PowerPoint presentation with 3 slides about the solar system: title slide, inner planets overview, and outer planets overview.',
 };
 
 // =============================================================================
@@ -151,164 +186,166 @@ Present world population demographic data in a chart.
 // =============================================================================
 
 export const TEST_CASES: TestCase[] = [
-  // No tools
+  // --- No tools ---
   {
-    name: "no_tools_what_is_ai",
+    name: 'no_tools_what_is_ai',
     prompt: PROMPTS.whatIsAi,
-    agentType: "agent_no_tools",
-    description: "Basic text response without tools",
+    agentType: 'agent_no_tools',
+    description: 'Basic text response without tools',
   },
-  
-  // Client tools
+
+  // --- Client tools ---
   {
-    name: "client_tools_math",
+    name: 'client_tools_math',
     prompt: PROMPTS.mathExpression,
-    agentType: "agent_client_tools",
-    description: "Client-side tool call for math calculation",
+    agentType: 'agent_client_tools',
+    description: 'Client-side tool call for math calculation',
   },
-  
-  // Server tools - Raw format
+
+  // --- Server tools ---
   {
-    name: "server_tools_math_raw",
+    name: 'server_tools_math',
     prompt: PROMPTS.mathExpression,
-    agentType: "agent_all_raw",
-    description: "Server tools with raw format - math calculation",
+    agentType: 'agent_all_json',
+    description: 'Server tools with JSON format - math calculation',
   },
-  
-  // Server tools - XML format
+
+  // --- Y Combinator (web search) ---
   {
-    name: "server_tools_math_xml",
-    prompt: PROMPTS.mathExpression,
-    agentType: "agent_all_xml",
-    description: "Server tools with XML format - math calculation",
-  },
-  
-  // Y Combinator - Raw format
-  {
-    name: "ycombinator_raw",
+    name: 'ycombinator',
     prompt: PROMPTS.ycombinator,
-    agentType: "agent_all_raw",
-    description: "Web search tool with raw format",
+    agentType: 'agent_all_json',
+    description: 'Web search tool with JSON format',
   },
-  
-  // Y Combinator - XML format
+
+  // --- PDF citations ---
   {
-    name: "ycombinator_xml",
-    prompt: PROMPTS.ycombinator,
-    agentType: "agent_all_xml",
-    description: "Web search tool with XML format",
-  },
-  
-  // PDF citations - Raw format
-  {
-    name: "pdf_citations_raw",
+    name: 'pdf_citations',
     prompt: PROMPTS.pdfCitations,
-    agentType: "agent_all_raw",
-    description: "PDF document citations with raw format",
+    agentType: 'agent_all_json',
+    description: 'PDF document citations',
   },
-  
-  // PDF citations - XML format
+
+  // --- Content citations ---
   {
-    name: "pdf_citations_xml",
-    prompt: PROMPTS.pdfCitations,
-    agentType: "agent_all_xml",
-    description: "PDF document citations with XML format",
-  },
-  
-  // Content citations - Raw format
-  {
-    name: "content_citations_raw",
+    name: 'content_citations',
     prompt: PROMPTS.contentCitations,
-    agentType: "agent_all_raw",
-    description: "Text content citations with raw format",
+    agentType: 'agent_all_json',
+    description: 'Text content citations',
   },
-  
-  // Content citations - XML format
+
+  // --- Markdown report ---
   {
-    name: "content_citations_xml",
-    prompt: PROMPTS.contentCitations,
-    agentType: "agent_all_xml",
-    description: "Text content citations with XML format",
-  },
-  
-  // Markdown report - Raw format
-  {
-    name: "markdown_report_raw",
+    name: 'markdown_report',
     prompt: PROMPTS.markdownReport,
-    agentType: "agent_all_raw",
-    description: "Complex markdown rendering with raw format",
+    agentType: 'agent_all_json',
+    description: 'Complex markdown rendering (table + code + bullets)',
   },
-  
-  // Markdown report - XML format
+
+  // --- File generation ---
   {
-    name: "markdown_report_xml",
-    prompt: PROMPTS.markdownReport,
-    agentType: "agent_all_xml",
-    description: "Complex markdown rendering with XML format",
-  },
-  
-  // File generation - Raw format
-  {
-    name: "file_generation_raw",
+    name: 'file_generation',
     prompt: PROMPTS.fileGeneration,
-    agentType: "agent_all_raw",
-    description: "File creation with meta_files - raw format",
+    agentType: 'agent_all_json',
+    description: 'File creation with meta_files',
   },
-  
-  // File generation - XML format
+
+  // --- Chart embedded tags ---
   {
-    name: "file_generation_xml",
-    prompt: PROMPTS.fileGeneration,
-    agentType: "agent_all_xml",
-    description: "File creation with meta_files - XML format",
-  },
-  
-  // Chart embedded - Raw format
-  {
-    name: "chart_embedded_raw",
+    name: 'chart_embedded',
     prompt: PROMPTS.chartEmbedded,
-    agentType: "agent_all_raw",
-    description: "Embedded <chart> tags with raw format",
+    agentType: 'agent_all_json',
+    description: 'Embedded <chart> tags in response',
   },
-  
-  // Chart embedded - XML format
+
+  // --- Frontend tools (user_confirm) ---
   {
-    name: "chart_embedded_xml",
-    prompt: PROMPTS.chartEmbedded,
-    agentType: "agent_all_xml",
-    description: "Embedded <chart> tags with XML format",
-  },
-  
-  // Frontend tools - XML format (pauses for user_confirm)
-  {
-    name: "frontend_tools_confirm_xml",
+    name: 'frontend_tools_confirm',
     prompt: PROMPTS.frontendToolsConfirm,
-    agentType: "agent_frontend_tools",
-    description: "Frontend tools with user_confirm - XML format, pauses at awaiting_frontend_tools",
+    agentType: 'agent_frontend_tools',
+    description: 'Frontend tools with user_confirm - pauses at awaiting_frontend_tools',
   },
-  
-  // Frontend tools - Raw format (pauses for user_confirm)
+
+  // --- Image tool result ---
   {
-    name: "frontend_tools_confirm_raw",
-    prompt: PROMPTS.frontendToolsConfirm,
-    agentType: "agent_frontend_tools_raw",
-    description: "Frontend tools with user_confirm - raw format, pauses at awaiting_frontend_tools",
-  },
-  
-  // Image tool result - Raw format
-  {
-    name: "image_tool_result_raw",
+    name: 'image_tool_result',
     prompt: PROMPTS.imageToolResult,
-    agentType: "agent_all_raw",
-    description: "Tool result with image - raw format, tests read_image_raw tool",
+    agentType: 'agent_all_json',
+    description: 'Tool result with image - tests read_image_raw tool',
   },
-  
-  // Image tool result - XML format
+
+  // --- NEW: Inline base64 image in prompt (image fetched and encoded at runtime) ---
   {
-    name: "image_tool_result_xml",
-    prompt: PROMPTS.imageToolResult,
-    agentType: "agent_all_xml",
-    description: "Tool result with image - XML format, tests read_image_raw tool",
+    name: 'image_base64_in_prompt',
+    prompt: PROMPTS.imageBase64InPrompt,
+    agentType: 'agent_all_json',
+    endpoint: 'multipart',
+    files: [{ filename: 'currency_receipt_usd_jpy.png', mimeType: 'image/png', url: IMAGE_PATH }],
+    description: 'Real image uploaded via multipart - tests image content in prompt',
+  },
+
+  // --- NEW: Literal newlines / backslash ---
+  {
+    name: 'literal_newlines_backslash',
+    prompt: PROMPTS.literalNewlines,
+    agentType: 'agent_all_json',
+    description: 'Backslash and newline character rendering in streamed text',
+  },
+
+  // --- NEW: Multipart image upload ---
+  {
+    name: 'multipart_image_upload',
+    prompt: PROMPTS.multipartImageUpload,
+    agentType: 'agent_all_json',
+    endpoint: 'multipart',
+    files: [{ filename: 'currency_receipt_usd_jpy.png', mimeType: 'image/png', url: IMAGE_PATH }],
+    description: 'Image file uploaded via multipart/form-data endpoint',
+  },
+
+  // --- NEW: Multipart PDF upload ---
+  {
+    name: 'multipart_pdf_upload',
+    prompt: PROMPTS.multipartPdfUpload,
+    agentType: 'agent_all_json',
+    endpoint: 'multipart',
+    files: [{ filename: 'Claude-3-Model-Card.pdf', mimeType: 'application/pdf', url: PDF_URL }],
+    description: 'PDF file uploaded via multipart/form-data endpoint',
+  },
+
+  // --- NEW: Multipart text only (no files) ---
+  {
+    name: 'multipart_text_only',
+    prompt: PROMPTS.multipartTextOnly,
+    agentType: 'agent_all_json',
+    endpoint: 'multipart',
+    description: 'Multipart endpoint with text only, no file attachments',
+  },
+
+  // --- NEW: Multipart unsupported file type (expect 400) ---
+  {
+    name: 'multipart_unsupported_file',
+    prompt: PROMPTS.multipartUnsupportedFile,
+    agentType: 'agent_all_json',
+    endpoint: 'multipart',
+    files: [{ filename: 'data.csv', mimeType: 'text/csv', content: CSV_B64 }],
+    expectError: 400,
+    description: 'Unsupported file type rejected with HTTP 400',
+  },
+
+  // --- NEW: Skills - Excel spreadsheet ---
+  {
+    name: 'skills_xlsx',
+    prompt: PROMPTS.skillsXlsx,
+    agentType: 'agent_skills',
+    description: 'Anthropic Skills - Excel spreadsheet generation via code_execution',
+  },
+
+  // --- NEW: Skills - PowerPoint presentation ---
+  {
+    name: 'skills_pptx',
+    prompt: PROMPTS.skillsPptx,
+    agentType: 'agent_skills',
+    description: 'Anthropic Skills - PowerPoint presentation generation via code_execution',
   },
 ];
 
@@ -317,13 +354,12 @@ export const TEST_CASES: TestCase[] = [
  */
 export function getTestCases(filter?: string): TestCase[] {
   if (!filter) return TEST_CASES;
-  return TEST_CASES.filter(tc => tc.name.includes(filter));
+  return TEST_CASES.filter((tc) => tc.name.includes(filter));
 }
 
 /**
  * Get a single test case by exact name.
  */
 export function getTestCase(name: string): TestCase | undefined {
-  return TEST_CASES.find(tc => tc.name === name);
+  return TEST_CASES.find((tc) => tc.name === name);
 }
-

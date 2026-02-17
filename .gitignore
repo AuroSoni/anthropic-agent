@@ -9,3 +9,4 @@ temp/
 *.egg-info/
 temp_logs/
 agent_data/
+demos/fastapi_server/workspace/
