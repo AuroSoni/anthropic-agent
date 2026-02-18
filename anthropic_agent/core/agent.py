@@ -878,6 +878,12 @@ class AnthropicAgent:
                             "backend_results_count": len(tool_results),
                         }, step_number=step)
                         
+                        # Persist state to DB BEFORE emitting to client.
+                        # The client may immediately POST /tool_results upon
+                        # receiving the event; the DB must already contain the
+                        # updated pending_frontend_tools at that point.
+                        await self._save_agent_config()
+
                         # Emit all pending frontend tools to client
                         if queue is not None:
                             active_fmt = formatter if formatter is not None else self.formatter
@@ -890,9 +896,6 @@ class AnthropicAgent:
                             else:
                                 tools_json = html.escape(json.dumps(self._pending_frontend_tools), quote=True)
                                 await queue.put(f'<awaiting_frontend_tools data="{tools_json}"></awaiting_frontend_tools>')
-                        
-                        # Persist state to DB before returning (required for re-hydration)
-                        await self._save_agent_config()
 
                         # Clear subagent context before returning
                         self._inject_subagent_context(None, None)
@@ -1636,6 +1639,12 @@ class AnthropicAgent:
                             "backend_results_count": len(tool_results),
                         }, step_number=step)
 
+                        # Persist state to DB BEFORE emitting to client.
+                        # The client may immediately POST /tool_results upon
+                        # receiving the event; the DB must already contain the
+                        # updated pending_frontend_tools at that point.
+                        await self._save_agent_config()
+
                         # Emit all pending frontend tools to client
                         if queue is not None:
                             active_fmt = formatter if formatter is not None else self.formatter
@@ -1648,9 +1657,6 @@ class AnthropicAgent:
                             else:
                                 tools_json = html.escape(json.dumps(self._pending_frontend_tools), quote=True)
                                 await queue.put(f'<awaiting_frontend_tools data="{tools_json}"></awaiting_frontend_tools>')
-                        
-                        # Persist state to DB before returning (required for re-hydration)
-                        await self._save_agent_config()
 
                         # Clear subagent context before returning
                         self._inject_subagent_context(None, None)
