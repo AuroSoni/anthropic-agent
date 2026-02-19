@@ -1,21 +1,42 @@
 """Context compaction strategies for managing message history size.
 
-This module provides pluggable compaction strategies that can reduce the size
-of conversation history by removing or summarizing old messages, tool results,
-and assistant turns.
+Compactors are the agent's **within-session context window managers**. Their
+sole responsibility is keeping the live message list (``self.messages``) under
+the model's token budget so the agent can continue operating without hitting
+context limits.
+
+A compactor is self-sufficient: it reads the current message chain, decides
+whether compaction is needed, and returns a (possibly shortened) message list
+together with metadata describing what it did. Compactors never interact with
+the memory store — they are independent systems that operate at different
+points in the agent lifecycle.
+
+Available strategies (via ``CompactorType``):
+
+* ``SlidingWindowCompactor`` — progressive multi-phase compaction (default).
+* ``SummarizingCompactor`` — LLM-based summarization of older history.
+* ``ToolResultRemovalCompactor`` — strips / replaces old tool results.
+* ``NoOpCompactor`` — pass-through, compaction disabled.
+
+See also ``anthropic_agent.memory.stores`` for the cross-session knowledge
+layer, which operates at run boundaries and is independent of compaction.
 """
+
+from __future__ import annotations
 
 import json
 import copy
 from typing import Protocol, Literal, Any
 from datetime import datetime
 
+import anthropic
+
 from ..logging import get_logger
 
 logger = get_logger(__name__)
 
 # Type alias for compactor names
-CompactorType = Literal["sliding_window", "tool_result_removal", "none"]
+CompactorType = Literal["sliding_window", "tool_result_removal", "summarizing", "none"]
 
 # Default token thresholds for different models
 # These are set at ~80% of the model's context window to leave room for output
@@ -52,22 +73,58 @@ def get_model_token_limit(model: str) -> int:
     return MODEL_TOKEN_LIMITS["default"]
 
 
-def estimate_tokens(messages: list[dict]) -> int:
-    """Estimate token count of messages using simple heuristic.
-    
-    Uses ~4 characters per token as a rough approximation.
-    This is a simple heuristic and may not be accurate for all content types.
-    
-    Args:
-        messages: List of message dictionaries
-        
-    Returns:
-        Estimated token count
+ANTHROPIC_IMAGE_TOKEN_CAP = 1600
+
+
+def _count_images_and_strip(obj: Any) -> tuple[Any, int]:
+    """Return (*obj* with base64 image data removed, image count).
+
+    Image/document content blocks with base64 sources have their ``data``
+    field replaced with a short placeholder so that the downstream
+    character-based heuristic doesn't count megabytes of base64 as tokens.
     """
-    total_chars = 0
-    message_json = json.dumps(messages)
-    total_chars = len(message_json)
-    return total_chars // 4
+    if isinstance(obj, list):
+        stripped: list[Any] = []
+        count = 0
+        for item in obj:
+            s, c = _count_images_and_strip(item)
+            stripped.append(s)
+            count += c
+        return stripped, count
+
+    if isinstance(obj, dict):
+        source = obj.get("source")
+        if (
+            isinstance(source, dict)
+            and source.get("type") == "base64"
+            and "data" in source
+        ):
+            new_source = {k: v for k, v in source.items() if k != "data"}
+            new_source["data"] = "[binary]"
+            return {**obj, "source": new_source}, 1
+
+        rebuilt: dict[str, Any] = {}
+        count = 0
+        for k, v in obj.items():
+            s, c = _count_images_and_strip(v)
+            rebuilt[k] = s
+            count += c
+        return rebuilt, count
+
+    return obj, 0
+
+
+def estimate_tokens(messages: list[dict]) -> int:
+    """Estimate token count of messages using a character-based heuristic.
+
+    Uses ~4 characters per token for text content.  Base64 image/document
+    payloads are excluded from the character count and instead contribute a
+    fixed ``ANTHROPIC_IMAGE_TOKEN_CAP`` (1 600) tokens each, which matches
+    the upper bound of Anthropic's vision token pricing.
+    """
+    stripped, image_count = _count_images_and_strip(messages)
+    text_chars = len(json.dumps(stripped))
+    return (text_chars // 4) + (image_count * ANTHROPIC_IMAGE_TOKEN_CAP)
 
 
 class Compactor(Protocol):
@@ -78,11 +135,12 @@ class Compactor(Protocol):
     its own threshold and decision logic for when to compact.
     """
     
-    def compact(
+    async def compact(
         self, 
         messages: list[dict], 
         model: str,
-        estimated_tokens: int | None = None
+        estimated_tokens: int | None = None,
+        enable_cache_control: bool = False,
     ) -> tuple[list[dict], dict[str, Any]]:
         """Apply compaction strategy to messages.
         
@@ -91,6 +149,8 @@ class Compactor(Protocol):
             model: Model name being used (for model-specific decisions)
             estimated_tokens: Optional estimated token count from previous API response.
                 If provided, this is used instead of the heuristic estimation.
+            enable_cache_control: Whether to apply cache_control markers to compacted
+                messages. Used by compactors that produce new content (e.g. summaries).
             
         Returns:
             Tuple of (compacted_messages, metadata)
@@ -114,17 +174,8 @@ class NoOpCompactor:
         """
         self.threshold = threshold
     
-    def compact(self, messages: list[dict], model: str, estimated_tokens: int | None = None) -> tuple[list[dict], dict[str, Any]]:
-        """Return messages unchanged.
-        
-        Args:
-            messages: List of message dictionaries
-            model: Model name (ignored)
-            estimated_tokens: Estimated token count (ignored)
-            
-        Returns:
-            Tuple of (messages, empty_metadata)
-        """
+    async def compact(self, messages: list[dict], model: str, estimated_tokens: int | None = None, enable_cache_control: bool = False) -> tuple[list[dict], dict[str, Any]]:
+        """Return messages unchanged."""
         return messages, {
             "compaction_applied": False,
             "messages_removed": 0,
@@ -161,7 +212,7 @@ class ToolResultRemovalCompactor:
         self.threshold = threshold
         self.aggressive = aggressive
     
-    def compact(self, messages: list[dict], model: str, estimated_tokens: int | None = None) -> tuple[list[dict], dict[str, Any]]:
+    async def compact(self, messages: list[dict], model: str, estimated_tokens: int | None = None, enable_cache_control: bool = False) -> tuple[list[dict], dict[str, Any]]:
         """Apply tool result removal compaction strategy.
         
         Args:
@@ -169,6 +220,7 @@ class ToolResultRemovalCompactor:
             model: Model name being used (for model-specific threshold decisions)
             estimated_tokens: Optional estimated token count from previous API response.
                 If provided, this is used instead of the heuristic estimation.
+            enable_cache_control: Ignored by this compactor.
             
         Returns:
             Tuple of (compacted_messages, metadata)
@@ -397,11 +449,12 @@ class SlidingWindowCompactor:
             return self.threshold
         return get_model_token_limit(model)
     
-    def compact(
+    async def compact(
         self, 
         messages: list[dict], 
         model: str,
-        estimated_tokens: int | None = None
+        estimated_tokens: int | None = None,
+        enable_cache_control: bool = False,
     ) -> tuple[list[dict], dict[str, Any]]:
         """Apply progressive compaction until under threshold.
         
@@ -409,6 +462,7 @@ class SlidingWindowCompactor:
             messages: List of message dictionaries to compact
             model: Model name being used
             estimated_tokens: Optional estimated token count from previous API response
+            enable_cache_control: Ignored by this compactor.
             
         Returns:
             Tuple of (compacted_messages, metadata)
@@ -698,10 +752,180 @@ class SlidingWindowCompactor:
         return [first_message] + remaining, removed_count
 
 
+_DEFAULT_SUMMARY_PROMPT = """\
+You are a conversation summarizer. Given the conversation history below, \
+produce a concise structured summary preserving the following categories. \
+Omit any category that has no relevant content.
+
+**User Intent** — Original request and any refinements.
+**Completed Work** — Actions performed, identifiers, values produced.
+**Errors & Corrections** — What failed and how the user corrected it (quote corrections verbatim).
+**Active Work** — What was in progress, partial results.
+**Pending Tasks** — Remaining items.
+**Key References** — IDs, file paths, URLs, configuration values.
+
+Rules:
+- Be concise; prefer bullet points over prose.
+- Weight recent content more heavily than old content.
+- Omit pleasantries, filler, and meta-commentary.
+- Wrap your entire output in <session_summary> tags.
+"""
+
+class SummarizingCompactor:
+    """Compactor that uses an LLM to summarize older conversation history.
+
+    When the estimated token count exceeds the threshold, older messages are
+    sent to the LLM for summarization. The resulting summary replaces the
+    older messages, while recent turns are preserved verbatim. This follows
+    Anthropic's recommended pattern for context window management.
+    """
+
+    def __init__(
+        self,
+        client: anthropic.AsyncAnthropic,
+        threshold: int | None = None,
+        clear_at_least_tokens: int = 10_000,
+        keep_recent_turns: int = 5,
+        summary_model: str | None = None,
+        summary_prompt: str | None = None,
+    ):
+        self.client = client
+        self.threshold = threshold
+        self.clear_at_least_tokens = clear_at_least_tokens
+        self.keep_recent_turns = keep_recent_turns
+        self.summary_model = summary_model
+        self.summary_prompt = summary_prompt or _DEFAULT_SUMMARY_PROMPT
+
+    def _get_threshold(self, model: str) -> int:
+        if self.threshold is not None:
+            return self.threshold
+        return get_model_token_limit(model)
+
+    @staticmethod
+    def _split_at_turn_boundary(messages: list[dict], keep_count: int) -> tuple[list[dict], list[dict]]:
+        """Split messages into (to_summarize, to_keep) at a turn boundary.
+
+        A "turn" here is a contiguous group of messages starting with an
+        assistant message and including any immediately following user message
+        that carries tool results. We walk backwards from the end of
+        ``messages`` counting ``keep_count`` such turns, then split.
+        """
+        if keep_count <= 0 or len(messages) <= 1:
+            return messages, []
+
+        turns_found = 0
+        split_idx = len(messages)
+
+        i = len(messages) - 1
+        while i >= 1 and turns_found < keep_count:
+            msg = messages[i]
+            if msg.get("role") == "assistant":
+                turns_found += 1
+                split_idx = i
+            elif msg.get("role") == "user":
+                content = msg.get("content", [])
+                has_tool_result = isinstance(content, list) and any(
+                    isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+                )
+                if not has_tool_result:
+                    turns_found += 1
+                    split_idx = i
+            i -= 1
+
+        to_summarize = messages[:split_idx]
+        to_keep = messages[split_idx:]
+        return to_summarize, to_keep
+
+    async def compact(
+        self,
+        messages: list[dict],
+        model: str,
+        estimated_tokens: int | None = None,
+        enable_cache_control: bool = False,
+    ) -> tuple[list[dict], dict[str, Any]]:
+        threshold = self._get_threshold(model)
+        original_tokens = estimated_tokens if estimated_tokens is not None else estimate_tokens(messages)
+
+        if original_tokens <= threshold:
+            return messages, {
+                "compaction_applied": False,
+                "reason": "below_threshold",
+                "original_token_estimate": original_tokens,
+                "threshold": threshold,
+            }
+
+        if len(messages) <= 1:
+            return messages, {
+                "compaction_applied": False,
+                "reason": "insufficient_messages",
+                "original_token_estimate": original_tokens,
+                "threshold": threshold,
+            }
+
+        keep_turns = self.keep_recent_turns
+        to_summarize, to_keep = self._split_at_turn_boundary(messages, keep_turns)
+
+        # Iteratively move the split point until we would free enough tokens
+        summary_overhead_estimate = 1_500  # rough token budget for the summary itself
+        while keep_turns > 1:
+            kept_tokens = estimate_tokens(to_keep) + summary_overhead_estimate
+            freed = original_tokens - kept_tokens
+            if freed >= self.clear_at_least_tokens:
+                break
+            keep_turns -= 1
+            to_summarize, to_keep = self._split_at_turn_boundary(messages, keep_turns)
+
+        if not to_summarize:
+            return messages, {
+                "compaction_applied": False,
+                "reason": "nothing_to_summarize",
+                "original_token_estimate": original_tokens,
+                "threshold": threshold,
+            }
+
+        summary_model_used = self.summary_model or model
+
+        summary_response = await self.client.messages.create(
+            model=summary_model_used,
+            max_tokens=4096,
+            system=self.summary_prompt,
+            messages=to_summarize,
+        )
+        summary_text = summary_response.content[0].text
+
+        if not summary_text.startswith("<session_summary>"):
+            summary_text = f"<session_summary>\n{summary_text}\n</session_summary>"
+
+        summary_content_block: dict[str, Any] = {"type": "text", "text": summary_text}
+        if enable_cache_control:
+            summary_content_block["cache_control"] = {"type": "ephemeral"}
+
+        summary_message: dict[str, Any] = {
+            "role": "user",
+            "content": [summary_content_block],
+        }
+
+        compacted = [summary_message] + to_keep
+        final_tokens = estimate_tokens(compacted)
+
+        return compacted, {
+            "compaction_applied": True,
+            "original_token_estimate": original_tokens,
+            "final_token_estimate": final_tokens,
+            "estimated_tokens_saved": original_tokens - final_tokens,
+            "messages_summarized": len(to_summarize),
+            "messages_kept": len(to_keep),
+            "summary_model_used": summary_model_used,
+            "threshold": threshold,
+            "timestamp": datetime.now().isoformat(),
+        }
+
+
 # Compactor registry mapping string names to compactor classes
 COMPACTORS: dict[str, type[Compactor]] = {
     "sliding_window": SlidingWindowCompactor,
     "tool_result_removal": ToolResultRemovalCompactor,
+    "summarizing": SummarizingCompactor,
     "none": NoOpCompactor,
 }
 
@@ -713,22 +937,29 @@ def get_compactor(name: CompactorType, threshold: int | None = None, **kwargs) -
     """Get a compactor instance by name.
     
     Args:
-        name: Compactor name ("sliding_window", "tool_result_removal", or "none")
+        name: Compactor name ("sliding_window", "tool_result_removal",
+            "summarizing", or "none")
         threshold: Token count threshold for compaction. The compactor uses this to decide
-            when to compact. If None, model-specific defaults are used (for sliding_window)
-            or compaction is disabled (for other compactors).
-        **kwargs: Additional arguments to pass to the compactor constructor
-            (e.g., keep_recent_turns=10 for SlidingWindowCompactor)
+            when to compact. If None, model-specific defaults are used (for sliding_window
+            and summarizing) or compaction is disabled (for other compactors).
+        **kwargs: Additional arguments to pass to the compactor constructor.
+            For SummarizingCompactor a ``client`` (anthropic.AsyncAnthropic)
+            kwarg is required.
         
     Returns:
         An instance of the requested compactor
         
     Raises:
-        ValueError: If compactor name is not recognized
+        ValueError: If compactor name is not recognized or required kwargs missing.
     """
     if name not in COMPACTORS:
         raise ValueError(
             f"Unknown compactor '{name}'. Available compactors: {list(COMPACTORS.keys())}"
+        )
+    
+    if name == "summarizing" and "client" not in kwargs:
+        raise ValueError(
+            "SummarizingCompactor requires a 'client' (anthropic.AsyncAnthropic) kwarg."
         )
     
     compactor_class = COMPACTORS[name]

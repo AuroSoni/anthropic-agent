@@ -32,7 +32,7 @@ anthropic_agent/          # Main library package
 │   └── adapters/         # Concrete implementations per backend
 ├── file_backends/        # File storage (local filesystem, S3)
 ├── logging/              # Structured logging via structlog
-├── memory/               # Memory stores for context injection (ABC + registry)
+├── memory/               # Cross-session memory stores (retrieve/update at run boundaries)
 ├── common_tools/         # Built-in tools (code exec, glob, grep, read, patch)
 └── python_executors/     # Python code execution (AST evaluator, local executor)
 
@@ -84,4 +84,4 @@ config, conversation, run = create_adapters("filesystem", base_path="./data")
 - Build backend is **hatchling**
 - Retry logic uses exponential backoff for rate limits and transient API errors
 - Streaming formatters: `"xml"` (structured, default) and `"raw"` (unformatted)
-- Compaction strategies manage context window: `SlidingWindowCompactor` is the default (~160k tokens)
+- Compaction strategies manage context window: `SlidingWindowCompactor` (default, ~160k tokens), `SummarizingCompactor` (LLM-based summarization), `ToolResultRemovalCompactor`

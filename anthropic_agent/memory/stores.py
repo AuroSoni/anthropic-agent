@@ -1,7 +1,19 @@
-"""Memory store implementations for semantic context injection.
+"""Memory store implementations for persistent cross-session knowledge.
 
-This module defines the MemoryStore protocol and provides placeholder implementations.
-Real implementations (vector-based, semantic, etc.) will be added in future iterations.
+Memory stores are the agent's **cross-session knowledge managers**. They
+operate strictly at run boundaries — ``retrieve()`` at the start of a run to
+inject relevant prior knowledge, and ``update()`` at the end to extract and
+persist new learnings for future runs.
+
+Memory stores never participate in context compaction. Compaction (shrinking
+the live message list to fit the model's token budget) is handled entirely by
+the ``Compactor`` in ``anthropic_agent.core.compaction``. The two systems are
+independent: a compactor manages *within-session* context size, while a memory
+store manages *across-session* knowledge.
+
+This module defines the ``MemoryStore`` protocol and provides placeholder
+implementations. Real implementations (vector-based, semantic, etc.) will be
+added in future iterations.
 """
 
 from typing import Protocol, Literal, Any
@@ -18,9 +30,9 @@ MemoryStoreType = Literal["placeholder", "none"]
 class MemoryStore(Protocol):
     """Protocol for memory store implementations.
     
-    Memory stores manage semantic context that can be injected into agent
-    conversations for more accurate and faster responses. They integrate
-    with the agent's compaction lifecycle to preserve important information.
+    Memory stores manage persistent cross-session knowledge that can be
+    injected into agent conversations. They operate at run boundaries only:
+    retrieve at start, update at end. Independent of context compaction.
     """
     
     def retrieve(
@@ -71,51 +83,6 @@ class MemoryStore(Protocol):
             This will be logged to agent_logs.
         """
         ...
-    
-    def before_compact(
-        self,
-        messages: list[dict],
-        model: str
-    ) -> None:
-        """Extract information before compaction removes it.
-        
-        Called before compaction is applied. The memory store can extract
-        and preserve important information that may be removed during compaction.
-        This method modifies internal memory store state only.
-        
-        Args:
-            messages: Messages about to be compacted
-            model: Model name being used
-            
-        Returns:
-            None - modifies internal state only
-        """
-        ...
-    
-    def after_compact(
-        self,
-        original_messages: list[dict],
-        compacted_messages: list[dict],
-        model: str
-    ) -> tuple[list[dict], dict[str, Any]]:
-        """Process compaction results and optionally update messages.
-        
-        Called after compaction is applied. The memory store can:
-        1. Analyze what was removed
-        2. Inject replacement context if needed
-        3. Return updated compacted messages
-        
-        Args:
-            original_messages: Messages before compaction
-            compacted_messages: Messages after compaction
-            model: Model name being used
-            
-        Returns:
-            Tuple of (updated_compacted_messages, metadata)
-            - updated_compacted_messages: Potentially modified compacted messages
-            - metadata: Dict with info about memory operations for agent_logs
-        """
-        ...
 
 
 class NoOpMemoryStore:
@@ -157,25 +124,6 @@ class NoOpMemoryStore:
             "memories_updated": 0
         }
     
-    def before_compact(
-        self,
-        messages: list[dict],
-        model: str
-    ) -> None:
-        """No-op before compaction."""
-        pass
-    
-    def after_compact(
-        self,
-        original_messages: list[dict],
-        compacted_messages: list[dict],
-        model: str
-    ) -> tuple[list[dict], dict[str, Any]]:
-        """Return compacted messages unchanged."""
-        return compacted_messages, {
-            "store_type": "none",
-            "memories_injected": 0
-        }
 
 
 class PlaceholderMemoryStore:
@@ -268,56 +216,6 @@ class PlaceholderMemoryStore:
             "note": "Placeholder - no actual storage performed"
         }
     
-    def before_compact(
-        self,
-        messages: list[dict],
-        model: str
-    ) -> None:
-        """Extract information before compaction removes it.
-        
-        TODO: Implement pre-compaction extraction:
-        1. Identify important information in messages
-        2. Extract facts, entities, relationships
-        3. Store temporarily for potential re-injection
-        4. Update internal memory state
-        
-        Current behavior: No extraction.
-        """
-        # TODO: Extract important info before it's removed
-        # Example:
-        # - Find tool results with important data
-        # - Extract facts from assistant responses
-        # - Store for potential re-injection after compaction
-        
-        pass
-    
-    def after_compact(
-        self,
-        original_messages: list[dict],
-        compacted_messages: list[dict],
-        model: str
-    ) -> tuple[list[dict], dict[str, Any]]:
-        """Process compaction results and optionally update messages.
-        
-        TODO: Implement post-compaction processing:
-        1. Compare original vs compacted to see what was removed
-        2. Decide if removed context needs replacement
-        3. Inject summarized/semantic versions if needed
-        4. Return updated messages with injected context
-        
-        Current behavior: Returns compacted messages unchanged.
-        """
-        # TODO: Analyze compaction and inject replacement context
-        # Example:
-        # - If important tool results were removed, inject summaries
-        # - If key facts were lost, re-inject from memory store
-        
-        return compacted_messages, {
-            "store_type": "placeholder",
-            "messages_removed": messages_removed,
-            "memories_injected": 0,
-            "note": "Placeholder - no actual memory injection performed"
-        }
 
 
 # Memory store registry mapping string names to store classes
