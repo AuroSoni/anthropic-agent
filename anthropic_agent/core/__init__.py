@@ -11,6 +11,7 @@ from .compaction import (
     NoOpCompactor,
     ToolResultRemovalCompactor,
     SlidingWindowCompactor,
+    SummarizingCompactor,
     estimate_tokens,
 )
 
@@ -26,6 +27,7 @@ __all__ = [
     'NoOpCompactor',
     'ToolResultRemovalCompactor',
     'SlidingWindowCompactor',
+    'SummarizingCompactor',
     'estimate_tokens',
 ]
 

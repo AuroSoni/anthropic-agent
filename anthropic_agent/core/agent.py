@@ -515,8 +515,9 @@ class AnthropicAgent:
         elif isinstance(compactor, str):
             if compactor == "none":
                 self.compactor = None
+            elif compactor == "summarizing":
+                self.compactor = get_compactor(compactor, client=self.client)
             else:
-                # String name provided - create compactor with default settings
                 self.compactor = get_compactor(compactor)
         else:
             # Pre-configured Compactor instance provided
@@ -784,7 +785,7 @@ class AnthropicAgent:
             
             # Always pass through compactor (it decides whether to compact)
             if self.compactor:
-                self._apply_compaction(step_number=step)  # self._last_known_input_tokens is used here.
+                await self._apply_compaction(step_number=step)
             
             # Prepare request parameters
             request_params = self._prepare_request_params()
@@ -1552,7 +1553,7 @@ class AnthropicAgent:
             
             # Always pass through compactor (it decides whether to compact)
             if self.compactor:
-                self._apply_compaction(step_number=step)
+                await self._apply_compaction(step_number=step)
             
             # Prepare request parameters
             request_params = self._prepare_request_params()
@@ -1780,15 +1781,12 @@ class AnthropicAgent:
         self._inject_subagent_context(None, None)
         return await self._generate_final_summary(queue=queue, formatter=formatter)
 
-    def _apply_compaction(self, step_number: int = 0) -> None:
+    async def _apply_compaction(self, step_number: int = 0) -> None:
         """Apply compaction to self.messages and log the event.
         
         This method is called before each API call. The compactor itself decides
         whether compaction is needed based on its internal threshold and logic.
         If compaction is applied, the event is logged to agent_logs with metadata.
-        
-        Memory integration: If a memory store is configured, it is called before
-        and after compaction to extract and preserve important information.
         
         Args:
             step_number: Current step number in the agent loop (for logging)
@@ -1796,40 +1794,23 @@ class AnthropicAgent:
         if not self.compactor:
             return
         
-        # Before compaction: Let memory store extract info
-        if self.memory_store:
-            self.memory_store.before_compact(self.messages, self.model)
-        
-        # Preserve original for after_compact
-        original_messages = self.messages.copy() if self.memory_store else None
-        
-        # Estimate current context: last_input
         estimated_tokens = self._last_known_input_tokens
         
-        # Compact
-        compacted, metadata = self.compactor.compact(self.messages, self.model, estimated_tokens=estimated_tokens)
+        compacted, metadata = await self.compactor.compact(
+            self.messages, self.model,
+            estimated_tokens=estimated_tokens,
+            enable_cache_control=self.enable_cache_control,
+        )
         
-        # Only update messages if compaction was actually applied
         if metadata.get("compaction_applied", False):
             self.messages = compacted
             
-            # After compaction: Let memory store update compacted messages
-            if self.memory_store:
-                self.messages, after_meta = self.memory_store.after_compact(
-                    original_messages=original_messages,
-                    compacted_messages=self.messages,
-                    model=self.model
-                )
-                metadata["memory"] = after_meta
-            
-            # Log compaction with memory metadata
             self.agent_logs.append({
                 "timestamp": datetime.now().isoformat(),
                 "action": "compaction",
                 "details": metadata
             })
             
-            # Log: compaction applied (to run logs buffer)
             self._log_action("compaction", metadata, step_number=step_number)
             
             logger.info("Compaction applied", **metadata)
@@ -1943,7 +1924,7 @@ class AnthropicAgent:
         
         # Apply compaction before final call
         if self.compactor:
-            self._apply_compaction(step_number=self.max_steps)
+            await self._apply_compaction(step_number=self.max_steps)
         
         # Create temporary system prompt for summary
         summary_system_prompt = (
@@ -2094,7 +2075,7 @@ class AnthropicAgent:
         # Return AgentResult with final summary
         return result
     
-    def compact_messages(self) -> dict[str, Any]:
+    async def compact_messages(self) -> dict[str, Any]:
         """Explicitly trigger compaction on message history.
         
         This method can be called manually to request compaction of the message
@@ -2110,7 +2091,11 @@ class AnthropicAgent:
             return {"error": "No compactor configured"}
         
         estimated_tokens = self._last_known_input_tokens
-        compacted, metadata = self.compactor.compact(self.messages, self.model, estimated_tokens)
+        compacted, metadata = await self.compactor.compact(
+            self.messages, self.model,
+            estimated_tokens=estimated_tokens,
+            enable_cache_control=self.enable_cache_control,
+        )
         
         # Update messages if compaction was applied
         if metadata.get("compaction_applied", False):
