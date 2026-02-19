@@ -1805,6 +1805,7 @@ class AnthropicAgent:
             self.messages, self.model,
             estimated_tokens=estimated_tokens,
             enable_cache_control=self.enable_cache_control,
+            system_prompt=self.system_prompt,
         )
         
         if metadata.get("compaction_applied", False):
@@ -2100,6 +2101,7 @@ class AnthropicAgent:
             self.messages, self.model,
             estimated_tokens=estimated_tokens,
             enable_cache_control=self.enable_cache_control,
+            system_prompt=self.system_prompt,
         )
         
         # Update messages if compaction was applied

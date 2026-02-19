@@ -4,8 +4,9 @@ Major Upgrades:
     ☐ JSON formatter parsing for frontend.
     ☐ Frontend UI State with new primitives: Todo, Planning, Subagents.
 
-Critical Bugs:
+Major Bugs:
     ☐ Abrupt stream end in Server tools with web search tools. In special cases for web fetch? 
+    ☐ Fix the message construction, caching and summarization in SummarizingCompactor.
 
 Minor Fixes:
     ☐ Improve title generation logic. Save it per conversation.
@@ -15,3 +16,4 @@ Minor Fixes:
 Potential Improvements:
     ☐ Better agent run logging for deeper analytics.
     ☐ Integrated handling of attachments in the agent. Direct token estimation.
+    ☐ Create a proactive memory based compactor for instant compaction.

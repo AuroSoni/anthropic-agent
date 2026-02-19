@@ -31,6 +31,7 @@ from typing import Literal, Any
 from datetime import datetime
 
 import anthropic
+from anthropic.types import thinking_block
 
 from ..logging import get_logger
 from .token_counting import estimate_tokens, get_model_token_limit
@@ -59,6 +60,7 @@ class Compactor(ABC):
         model: str,
         estimated_tokens: int | None = None,
         enable_cache_control: bool = False,
+        system_prompt: str | None = None,
     ) -> tuple[list[dict], dict[str, Any]]:
         """Apply compaction strategy to messages.
         
@@ -69,6 +71,9 @@ class Compactor(ABC):
                 If provided, this is used instead of the heuristic estimation.
             enable_cache_control: Whether to apply cache_control markers to compacted
                 messages. Used by compactors that produce new content (e.g. summaries).
+            system_prompt: The main chat system prompt. Used by SummarizingCompactor
+                to share the cached prefix from the main chat's API call, enabling
+                prompt cache hits on the summarization call.
             
         Returns:
             Tuple of (compacted_messages, metadata)
@@ -92,7 +97,7 @@ class NoOpCompactor(Compactor):
         """
         self.threshold = threshold
     
-    async def compact(self, messages: list[dict], model: str, estimated_tokens: int | None = None, enable_cache_control: bool = False) -> tuple[list[dict], dict[str, Any]]:
+    async def compact(self, messages: list[dict], model: str, estimated_tokens: int | None = None, enable_cache_control: bool = False, system_prompt: str | None = None) -> tuple[list[dict], dict[str, Any]]:
         """Return messages unchanged."""
         return messages, {
             "compaction_applied": False,
@@ -130,7 +135,7 @@ class ToolResultRemovalCompactor(Compactor):
         self.threshold = threshold
         self.aggressive = aggressive
     
-    async def compact(self, messages: list[dict], model: str, estimated_tokens: int | None = None, enable_cache_control: bool = False) -> tuple[list[dict], dict[str, Any]]:
+    async def compact(self, messages: list[dict], model: str, estimated_tokens: int | None = None, enable_cache_control: bool = False, system_prompt: str | None = None) -> tuple[list[dict], dict[str, Any]]:
         """Apply tool result removal compaction strategy.
         
         Args:
@@ -139,6 +144,7 @@ class ToolResultRemovalCompactor(Compactor):
             estimated_tokens: Optional estimated token count from previous API response.
                 If provided, this is used instead of the heuristic estimation.
             enable_cache_control: Ignored by this compactor.
+            system_prompt: Ignored by this compactor.
             
         Returns:
             Tuple of (compacted_messages, metadata)
@@ -373,6 +379,7 @@ class SlidingWindowCompactor(Compactor):
         model: str,
         estimated_tokens: int | None = None,
         enable_cache_control: bool = False,
+        system_prompt: str | None = None,
     ) -> tuple[list[dict], dict[str, Any]]:
         """Apply progressive compaction until under threshold.
         
@@ -381,6 +388,7 @@ class SlidingWindowCompactor(Compactor):
             model: Model name being used
             estimated_tokens: Optional estimated token count from previous API response
             enable_cache_control: Ignored by this compactor.
+            system_prompt: Ignored by this compactor.
             
         Returns:
             Tuple of (compacted_messages, metadata)
@@ -671,9 +679,8 @@ class SlidingWindowCompactor(Compactor):
 
 
 _DEFAULT_SUMMARY_PROMPT = """\
-You are a conversation summarizer. Given the conversation history below, \
-produce a concise structured summary preserving the following categories. \
-Omit any category that has no relevant content.
+Summarize the conversation history above into a concise structured summary \
+preserving the following categories. Omit any category that has no relevant content.
 
 **User Intent** — Original request and any refinements.
 **Completed Work** — Actions performed, identifiers, values produced.
@@ -720,6 +727,38 @@ class SummarizingCompactor(Compactor):
         return get_model_token_limit(model)
 
     @staticmethod
+    def _add_cache_control_to_messages(messages: list[dict]) -> list[dict]:
+        """Add cache_control breakpoint to the last user message for prompt caching.
+
+        Returns a deep copy with ``cache_control: {"type": "ephemeral"}``
+        applied to the last content block of the last user message. This
+        mirrors the cookbook's ``add_cache_control()`` pattern so the
+        summarization call can share the cached prefix from the main chat.
+        """
+        cached = copy.deepcopy(messages)
+        for msg in reversed(cached):
+            if msg.get("role") == "user":
+                content = msg.get("content")
+                if isinstance(content, str):
+                    msg["content"] = [{
+                        "type": "text",
+                        "text": content,
+                        "cache_control": {"type": "ephemeral"},
+                    }]
+                elif isinstance(content, list) and content:
+                    last_block = content[-1]
+                    if isinstance(last_block, dict):
+                        last_block["cache_control"] = {"type": "ephemeral"}
+                break
+        return cached
+
+    @staticmethod
+    def _strip_thinking_tags(text: str) -> str:
+        """Strip ``<think>...</think>`` blocks that inflate summaries."""
+        import re
+        return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL).strip()
+
+    @staticmethod
     def _split_at_turn_boundary(messages: list[dict], keep_count: int) -> tuple[list[dict], list[dict]]:
         """Split messages into (to_summarize, to_keep) at a turn boundary.
 
@@ -760,6 +799,7 @@ class SummarizingCompactor(Compactor):
         model: str,
         estimated_tokens: int | None = None,
         enable_cache_control: bool = False,
+        system_prompt: str | None = None,
     ) -> tuple[list[dict], dict[str, Any]]:
         threshold = self._get_threshold(model)
         original_tokens = estimated_tokens if estimated_tokens is not None else estimate_tokens(messages)
@@ -786,6 +826,7 @@ class SummarizingCompactor(Compactor):
         # Iteratively move the split point until we would free enough tokens
         summary_overhead_estimate = 1_500  # rough token budget for the summary itself
         while keep_turns > 1:
+            # TODO: Can optimize the iteration logic to be faster.
             kept_tokens = estimate_tokens(to_keep) + summary_overhead_estimate
             freed = original_tokens - kept_tokens
             if freed >= self.clear_at_least_tokens:
@@ -803,20 +844,30 @@ class SummarizingCompactor(Compactor):
 
         summary_model_used = self.summary_model or model
 
+        # FIXME: Check that the cache marker does not leak into the collected messages.
+        cached_messages = self._add_cache_control_to_messages(to_summarize)
+        cached_messages.append({"role": "user", "content": self.summary_prompt})
+
+        #TODO: May need to inherit from parent agent config.
         summary_response = await self.client.messages.create(
             model=summary_model_used,
-            max_tokens=4096,
-            system=self.summary_prompt,
-            messages=to_summarize,
+            max_tokens=64000,
+            thinking={
+                "type": "enabled",
+                "budget_tokens": 12400,
+            },
+            system=system_prompt,
+            messages=cached_messages,
         )
-        summary_text = summary_response.content[0].text
+        summary_text = self._strip_thinking_tags(summary_response.content[0].text)
 
         if not summary_text.startswith("<session_summary>"):
             summary_text = f"<session_summary>\n{summary_text}\n</session_summary>"
 
         summary_content_block: dict[str, Any] = {"type": "text", "text": summary_text}
         if enable_cache_control:
-            summary_content_block["cache_control"] = {"type": "ephemeral"}
+            # summary_content_block["cache_control"] = {"type": "ephemeral"} # No need to add cache control here since the agent automatically injects them when preparing the request parameters.
+            pass
 
         summary_message: dict[str, Any] = {
             "role": "user",
