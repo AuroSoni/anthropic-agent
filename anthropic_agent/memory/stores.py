@@ -16,7 +16,8 @@ implementations. Real implementations (vector-based, semantic, etc.) will be
 added in future iterations.
 """
 
-from typing import Protocol, Literal, Any
+from abc import ABC, abstractmethod
+from typing import Literal, Any
 from datetime import datetime
 
 from ..logging import get_logger
@@ -27,14 +28,18 @@ logger = get_logger(__name__)
 MemoryStoreType = Literal["placeholder", "none"]
 
 
-class MemoryStore(Protocol):
-    """Protocol for memory store implementations.
+class MemoryStore(ABC):
+    """Abstract base class for memory store implementations.
     
     Memory stores manage persistent cross-session knowledge that can be
     injected into agent conversations. They operate at run boundaries only:
     retrieve at start, update at end. Independent of context compaction.
+    
+    All concrete memory stores must inherit from this class and implement
+    both ``retrieve()`` and ``update()``.
     """
     
+    @abstractmethod
     def retrieve(
         self,
         tools: list[dict],
@@ -60,6 +65,7 @@ class MemoryStore(Protocol):
         """
         ...
     
+    @abstractmethod
     def update(
         self,
         messages: list[dict],
@@ -85,7 +91,7 @@ class MemoryStore(Protocol):
         ...
 
 
-class NoOpMemoryStore:
+class NoOpMemoryStore(MemoryStore):
     """No-operation memory store that does nothing.
     
     Useful for disabling memory functionality or as a baseline.
@@ -126,7 +132,7 @@ class NoOpMemoryStore:
     
 
 
-class PlaceholderMemoryStore:
+class PlaceholderMemoryStore(MemoryStore):
     """Placeholder memory store for future implementation.
     
     This is a stub implementation that logs method calls and returns

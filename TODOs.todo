@@ -10,6 +10,8 @@ Critical Bugs:
 Minor Fixes:
     ☐ Improve title generation logic. Save it per conversation.
     ☐ Factor title generation cost in agent cost tracking.
+    ☐ Remove unnecessary redirect for token counting in @agent.py
 
 Potential Improvements:
     ☐ Better agent run logging for deeper analytics.
+    ☐ Integrated handling of attachments in the agent. Direct token estimation.

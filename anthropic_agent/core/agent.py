@@ -18,6 +18,11 @@ from .title_generator import generate_title
 from ..tools.base import ToolRegistry, ToolResultContent
 from ..streaming import FormatterType, _chunk_and_emit
 from .compaction import CompactorType, get_compactor, get_default_compactor, Compactor
+from .token_counting import (
+    estimate_tokens_heuristic,
+    count_tokens_api,
+    filter_messages_for_token_count,
+)
 from ..memory import MemoryStoreType, get_memory_store, MemoryStore
 from ..storage import (
     AgentConfig as StoredAgentConfig,
@@ -2126,47 +2131,10 @@ class AnthropicAgent:
         messages: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
         """Filter messages to remove content types unsupported by token counting API.
-        
-        The count_tokens endpoint doesn't support URL-based document sources
-        (especially PDFs). This method removes such blocks to prevent 400 errors.
-        
-        Args:
-            messages: List of message dicts to filter
-            
-        Returns:
-            Filtered messages list with unsupported content removed
+
+        Delegates to :func:`token_counting.filter_messages_for_token_count`.
         """
-        filtered: list[dict[str, Any]] = []
-        
-        for msg in messages:
-            content = msg.get("content")
-            
-            # Pass through messages without list content unchanged
-            if not isinstance(content, list):
-                filtered.append(msg)
-                continue
-            
-            # Filter content blocks
-            filtered_content: list[dict[str, Any]] = []
-            for block in content:
-                if not isinstance(block, dict):
-                    filtered_content.append(block)
-                    continue
-                
-                # Check for document blocks with URL sources
-                if block.get("type") == "document":
-                    source = block.get("source", {})
-                    if isinstance(source, dict) and source.get("type") == "url":
-                        # Skip URL-based documents (not supported by count_tokens)
-                        continue
-                
-                filtered_content.append(block)
-            
-            # Only include message if it still has content
-            if filtered_content:
-                filtered.append({"role": msg.get("role"), "content": filtered_content})
-        
-        return filtered
+        return filter_messages_for_token_count(messages)
     
     async def _count_tokens_api(
         self,
@@ -2179,70 +2147,23 @@ class AnthropicAgent:
         container: Optional[str],
     ) -> Optional[int]:
         """Best-effort token counting via Anthropic count_tokens API.
-        
+
         .. deprecated::
             This method is deprecated and will be removed in a future version.
             Use :meth:`_estimate_tokens` instead.
-        
-        Returns:
-            input_tokens from the API response, or None if the call fails.
+
+        Delegates to :func:`token_counting.count_tokens_api`.
         """
-        warnings.warn(
-            "_count_tokens_api is deprecated and will be removed in a future version. "
-            "Use _estimate_tokens instead.",
-            DeprecationWarning,
-            stacklevel=2
+        return await count_tokens_api(
+            client=self.client,
+            model=self.model,
+            messages=messages,
+            system=system,
+            tools=tools,
+            thinking=thinking,
+            betas=betas,
+            container=container,
         )
-        # Filter tools to only those supported by the count_tokens API.
-        # The endpoint currently only accepts a limited set of server tool
-        # types; passing unsupported types like "code_execution_20250825"
-        # results in 400 errors. We keep client tools (which typically
-        # have no "type" field) and allow only known server tool tags.
-        allowed_server_tool_types = {
-            "bash_20250124",
-            "custom",
-            "text_editor_20250124",
-            "text_editor_20250429",
-            "text_editor_20250728",
-            "web_search_20250305",
-        }
-
-        filtered_tools: list[dict[str, Any]] = []
-        if tools:
-            for tool in tools:
-                tool_type = tool.get("type")
-                # Client tools (no explicit type) are always allowed.
-                if tool_type is None or tool_type in allowed_server_tool_types:
-                    filtered_tools.append(tool)
-
-        # Filter messages to remove unsupported content types (e.g., URL PDF sources)
-        filtered_messages = self._filter_messages_for_token_count(messages)
-
-        params: dict[str, Any] = {
-            "model": self.model,
-            "messages": filtered_messages,
-        }
-        if system:
-            params["system"] = system
-        if filtered_tools:
-            params["tools"] = filtered_tools
-        if thinking:
-            params["thinking"] = thinking
-            
-        # Pass betas as extra headers since the count_tokens API doesn't support the 'betas' parameter directly
-        if betas:
-            params["extra_headers"] = {"anthropic-beta": ",".join(betas)}
-            
-        # if container:
-        #     params["container"] = container   # This is not supported by the count_tokens API
-        
-        logger.debug("Anthropic count_tokens params: %s", params)
-        try:
-            response = await self.client.messages.count_tokens(**params)
-            return getattr(response, "input_tokens", None)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("Token count API call failed", exc_info=True)
-            return None
     
     async def _estimate_tokens(
         self,
@@ -2250,52 +2171,22 @@ class AnthropicAgent:
         messages: Optional[list[dict[str, Any]]] = None,
         system: Optional[str] = None,
         tools: Optional[list[dict[str, Any]]] = None,
-        thinking: Optional[dict[str, Any]] = None,  # kept for signature compatibility
-        betas: Optional[list[str]] = None,  # kept for signature compatibility
-        container: Optional[str] = None,  # kept for signature compatibility
+        thinking: Optional[dict[str, Any]] = None,
+        betas: Optional[list[str]] = None,
+        container: Optional[str] = None,
     ) -> int:
         """Heuristically estimate token count for the given delta/context.
-        
-        Uses a simple character-count heuristic so it can be used cheaply on
-        small deltas like tool_result messages, while sharing I/O shape with
-        _count_tokens_api.
+
+        Delegates to :func:`token_counting.estimate_tokens_heuristic`.
         """
-        text_parts: list[str] = []
-        
-        if system:
-            text_parts.append(system)
-        
-        if tools:
-            try:
-                text_parts.append(json.dumps(tools, separators=(",", ":")))
-            except TypeError:
-                text_parts.append(str(tools))
-        
-        if messages:
-            for message in messages:
-                content = message.get("content")
-                if isinstance(content, str):
-                    text_parts.append(content)
-                elif isinstance(content, list):
-                    for block in content:
-                        if not isinstance(block, dict):
-                            continue
-                        if block.get("type") == "text" and "text" in block:
-                            text_parts.append(str(block["text"]))
-                        else:
-                            try:
-                                text_parts.append(json.dumps(block, separators=(",", ":"), ensure_ascii=False))
-                            except TypeError:
-                                text_parts.append(str(block))
-                elif isinstance(content, dict):
-                    try:
-                        text_parts.append(json.dumps(content, separators=(",", ":"), ensure_ascii=False))
-                    except TypeError:
-                        text_parts.append(str(content))
-        
-        full_text = " ".join(text_parts)
-        approx_tokens = max(0, len(full_text) // 4)
-        return approx_tokens
+        return estimate_tokens_heuristic(
+            messages=messages,
+            system=system,
+            tools=tools,
+            thinking=thinking,
+            betas=betas,
+            container=container,
+        )
     
     def _on_persistence_failure(
         self,

@@ -6,13 +6,15 @@ from .compaction import (
     CompactorType,
     get_compactor,
     get_default_compactor,
-    get_model_token_limit,
     Compactor,
     NoOpCompactor,
     ToolResultRemovalCompactor,
     SlidingWindowCompactor,
     SummarizingCompactor,
+)
+from .token_counting import (
     estimate_tokens,
+    get_model_token_limit,
 )
 
 __all__ = [

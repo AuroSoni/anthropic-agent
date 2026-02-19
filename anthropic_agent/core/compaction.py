@@ -26,115 +26,33 @@ from __future__ import annotations
 
 import json
 import copy
-from typing import Protocol, Literal, Any
+from abc import ABC, abstractmethod
+from typing import Literal, Any
 from datetime import datetime
 
 import anthropic
 
 from ..logging import get_logger
+from .token_counting import estimate_tokens, get_model_token_limit
 
 logger = get_logger(__name__)
 
 # Type alias for compactor names
 CompactorType = Literal["sliding_window", "tool_result_removal", "summarizing", "none"]
 
-# Default token thresholds for different models
-# These are set at ~80% of the model's context window to leave room for output
-MODEL_TOKEN_LIMITS: dict[str, int] = {
-    "claude-sonnet-4-5": 160_000,      # 200k context
-    "claude-opus-4": 160_000,          # 200k context
-    "claude-3-5-sonnet": 160_000,      # 200k context
-    "claude-3-opus": 160_000,          # 200k context  
-    "claude-3-sonnet": 160_000,        # 200k context
-    "claude-3-haiku": 160_000,         # 200k context
-    "claude-3-5-haiku": 160_000,       # 200k context
-    "default": 160_000,                # Safe default
-}
 
-
-def get_model_token_limit(model: str) -> int:
-    """Get the token limit threshold for a given model.
-    
-    Args:
-        model: Model name string
-        
-    Returns:
-        Token threshold for compaction (typically 80% of context window)
-    """
-    # Check for exact match first
-    if model in MODEL_TOKEN_LIMITS:
-        return MODEL_TOKEN_LIMITS[model]
-    
-    # Check for partial matches (e.g., "claude-sonnet-4-5-20250514")
-    for model_key, limit in MODEL_TOKEN_LIMITS.items():
-        if model_key in model.lower():
-            return limit
-    
-    return MODEL_TOKEN_LIMITS["default"]
-
-
-ANTHROPIC_IMAGE_TOKEN_CAP = 1600
-
-
-def _count_images_and_strip(obj: Any) -> tuple[Any, int]:
-    """Return (*obj* with base64 image data removed, image count).
-
-    Image/document content blocks with base64 sources have their ``data``
-    field replaced with a short placeholder so that the downstream
-    character-based heuristic doesn't count megabytes of base64 as tokens.
-    """
-    if isinstance(obj, list):
-        stripped: list[Any] = []
-        count = 0
-        for item in obj:
-            s, c = _count_images_and_strip(item)
-            stripped.append(s)
-            count += c
-        return stripped, count
-
-    if isinstance(obj, dict):
-        source = obj.get("source")
-        if (
-            isinstance(source, dict)
-            and source.get("type") == "base64"
-            and "data" in source
-        ):
-            new_source = {k: v for k, v in source.items() if k != "data"}
-            new_source["data"] = "[binary]"
-            return {**obj, "source": new_source}, 1
-
-        rebuilt: dict[str, Any] = {}
-        count = 0
-        for k, v in obj.items():
-            s, c = _count_images_and_strip(v)
-            rebuilt[k] = s
-            count += c
-        return rebuilt, count
-
-    return obj, 0
-
-
-def estimate_tokens(messages: list[dict]) -> int:
-    """Estimate token count of messages using a character-based heuristic.
-
-    Uses ~4 characters per token for text content.  Base64 image/document
-    payloads are excluded from the character count and instead contribute a
-    fixed ``ANTHROPIC_IMAGE_TOKEN_CAP`` (1 600) tokens each, which matches
-    the upper bound of Anthropic's vision token pricing.
-    """
-    stripped, image_count = _count_images_and_strip(messages)
-    text_chars = len(json.dumps(stripped))
-    return (text_chars // 4) + (image_count * ANTHROPIC_IMAGE_TOKEN_CAP)
-
-
-class Compactor(Protocol):
-    """Protocol for context compaction strategies.
+class Compactor(ABC):
+    """Abstract base class for context compaction strategies.
     
     Compactors take a list of messages and apply a strategy to reduce
     their size while preserving important context. Each compactor manages
     its own threshold and decision logic for when to compact.
+    
+    All concrete compactors must inherit from this class and implement
+    the ``compact()`` method.
     """
     
+    @abstractmethod
     async def compact(
         self, 
         messages: list[dict], 
@@ -160,7 +78,7 @@ class Compactor(Protocol):
         ...
 
 
-class NoOpCompactor:
+class NoOpCompactor(Compactor):
     """No-operation compactor that returns messages unchanged.
     
     Useful for disabling compaction or as a baseline comparison.
@@ -184,7 +102,7 @@ class NoOpCompactor:
         }
 
 
-class ToolResultRemovalCompactor:
+class ToolResultRemovalCompactor(Compactor):
     """Compactor that removes old tool results and assistant turns.
     
     Strategy:
@@ -383,7 +301,7 @@ class ToolResultRemovalCompactor:
         return filtered_messages, messages_removed
 
 
-class SlidingWindowCompactor:
+class SlidingWindowCompactor(Compactor):
     """Progressive compactor that applies multiple strategies until under threshold.
     
     This is the recommended default compactor for production use. It applies
@@ -771,7 +689,7 @@ Rules:
 - Wrap your entire output in <session_summary> tags.
 """
 
-class SummarizingCompactor:
+class SummarizingCompactor(Compactor):
     """Compactor that uses an LLM to summarize older conversation history.
 
     When the estimated token count exceeds the threshold, older messages are
