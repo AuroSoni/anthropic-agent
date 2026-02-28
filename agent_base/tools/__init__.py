@@ -1,6 +1,6 @@
 """Tool infrastructure — registry, decorator, envelope pattern, and configurable base."""
 
-from .types import ToolResultEnvelope, GenericErrorEnvelope, GenericTextEnvelope
+from .types import ToolResultEnvelope, GenericErrorEnvelope, GenericTextEnvelope, ToolSchema
 from .decorators import tool, ExecutorType
 from .base import ConfigurableToolBase
 from .registry import ToolRegistry, ToolCallInfo, ToolCallClassification, RegisteredTool
@@ -11,6 +11,8 @@ from .schema_utils import (
 )
 
 __all__ = [
+    # Schema
+    "ToolSchema",
     # Envelope types
     "ToolResultEnvelope",
     "GenericErrorEnvelope",

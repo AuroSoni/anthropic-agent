@@ -1,8 +1,7 @@
-from webbrowser import get
 from agent_base.core.agent_base import Agent
-from typing import Optional, Callable, Any
-from agent_base.core.config import AgentConfig, Conversation
+from agent_base.core.config import AgentConfig, Conversation, LLMConfig
 from agent_base.core.messages import Message
+from typing import Optional, Callable, Any
 from dataclasses import dataclass
 import uuid
 
@@ -13,8 +12,14 @@ DEFAULT_MAX_STEPS = 50
 DEFAULT_STREAM_FORMATTER = "json"
 DEFAULT_MAX_TOOL_RESULT_TOKENS = 25000
 
+
 @dataclass
-class AnthropicLLMConfig:
+class AnthropicLLMConfig(LLMConfig):
+    """Anthropic-specific LLM configuration.
+
+    Extends the base ``LLMConfig`` with fields specific to the
+    Anthropic API (extended thinking, server tools, skills, etc.).
+    """
     thinking_tokens: Optional[int] = None
     max_tokens: Optional[int] = None
     server_tools: list[dict[str, Any]] | None = None
@@ -191,42 +196,42 @@ class AnthropicAgent(Agent):
         if self.memory_store:
             memories = self.memory_store.retrieve(
                 user_message=prompt,
-                messages=self.agent_config.messages
+                messages=self.agent_config.context_messages
             )
             # Memory store returns the messages with memory context injected.
             # TODO: Extend the prompt message with the memories.
             prompt.content.extend(memories)
-        
+
         self.agent_config.add_message(prompt)
-        
+
         # Agent Loop
         return await self._resume_loop()
-        
-    
+
+
     async def run_stream(
-        self, 
-        prompt: str | Message , 
-        queue: asyncio.Queue, 
+        self,
+        prompt: str | Message ,
+        queue: asyncio.Queue,
         stream_formatter: str | StreamFormatter = DEFAULT_STREAM_FORMATTER
     ) -> AgentResult:
         if not self._initialized:
             await self.initialize()
-        
+
         if isinstance(prompt, str):
             prompt = Message(role="user", content=prompt)
-        
+
         # TODO: Check agent config and conversation for validity. Initialize run tracking.
         # Message chain is snapped into a valid state here.
         self.initialize_run(prompt)
-        
+
         #TODO: Stream meta init delta to the queue.
-        
+
         self.conversation.add_message(prompt)
-        
+
         if self.memory_store:
             memories = self.memory_store.retrieve(
                 user_message=prompt,
-                messages=self.agent_config.messages
+                messages=self.agent_config.context_messages
             )
             # Memory store returns the messages with memory context injected.
             # TODO: Extend the prompt message with the memories.
@@ -259,13 +264,13 @@ class AnthropicAgent(Agent):
             )
             
             if did_compact:
-                self.agent_config.messages = compacted_messages
+                self.agent_config.context_messages = compacted_messages
                 
             # TODO: Try catch the llm call for different errors apart from the retryable ones.
             if queue:
                 response_message: Message = await self.provider.generate_stream(
                     system_prompt=self.agent_config.system_prompt,
-                    messages=self.agent_config.messages,
+                    messages=self.agent_config.context_messages,
                     tool_schemas=self.agent_config.tool_schemas,
                     llm_config=self.agent_config.llm_config,
                     model=self.agent_config.model,
@@ -279,7 +284,7 @@ class AnthropicAgent(Agent):
             else:
                 response_message: Message = await self.provider.generate(
                     system_prompt=self.agent_config.system_prompt,
-                    messages=self.agent_config.messages,
+                    messages=self.agent_config.context_messages,
                     tool_schemas=self.agent_config.tool_schemas,
                     llm_config=self.agent_config.llm_config,
                     model=self.agent_config.model,

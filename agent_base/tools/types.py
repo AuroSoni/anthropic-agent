@@ -1,7 +1,30 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from agent_base.core.types import ContentBlock, TextContent
 from typing import Any
+
+
+@dataclass
+class ToolSchema:
+    """Canonical tool schema definition.
+
+    This is the framework's internal representation of a tool's interface.
+    Produced by ``ToolRegistry.get_schemas()`` and stored on ``AgentConfig``.
+    Provider-specific formatters (``MessageFormatter.format_tool_schemas()``)
+    convert these into whatever shape the provider API expects.
+
+    Fields:
+        name: Unique tool name (e.g., ``"read_file"``, ``"grep_search"``).
+        description: Human-readable description of what the tool does.
+            Used by the LLM to decide when to invoke the tool.
+        input_schema: JSON Schema dict defining the tool's parameters.
+            Follows the standard JSON Schema spec (type, properties,
+            required, etc.).
+    """
+    name: str
+    description: str
+    input_schema: dict[str, Any] = field(default_factory=dict)
+
 
 @dataclass
 class ToolResultEnvelope(ABC):

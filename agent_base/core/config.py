@@ -1,118 +1,294 @@
-from dataclasses import dataclass, field
-from typing import Any
-from agent_base.core.messages import Message
+"""Agent configuration, conversation, and supporting dataclasses.
 
-# --- Agent Config ---
+AgentConfig is the persistent agent session state, resumable across runs.
+Conversation is a single run record for UI display and pagination.
+LLMConfig is the base for provider-specific LLM configuration.
+PendingToolRelay captures state when the agent pauses for frontend/user tool responses.
+
+Serialization note: These dataclasses do NOT have to_dict()/from_dict() methods.
+Storage adapters are responsible for serialization/deserialization externally.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, TYPE_CHECKING
+
+from agent_base.core.messages import Message, Usage
+from agent_base.media_backend.types import MediaMetadata
+from agent_base.tools.types import ToolSchema
+
+if TYPE_CHECKING:
+    from agent_base.tools.registry import ToolCallInfo
+
+
+# ==============================================================================
+# LLM Configuration
+# ==============================================================================
+
+
+@dataclass
+class LLMConfig:
+    """Base LLM configuration. Provider-specific subclasses add their own fields.
+
+    Every LLM provider has unique configuration needs (thinking tokens,
+    server tools, beta headers, etc.). This empty base class provides a
+    common type for ``AgentConfig.llm_config`` so the core layer can
+    reference it without knowing provider details.
+
+    Provider subclasses (e.g., ``AnthropicLLMConfig``) extend this with
+    their specific fields. The ``provider`` field on ``AgentConfig``
+    tells storage adapters which subclass to reconstruct on load.
+
+    Example::
+
+        @dataclass
+        class AnthropicLLMConfig(LLMConfig):
+            thinking_tokens: int | None = None
+            max_tokens: int | None = None
+            server_tools: list[dict[str, Any]] | None = None
+    """
+
+
+# ==============================================================================
+# Pending Tool Relay
+# ==============================================================================
+
+
+@dataclass
+class PendingToolRelay:
+    """Persisted state when the agent loop is paused for frontend/user tool responses.
+
+    Created by the agent loop when ``ToolCallClassification.needs_relay``
+    is ``True``. The loop executes all backend tool calls immediately,
+    stores the results here alongside the pending frontend/confirmation
+    calls, then pauses. ``resume_with_relay_results()`` consumes this
+    state to continue the loop.
+
+    When ``AgentConfig.pending_relay`` is ``None``, no relay is pending.
+    When set, the agent is mid-turn awaiting external tool results.
+
+    Fields:
+        frontend_calls: Tool calls sent to the frontend for client-side
+            execution (e.g., UI-only tools like ``EnterPlanMode``).
+        confirmation_calls: Tool calls that require explicit user
+            approval before backend execution.
+        completed_results: Backend tool results already computed during
+            this turn, stored as ``Message`` objects containing
+            ``ToolResultContent`` blocks. These are combined with
+            incoming frontend/confirmation results on resumption.
+    """
+    frontend_calls: list[ToolCallInfo] = field(default_factory=list)
+    confirmation_calls: list[ToolCallInfo] = field(default_factory=list)
+    completed_results: list[Message] = field(default_factory=list)
+
+
+# ==============================================================================
+# Subagent Schema
+# ==============================================================================
+
+
+@dataclass
+class SubAgentSchema:
+    """Registration metadata for a subagent exposed as a tool.
+
+    When a subagent is registered with the parent agent, this schema
+    captures its identity. The actual tool schema (name, description,
+    input_schema) is auto-generated from the subagent definition and
+    registered separately in the ToolRegistry.
+
+    Fields:
+        name: The tool name under which this subagent is registered.
+        description: Human-readable description of the subagent's purpose.
+        agent_uuid: The subagent's unique identifier.
+    """
+    name: str
+    description: str
+    agent_uuid: str
+
+
+# ==============================================================================
+# Cost Breakdown
+# ==============================================================================
+
+
+@dataclass
+class CostBreakdown:
+    """Cost information for a single agent run.
+
+    Provides a ``total_cost`` for quick access and a ``breakdown``
+    dict for provider-specific cost line items. The breakdown keys
+    vary by provider (e.g., ``"input_cost"``, ``"output_cost"``,
+    ``"cache_read_cost"``, ``"thinking_cost"``).
+
+    Fields:
+        total_cost: Total cost in USD for this run.
+        breakdown: Per-category cost breakdown. Keys are provider-specific
+            cost categories, values are USD amounts.
+    """
+    total_cost: float = 0.0
+    breakdown: dict[str, float] = field(default_factory=dict)
+
+
+# ==============================================================================
+# Agent Config
+# ==============================================================================
+
 
 @dataclass
 class AgentConfig:
+    """Persistent agent session state, resumable across runs.
+
+    This is the canonical state object saved and loaded by storage adapters.
+    It contains everything needed to resume an agent session: the compacted
+    LLM context, tool configuration, provider settings, and relay state.
+
+    Fields are grouped by concern:
+
+    - **Identity**: ``agent_uuid``, ``description``, ``provider``, ``model``
+    - **LLM context**: ``context_messages`` (compacted), ``conversation_history`` (unabridged per-run)
+    - **Tools**: ``tool_schemas``, ``tool_names``, ``subagent_schemas``
+    - **Provider config**: ``llm_config`` (provider-specific ``LLMConfig`` subclass)
+    - **Components**: ``formatter``, ``compactor_type``, ``memory_store_type``
+    - **Media**: ``media_registry`` (keyed by ``media_id``)
+    - **Relay**: ``pending_relay`` (non-None when paused for frontend/user)
+    - **Hierarchy**: ``parent_agent_uuid``
+    - **Tracking**: ``current_step``, token counts, timestamps, ``total_runs``
+    - **Extension**: ``extras``
     """
-    Agent configuration and state for session resumption. Provider agnostic base class for all agent configs.
-    """
-    # TODO: Have proper default types for fresh agent initialization.
+
+    # --- Identity ---
     agent_uuid: str
-    
+
     # Core configuration
     description: str | None = None
     provider: str = ""
     model: str = ""
     max_steps: int = 50
     system_prompt: str | None = None
-    
-    # State for resumption
-    messages: list[Message] = field(default_factory=list)
-    
-    # Tools configuration
-    tool_schemas: list[dict] = field(default_factory=list)
+
+    # --- LLM Context ---
+
+    # The compacted message history sent to the LLM on each turn.
+    # Managed by the compactor — may be shorter than the full conversation.
+    context_messages: list[Message] = field(default_factory=list)
+
+    # The unabridged per-run conversation history.
+    # Not affected by compaction. Used for conversation logging and UI display.
+    conversation_history: list[Message] = field(default_factory=list)
+
+    # --- Tools ---
+
+    # Canonical tool schemas registered with the agent.
+    tool_schemas: list[ToolSchema] = field(default_factory=list)
     tool_names: list[str] = field(default_factory=list)
-    server_tools: list[dict] = field(default_factory=list)
-    
-    # Provider specific configuration. All provider specific details go here.
-    llm_config: dict[str, Any] = field(default_factory=dict) # TODO: Define a proper type for this.
-    
-    # Component configuration
+
+    # --- Provider-specific LLM configuration ---
+
+    # All provider-specific LLM parameters live here (e.g., thinking_tokens,
+    # max_tokens, beta_headers, server_tools for Anthropic). The ``provider``
+    # field tells storage adapters which LLMConfig subclass to reconstruct.
+    llm_config: LLMConfig = field(default_factory=LLMConfig)
+
+    # --- Component configuration ---
     formatter: str | None = None
     compactor_type: str | None = None
     memory_store_type: str | None = None
-    
-    # File registry
-    file_registry: dict[str, dict] = field(default_factory=dict)
-    # TODO: Change to MediaBackend
-    # TODO: Attach  Sandbox configuration.
-    
-    # Token tracking
-    # TODO: Make these as convinience property getters.
+
+    # --- Media registry ---
+
+    # Index of media files associated with this agent session.
+    # Keyed by media_id. The MediaBackend manages actual storage;
+    # this registry tracks what media exists for persistence/resumption.
+    media_registry: dict[str, MediaMetadata] = field(default_factory=dict)
+
+    # --- Token tracking ---
     last_known_input_tokens: int = 0
     last_known_output_tokens: int = 0
-    
-    # Frontend tool relay state
-    # TODO: Make these as convinience property getters?
-    pending_frontend_tools: list[dict] = field(default_factory=list)
-    pending_backend_results: list[dict] = field(default_factory=list)
-    
-    awaiting_frontend_tools: bool = False
-    current_step: int = 0
-    conversation_history: list[Message] = field(default_factory=list)   # The per run conversation history. Unabridged by compaction calls during the run.
 
-    # Subagent hierarchy
+    # --- Tool relay state ---
+
+    # Non-None when the agent is paused mid-turn waiting for frontend
+    # tool results or user confirmation. See PendingToolRelay.
+    pending_relay: PendingToolRelay | None = None
+
+    # --- Run tracking ---
+    current_step: int = 0
+
+    # --- Subagent hierarchy ---
     parent_agent_uuid: str | None = None
-    subagent_schemas: list[dict] = field(default_factory=list)
-    
-    # UI metadata
+    subagent_schemas: list[SubAgentSchema] = field(default_factory=list)
+
+    # --- UI metadata ---
     title: str | None = None
-    
-    # Timestamps
+
+    # --- Timestamps ---
     created_at: str | None = None
     updated_at: str | None = None
     last_run_at: str | None = None
     total_runs: int = 0
-    
-    # User extension point - store custom fields here
+
+    # --- User extension point ---
     extras: dict[str, Any] = field(default_factory=dict)
-    
-# --- Conversation ---
+
+
+# ==============================================================================
+# Conversation
+# ==============================================================================
+
 
 @dataclass
 class Conversation:
-    
-    """A single conversation/run record for UI display and pagination.
-    
-    All fields match the existing conversation_history schema.
+    """A single run record for UI display and pagination.
+
+    Each time ``Agent.run()`` is called, a new ``Conversation`` is created
+    to capture the full exchange for that run. This includes the user's
+    message, the agent's final response, all intermediate messages, and
+    run outcome metadata (stop reason, steps, usage, cost, generated files).
+
+    The ``sequence_number`` is auto-assigned by the storage adapter for
+    cursor-based pagination of an agent's run history.
     """
-    # TODO: Have proper default types for fresh agent initialization.
+
+    # --- Identity ---
     agent_uuid: str
-    run_id: str # The per run UUID.
-    
-    # Run timing
+    run_id: str
+
+    # --- Run timing ---
     started_at: str | None = None
     completed_at: str | None = None
-    
-    # User interaction
+
+    # --- User interaction ---
+
+    # The user message that initiated this run.
     user_message: Message | None = None
+    # The agent's final assistant response for this run.
     final_response: Message | None = None
-    
-    # Full conversation for this run
+
+    # --- Full conversation for this run ---
     messages: list[Message] = field(default_factory=list)
-    
-    # Run outcome
+
+    # --- Run outcome ---
     stop_reason: str | None = None
-    total_steps: int | None = None 
-    
-    # Token usage
-    usage: dict[str, int] = field(default_factory=dict)
-    
-    # Files generated in this run
-    # TODO: USe a better type here for generated media.
-    generated_files: list[dict] = field(default_factory=list)
+    total_steps: int | None = None
 
-    # Cost breakdown for this run (CostBreakdown as dict)
-    cost: dict[str, Any] = field(default_factory=dict)
+    # --- Token usage ---
 
-    # Sequence for pagination (auto-assigned)
+    # Cumulative token usage across all LLM turns in this run.
+    usage: Usage = field(default_factory=Usage)
+
+    # --- Generated files ---
+
+    # Media files created by tools during this run.
+    generated_files: list[MediaMetadata] = field(default_factory=list)
+
+    # --- Cost breakdown ---
+    cost: CostBreakdown | None = None
+
+    # --- Pagination ---
     sequence_number: int | None = None
-    
-    # Metadata
+
+    # --- Metadata ---
     created_at: str | None = None
-    
-    # User extension point
+
+    # --- User extension point ---
     extras: dict[str, Any] = field(default_factory=dict)
