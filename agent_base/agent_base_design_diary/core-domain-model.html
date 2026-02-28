@@ -462,6 +462,7 @@
     <a href="sandbox.html" class="nav-tab">Sandbox</a>
     <a href="media-backend.html" class="nav-tab">Media</a>
     <a href="file-coordination.html" class="nav-tab">Files</a>
+    <a href="storage.html" class="nav-tab">Storage</a>
     <a href="planned-systems.html" class="nav-tab">Planned</a>
   </div>
   <a href="tool-system.html" class="nav-arrow">&rarr;</a>
@@ -489,6 +490,9 @@
     <li><a href="#ch4"><span class="num">4</span> The Agent Contract</a></li>
     <li><a href="#ch5"><span class="num">5</span> Provider Mapping</a></li>
     <li><a href="#ch6"><span class="num">6</span> Connecting the Dots</a></li>
+    <li><a href="#ch7"><span class="num">7</span> Session State</a></li>
+    <li><a href="#ch8"><span class="num">8</span> Run Records</a></li>
+    <li><a href="#ch9"><span class="num">9</span> Supporting Cast</a></li>
   </ul>
 </nav>
 
@@ -872,6 +876,394 @@
   <div class="sep">· · ·</div>
 
   <p>The canonical model is the fulcrum of the entire architecture. Everything above it (tools, compaction, storage, streaming) speaks one language. Everything below it (Anthropic, OpenAI, LiteLLM) speaks its own language. The formatter translates between them. Add a new language by adding a translator. The core never changes.</p>
+</section>
+
+
+<!-- ================================================================ -->
+<!-- CHAPTER 7: SESSION STATE                                         -->
+<!-- ================================================================ -->
+<div class="chap" id="ch7"><span>Chapter 7 &mdash; Session State</span></div>
+
+<section class="entry">
+  <div class="entry-tag">AgentConfig &amp; LLMConfig</div>
+  <h2>Everything the Agent Needs to Resume</h2>
+
+  <p>An agent session isn't just a model name. It's a system prompt, a conversation history, tool schemas, media registries, provider-specific parameters, and tracking state. <code>AgentConfig</code> is the single dataclass that holds all of this:</p>
+
+  <div class="cw">
+    <div class="ch">
+      <div class="dt"><span></span><span></span><span></span></div>
+      <span class="fn">core/config.py &mdash; AgentConfig</span>
+      <span class="tg tg-type">Dataclass</span>
+    </div>
+<pre>
+<span class="k">@dataclass</span>
+<span class="k">class</span> <span class="t">AgentConfig</span>:
+    <span class="c"># Identity</span>
+    agent_uuid: <span class="t">str</span> = field(default_factory=<span class="k">lambda</span>: <span class="t">str</span>(uuid4()))
+    description: <span class="t">str</span> | <span class="t">None</span> = <span class="n">None</span>
+    provider: <span class="t">str</span> = <span class="s">""</span>
+    model: <span class="t">str</span> = <span class="s">""</span>
+    max_steps: <span class="t">int</span> = <span class="n">50</span>
+    system_prompt: <span class="t">str</span> | <span class="t">None</span> = <span class="n">None</span>
+
+    <span class="c"># LLM context</span>
+<span class="hl">    context_messages: <span class="t">list</span>[<span class="t">Message</span>] = field(default_factory=<span class="t">list</span>)</span>
+<span class="hl">    conversation_history: <span class="t">list</span>[<span class="t">Message</span>] = field(default_factory=<span class="t">list</span>)</span>
+
+    <span class="c"># Tools</span>
+<span class="hl">    tool_schemas: <span class="t">list</span>[<span class="t">ToolSchema</span>] = field(default_factory=<span class="t">list</span>)</span>
+    tool_names: <span class="t">list</span>[<span class="t">str</span>] = field(default_factory=<span class="t">list</span>)
+
+    <span class="c"># Provider config</span>
+<span class="hl">    llm_config: <span class="t">LLMConfig</span> = field(default_factory=<span class="t">LLMConfig</span>)</span>
+
+    <span class="c"># Media</span>
+<span class="hl">    media_registry: <span class="t">dict</span>[<span class="t">str</span>, <span class="t">MediaMetadata</span>] = field(default_factory=<span class="t">dict</span>)</span>
+
+    <span class="c"># Relay (frontend/confirmation tool calls)</span>
+<span class="hl">    pending_relay: <span class="t">PendingToolRelay</span> | <span class="t">None</span> = <span class="n">None</span></span>
+
+    <span class="c"># Hierarchy</span>
+    parent_agent_uuid: <span class="t">str</span> | <span class="t">None</span> = <span class="n">None</span>
+<span class="hl">    subagent_schemas: <span class="t">list</span>[<span class="t">SubAgentSchema</span>] = field(default_factory=<span class="t">list</span>)</span>
+
+    <span class="c"># Timestamps &amp; tracking</span>
+    title: <span class="t">str</span> | <span class="t">None</span> = <span class="n">None</span>
+    created_at: <span class="t">str</span> | <span class="t">None</span> = <span class="n">None</span>
+    total_runs: <span class="t">int</span> = <span class="n">0</span>
+    extras: <span class="t">dict</span>[<span class="t">str</span>, <span class="t">Any</span>] = field(default_factory=<span class="t">dict</span>)</pre>
+  </div>
+
+  <div class="th">
+    <span class="tl">Developer's inner voice</span>
+    "Every highlighted field used to be <code>dict</code> or <code>list[dict]</code> in the old <code>anthropic_agent</code>. A tool schema was a dict you hoped had the right keys. An LLM config was a dict that might or might not contain <code>thinking_tokens</code>. Now the types enforce structure at the Python level. You can't accidentally pass a media registry entry without a <code>media_type</code> field &mdash; the <code>MediaMetadata</code> dataclass won't let you."
+  </div>
+
+  <h3>LLMConfig: Polymorphic Provider Parameters</h3>
+
+  <p>Different providers need different parameters. Anthropic needs <code>thinking_tokens</code> and <code>beta_headers</code>. OpenAI needs <code>frequency_penalty</code> and <code>response_format</code>. The base <code>LLMConfig</code> holds common fields; provider subclasses add their own:</p>
+
+  <div class="cw">
+    <div class="ch">
+      <div class="dt"><span></span><span></span><span></span></div>
+      <span class="fn">core/config.py &mdash; LLMConfig</span>
+      <span class="tg tg-abc">Base</span>
+    </div>
+<pre>
+<span class="k">@dataclass</span>
+<span class="k">class</span> <span class="t">LLMConfig</span>:
+    <span class="s">"""Base LLM configuration. Provider subclasses extend this."""</span>
+    temperature: <span class="t">float</span> | <span class="t">None</span> = <span class="n">None</span>
+    max_tokens: <span class="t">int</span> = <span class="n">16384</span>
+    top_p: <span class="t">float</span> | <span class="t">None</span> = <span class="n">None</span>
+    stop_sequences: <span class="t">list</span>[<span class="t">str</span>] | <span class="t">None</span> = <span class="n">None</span>
+
+    <span class="k">def</span> <span class="f">to_dict</span>(<span class="p">self</span>) -> <span class="t">dict</span>[<span class="t">str</span>, <span class="t">Any</span>]:
+<span class="hl">        <span class="k">return</span> dataclasses.<span class="f">asdict</span>(<span class="p">self</span>)</span>
+
+    <span class="k">@classmethod</span>
+    <span class="k">def</span> <span class="f">from_dict</span>(<span class="p">cls</span>, data: <span class="t">dict</span>) -> <span class="s">"LLMConfig"</span>:
+        valid = {f.name <span class="k">for</span> f <span class="k">in</span> dataclasses.<span class="f">fields</span>(<span class="p">cls</span>)}
+<span class="hl">        <span class="k">return</span> <span class="p">cls</span>(**{k: v <span class="k">for</span> k, v <span class="k">in</span> data.items() <span class="k">if</span> k <span class="k">in</span> valid})</span></pre>
+  </div>
+
+  <div class="cw">
+    <div class="ch">
+      <div class="dt"><span></span><span></span><span></span></div>
+      <span class="fn">providers/anthropic/config.py</span>
+      <span class="tg tg-impl">Subclass</span>
+    </div>
+<pre>
+<span class="k">@dataclass</span>
+<span class="k">class</span> <span class="t">AnthropicLLMConfig</span>(<span class="t">LLMConfig</span>):
+    <span class="s">"""Anthropic-specific parameters."""</span>
+    thinking_budget_tokens: <span class="t">int</span> | <span class="t">None</span> = <span class="n">None</span>
+    beta_headers: <span class="t">list</span>[<span class="t">str</span>] | <span class="t">None</span> = <span class="n">None</span>
+    container_id: <span class="t">str</span> | <span class="t">None</span> = <span class="n">None</span>
+    <span class="c"># Inherits to_dict() / from_dict() from LLMConfig</span>
+    <span class="c"># The field-filtering from_dict handles extra fields automatically</span></pre>
+  </div>
+
+  <div class="th teal">
+    <span class="tl">Developer's inner voice</span>
+    "The <code>from_dict</code> method filters to only known fields before constructing. This means you can safely call <code>AnthropicLLMConfig.from_dict(data)</code> even if the dict has extra keys &mdash; they're silently ignored. And since each subclass inherits the base implementation, adding a new provider config is just adding a new dataclass with the right fields."
+  </div>
+
+  <div class="ins">
+    <span class="il">No Registry, No Discriminator</span>
+    <p>How does the system know to deserialize as <code>AnthropicLLMConfig</code> vs base <code>LLMConfig</code>? It doesn't use a type discriminator in the JSON. The caller (agent layer) knows the provider and passes the correct class: <code>deserialize_config(data, llm_config_class=AnthropicLLMConfig)</code>. Simple, explicit, impossible to misroute.</p>
+  </div>
+</section>
+
+
+<!-- ================================================================ -->
+<!-- CHAPTER 8: RUN RECORDS                                           -->
+<!-- ================================================================ -->
+<div class="chap" id="ch8"><span>Chapter 8 &mdash; Run Records</span></div>
+
+<section class="entry">
+  <div class="entry-tag">Conversation, Usage &amp; Cost</div>
+  <h2>Recording What Happened in a Run</h2>
+
+  <p>Every time the agent runs (one user message &rarr; one final response, possibly with multiple tool-use steps), the result is captured in a <code>Conversation</code> record. This is distinct from <code>AgentConfig.conversation_history</code> (which holds the live LLM context). A <code>Conversation</code> is a complete, immutable snapshot of one run:</p>
+
+  <div class="cw">
+    <div class="ch">
+      <div class="dt"><span></span><span></span><span></span></div>
+      <span class="fn">core/config.py &mdash; Conversation</span>
+      <span class="tg tg-type">Dataclass</span>
+    </div>
+<pre>
+<span class="k">@dataclass</span>
+<span class="k">class</span> <span class="t">Conversation</span>:
+    agent_uuid: <span class="t">str</span>
+    run_id: <span class="t">str</span> = field(default_factory=<span class="k">lambda</span>: <span class="t">str</span>(uuid4()))
+
+    <span class="c"># Timing</span>
+    started_at: <span class="t">str</span> | <span class="t">None</span> = <span class="n">None</span>
+    completed_at: <span class="t">str</span> | <span class="t">None</span> = <span class="n">None</span>
+
+    <span class="c"># The conversation</span>
+<span class="hl">    user_message: <span class="t">Message</span> | <span class="t">None</span> = <span class="n">None</span></span>
+<span class="hl">    final_response: <span class="t">Message</span> | <span class="t">None</span> = <span class="n">None</span></span>
+<span class="hl">    messages: <span class="t">list</span>[<span class="t">Message</span>] = field(default_factory=<span class="t">list</span>)  <span class="c"># full turn log</span></span>
+
+    <span class="c"># Outcome</span>
+    stop_reason: <span class="t">str</span> | <span class="t">None</span> = <span class="n">None</span>
+    total_steps: <span class="t">int</span> | <span class="t">None</span> = <span class="n">None</span>
+
+    <span class="c"># Metrics</span>
+<span class="hl">    usage: <span class="t">Usage</span> = field(default_factory=<span class="t">Usage</span>)</span>
+<span class="hl">    generated_files: <span class="t">list</span>[<span class="t">MediaMetadata</span>] = field(default_factory=<span class="t">list</span>)</span>
+<span class="hl">    cost: <span class="t">CostBreakdown</span> | <span class="t">None</span> = <span class="n">None</span></span>
+
+    <span class="c"># Ordering</span>
+    sequence_number: <span class="t">int</span> | <span class="t">None</span> = <span class="n">None</span>
+    extras: <span class="t">dict</span>[<span class="t">str</span>, <span class="t">Any</span>] = field(default_factory=<span class="t">dict</span>)</pre>
+  </div>
+
+  <h3>Usage: Token Accounting</h3>
+
+  <p><code>Usage</code> tracks cumulative token consumption across all LLM calls in a run. It supports addition for aggregating across steps:</p>
+
+  <div class="cw">
+    <div class="ch">
+      <div class="dt"><span></span><span></span><span></span></div>
+      <span class="fn">core/messages.py &mdash; Usage</span>
+      <span class="tg tg-type">Dataclass</span>
+    </div>
+<pre>
+<span class="k">@dataclass</span>
+<span class="k">class</span> <span class="t">Usage</span>:
+    input_tokens: <span class="t">int</span> = <span class="n">0</span>
+    output_tokens: <span class="t">int</span> = <span class="n">0</span>
+    cache_creation_input_tokens: <span class="t">int</span> = <span class="n">0</span>
+    cache_read_input_tokens: <span class="t">int</span> = <span class="n">0</span>
+
+    <span class="k">def</span> <span class="f">__add__</span>(<span class="p">self</span>, other: <span class="s">"Usage"</span>) -> <span class="s">"Usage"</span>:
+        <span class="k">return</span> <span class="t">Usage</span>(
+            input_tokens=<span class="p">self</span>.input_tokens + other.input_tokens,
+            output_tokens=<span class="p">self</span>.output_tokens + other.output_tokens,
+            <span class="c"># ... same for cache fields</span>
+        )
+
+    <span class="k">def</span> <span class="f">to_dict</span>(<span class="p">self</span>) -> <span class="t">dict</span>: ...
+    <span class="k">@classmethod</span>
+    <span class="k">def</span> <span class="f">from_dict</span>(<span class="p">cls</span>, data) -> <span class="s">"Usage"</span>: ...</pre>
+  </div>
+
+  <h3>CostBreakdown: Dollar Amounts</h3>
+
+  <p>While <code>Usage</code> counts tokens, <code>CostBreakdown</code> translates them to dollars. Separate fields for input vs output pricing, with a computed total:</p>
+
+  <div class="cw">
+    <div class="ch">
+      <div class="dt"><span></span><span></span><span></span></div>
+      <span class="fn">core/config.py &mdash; CostBreakdown</span>
+      <span class="tg tg-type">Dataclass</span>
+    </div>
+<pre>
+<span class="k">@dataclass</span>
+<span class="k">class</span> <span class="t">CostBreakdown</span>:
+    input_cost: <span class="t">float</span> = <span class="n">0.0</span>
+    output_cost: <span class="t">float</span> = <span class="n">0.0</span>
+    total_cost: <span class="t">float</span> = <span class="n">0.0</span>
+    currency: <span class="t">str</span> = <span class="s">"USD"</span></pre>
+  </div>
+
+  <div class="th amber">
+    <span class="tl">Developer's inner voice</span>
+    "Cost is separate from usage because the pricing logic is provider-specific. The agent computes cost after each run using the provider's pricing table and attaches it to the <code>Conversation</code>. The <code>Conversation</code> itself doesn't know how to calculate cost &mdash; it just stores the result."
+  </div>
+</section>
+
+
+<!-- ================================================================ -->
+<!-- CHAPTER 9: SUPPORTING CAST                                       -->
+<!-- ================================================================ -->
+<div class="chap" id="ch9"><span>Chapter 9 &mdash; Supporting Cast</span></div>
+
+<section class="entry">
+  <div class="entry-tag">PendingToolRelay, SubAgentSchema, LogEntry</div>
+  <h2>The Typed Helpers</h2>
+
+  <p>Several supporting dataclasses replace what were previously raw dicts. Each enforces structure at the Python level so that bugs surface at construction time, not at serialization time.</p>
+
+  <h3>PendingToolRelay</h3>
+
+  <p>When the agent encounters tool calls that need frontend interaction or user confirmation, the relay state holds them between runs:</p>
+
+  <div class="cw">
+    <div class="ch">
+      <div class="dt"><span></span><span></span><span></span></div>
+      <span class="fn">core/config.py &mdash; PendingToolRelay</span>
+      <span class="tg tg-type">Dataclass</span>
+    </div>
+<pre>
+<span class="k">@dataclass</span>
+<span class="k">class</span> <span class="t">PendingToolRelay</span>:
+    frontend_calls: <span class="t">list</span>[<span class="t">ToolCallInfo</span>] = field(default_factory=<span class="t">list</span>)
+    confirmation_calls: <span class="t">list</span>[<span class="t">ToolCallInfo</span>] = field(default_factory=<span class="t">list</span>)
+    completed_results: <span class="t">list</span>[<span class="t">Message</span>] = field(default_factory=<span class="t">list</span>)</pre>
+  </div>
+
+  <p><code>ToolCallInfo</code> captures the tool name, ID, and input for each pending call. <code>completed_results</code> holds results that have already been resolved (e.g., the user approved a confirmation) but haven't yet been fed back to the LLM.</p>
+
+  <h3>SubAgentSchema</h3>
+
+  <p>When an agent can spawn sub-agents, each sub-agent's configuration template is described by a schema:</p>
+
+  <div class="cw">
+    <div class="ch">
+      <div class="dt"><span></span><span></span><span></span></div>
+      <span class="fn">core/config.py &mdash; SubAgentSchema</span>
+      <span class="tg tg-type">Dataclass</span>
+    </div>
+<pre>
+<span class="k">@dataclass</span>
+<span class="k">class</span> <span class="t">SubAgentSchema</span>:
+    name: <span class="t">str</span>
+    description: <span class="t">str</span> = <span class="s">""</span>
+    model: <span class="t">str</span> | <span class="t">None</span> = <span class="n">None</span>
+    system_prompt: <span class="t">str</span> | <span class="t">None</span> = <span class="n">None</span>
+    tool_names: <span class="t">list</span>[<span class="t">str</span>] = field(default_factory=<span class="t">list</span>)
+    max_steps: <span class="t">int</span> = <span class="n">25</span></pre>
+  </div>
+
+  <h3>LogEntry &amp; AgentResult</h3>
+
+  <p><code>LogEntry</code> captures a single event during agent execution. <code>AgentResult</code> wraps the final outcome of a run:</p>
+
+  <div class="cw">
+    <div class="ch">
+      <div class="dt"><span></span><span></span><span></span></div>
+      <span class="fn">core/result.py</span>
+      <span class="tg tg-type">Dataclasses</span>
+    </div>
+<pre>
+<span class="k">@dataclass</span>
+<span class="k">class</span> <span class="t">LogEntry</span>:
+    step: <span class="t">int</span>
+    event_type: <span class="t">str</span>                          <span class="c"># "llm_call", "tool_exec", "error", ...</span>
+    timestamp: <span class="t">str</span>
+    message: <span class="t">str</span> = <span class="s">""</span>
+    duration_ms: <span class="t">float</span> | <span class="t">None</span> = <span class="n">None</span>
+    usage: <span class="t">Usage</span> | <span class="t">None</span> = <span class="n">None</span>             <span class="c"># per-step token usage</span>
+    extras: <span class="t">dict</span>[<span class="t">str</span>, <span class="t">Any</span>] = field(default_factory=<span class="t">dict</span>)
+
+<span class="k">@dataclass</span>
+<span class="k">class</span> <span class="t">AgentResult</span>:
+    config: <span class="t">AgentConfig</span>                    <span class="c"># updated session state</span>
+    conversation: <span class="t">Conversation</span>              <span class="c"># the run record</span>
+    run_log: <span class="t">AgentRunLog</span>                    <span class="c"># execution trace</span></pre>
+  </div>
+
+  <div class="th emerald">
+    <span class="tl">Developer's inner voice</span>
+    "Every <code>AgentResult</code> carries three things: the updated config (with new conversation_history), the conversation record (for the chat UI), and the run log (for diagnostics). Three concerns, three objects, all typed. The storage layer saves each one through its respective adapter."
+  </div>
+
+  <h3>The Complete Type Map</h3>
+
+  <table class="ctbl">
+    <thead>
+      <tr><th>Type</th><th>Lives In</th><th>Purpose</th><th>Serialization</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>ContentBlock</code></td>
+        <td><code>core/types.py</code></td>
+        <td>Provider-agnostic content hierarchy</td>
+        <td>Own <code>to_dict</code>/<code>from_dict</code></td>
+      </tr>
+      <tr>
+        <td><code>Message</code></td>
+        <td><code>core/messages.py</code></td>
+        <td>Single conversation turn</td>
+        <td>Own <code>to_dict</code>/<code>from_dict</code></td>
+      </tr>
+      <tr>
+        <td><code>Usage</code></td>
+        <td><code>core/messages.py</code></td>
+        <td>Token accounting</td>
+        <td>Own <code>to_dict</code>/<code>from_dict</code></td>
+      </tr>
+      <tr>
+        <td><code>LLMConfig</code></td>
+        <td><code>core/config.py</code></td>
+        <td>Provider parameters (base)</td>
+        <td>Own <code>to_dict</code>/<code>from_dict</code></td>
+      </tr>
+      <tr>
+        <td><code>AgentConfig</code></td>
+        <td><code>core/config.py</code></td>
+        <td>Full session state</td>
+        <td>External: <code>storage/serialization.py</code></td>
+      </tr>
+      <tr>
+        <td><code>Conversation</code></td>
+        <td><code>core/config.py</code></td>
+        <td>Run record</td>
+        <td>External: <code>storage/serialization.py</code></td>
+      </tr>
+      <tr>
+        <td><code>CostBreakdown</code></td>
+        <td><code>core/config.py</code></td>
+        <td>Dollar cost per run</td>
+        <td><code>dataclasses.asdict</code></td>
+      </tr>
+      <tr>
+        <td><code>PendingToolRelay</code></td>
+        <td><code>core/config.py</code></td>
+        <td>Inter-run tool state</td>
+        <td>External: <code>storage/serialization.py</code></td>
+      </tr>
+      <tr>
+        <td><code>SubAgentSchema</code></td>
+        <td><code>core/config.py</code></td>
+        <td>Sub-agent template</td>
+        <td><code>dataclasses.asdict</code></td>
+      </tr>
+      <tr>
+        <td><code>LogEntry</code></td>
+        <td><code>core/result.py</code></td>
+        <td>Execution event</td>
+        <td>External: <code>storage/serialization.py</code></td>
+      </tr>
+      <tr>
+        <td><code>AgentResult</code></td>
+        <td><code>core/result.py</code></td>
+        <td>Run outcome</td>
+        <td>Decomposed into its three components</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="ins emerald">
+    <span class="il">The Typing Guarantee</span>
+    <p>Every field that was <code>dict</code> or <code>list[dict]</code> in the original <code>anthropic_agent</code> is now a typed dataclass or a list of typed dataclasses. Type errors surface at construction time. Missing fields surface at construction time. The serialization layer converts between typed Python and untyped JSON &mdash; but everywhere else in the framework, the types are enforced.</p>
+  </div>
 </section>
 
 </div><!-- .wrap -->
