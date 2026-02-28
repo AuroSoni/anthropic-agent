@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Developer Diary — Tool Result Architecture</title>
+<title>Developer Diary — Tool System Architecture</title>
 <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500;600&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   :root {
@@ -429,7 +429,7 @@
 
 <header class="hero">
   <h1>Who Owns the <span>Tool Result</span>?</h1>
-  <p class="subtitle">A Developer Diary — Designing Result Ownership in an Agentic Architecture</p>
+  <p class="subtitle">A Developer Diary — The Tool System from Decorator to Registry to Schema Boundary</p>
 </header>
 
 <div class="content">
@@ -1053,46 +1053,9 @@
     <div class="diagram-caption">Fig 3 — The complete flow: execute → envelope → project → consume</div>
   </div>
 
-  <h3>Naming the Patterns</h3>
+  <h3>What We Built</h3>
 
-  <p>Let's step back and name the design patterns we just discovered by solving this problem. The interesting thing is we didn't start with patterns — we started with pain and the patterns emerged.</p>
-
-  <table class="compare-table">
-    <thead>
-      <tr>
-        <th>Pattern</th>
-        <th>Where It Appears</th>
-        <th>What Pain It Solves</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td><strong>Projection / View Model</strong></td>
-        <td><code>for_context_window()</code> and <code>for_conversation_log()</code></td>
-        <td>Same data, different consumers need different shapes. The source object owns the transformation logic.</td>
-      </tr>
-      <tr>
-        <td><strong>Envelope / Rich Result</strong></td>
-        <td><code>ToolResultEnvelope</code> subclasses</td>
-        <td>Tool-specific data that doesn't belong in the canonical model but needs to travel with the result.</td>
-      </tr>
-      <tr>
-        <td><strong>Information Expert (GRASP)</strong></td>
-        <td>Tools own their envelope definitions</td>
-        <td>The class with the most knowledge about data shape should own its serialization.</td>
-      </tr>
-      <tr>
-        <td><strong>Adapter (legacy wrapping)</strong></td>
-        <td><code>GenericTextEnvelope</code>, auto-wrapping in <code>execute()</code></td>
-        <td>Old tools returning <code>str</code> get wrapped into the new interface without code changes.</td>
-      </tr>
-      <tr>
-        <td><strong>Open-Closed Principle</strong></td>
-        <td>New tools add new envelope subclasses</td>
-        <td>Adding a new tool type never requires modifying the agentic loop, AgentConfig, or ConversationHistory.</td>
-      </tr>
-    </tbody>
-  </table>
+  <p>The data flow through the tool system is now clear: the LLM requests a tool call → the <code>ToolRegistry</code> dispatches to the right function → the function returns a <code>ToolResultEnvelope</code> → the agent loop projects it into the context window and conversation log. Each layer has a single job. The full pattern catalog lives in the Epilogue below.</p>
 </section>
 
 
@@ -1136,7 +1099,635 @@
 
 
 <!-- ================================================================ -->
-<!-- CHAPTER 7: THOUGHT PROCESS                                     -->
+<!-- CHAPTER 7: THE REGISTRY                                        -->
+<!-- ================================================================ -->
+<div class="chapter-divider reveal"><span>Chapter 7 — The Registry</span></div>
+
+<section class="entry reveal">
+  <div class="entry-date">The Central Coordinator</div>
+  <h2>ToolRegistry — Registration, Execution, Classification</h2>
+
+  <p>With the envelope pattern solving <em>what tools return</em>, a separate question remains: <strong>who manages the tools themselves?</strong> Somewhere between the LLM requesting a tool call and the tool executing, there's a coordinator that knows which tools exist, routes calls to the right function, runs them in parallel when possible, and classifies them for relay.</p>
+
+  <p>That coordinator is the <code>ToolRegistry</code>. It has a deceptively simple interface — register tools, get schemas, execute calls — but the decisions beneath the surface are worth examining.</p>
+
+  <div class="thought">
+    <span class="label">Developer's inner voice</span>
+    "I want the registry to be a dumb switchboard. It shouldn't know about providers. It shouldn't know about the LLM. It receives decorated functions, stores their schemas, and when asked to execute, it calls the function and wraps the result. The intelligence lives in the tools and their envelopes — the registry is just the dispatch layer."
+  </div>
+
+  <h3>Registration</h3>
+
+  <p>Tools arrive at the registry as plain Python functions decorated with <code>@tool</code>. The decorator attaches three metadata attributes: <code>__tool_schema__</code> (the canonical schema), <code>__tool_executor__</code> (backend or frontend), and <code>__tool_needs_confirmation__</code>. The registry reads these off and stores them in a <code>RegisteredTool</code> dataclass.</p>
+
+  <div class="code-wrapper">
+    <div class="code-header">
+      <div class="dots"><span></span><span></span><span></span></div>
+      <span class="filename">registry.py</span>
+      <span class="tag tag-impl">Registration</span>
+    </div>
+    <pre><span class="decorator">@dataclass</span>
+<span class="kw">class</span> <span class="tp">RegisteredTool</span>:
+    <span class="st">"""Internal metadata for a registered tool."""</span>
+    name: str
+    func: Callable
+    schema: dict
+    executor: ExecutorType = <span class="st">"backend"</span>
+    needs_confirmation: bool = <span class="kw">False</span>
+
+<span class="kw">class</span> <span class="tp">ToolRegistry</span>:
+    <span class="kw">def</span> <span class="fn">register_tools</span>(<span class="pa">self</span>, <span class="pa">tools</span>: list[Callable]) -> <span class="kw">None</span>:
+        <span class="kw">for</span> func <span class="kw">in</span> tools:
+            <span class="kw">if not</span> hasattr(func, <span class="st">"__tool_schema__"</span>):
+                <span class="kw">raise</span> ValueError(
+                    <span class="kw">f</span><span class="st">"Function '{func.__name__}' is missing __tool_schema__."</span>
+                )
+<span class="hl">            schema = func.__tool_schema__</span>
+<span class="hl">            executor = getattr(func, <span class="st">"__tool_executor__"</span>, <span class="st">"backend"</span>)</span>
+<span class="hl">            needs_confirm = getattr(func, <span class="st">"__tool_needs_confirmation__"</span>, <span class="kw">False</span>)</span>
+            self._tools[schema[<span class="st">"name"</span>]] = RegisteredTool(
+                name=schema[<span class="st">"name"</span>], func=func, schema=schema,
+                executor=executor, needs_confirmation=needs_confirm,
+            )</pre>
+  </div>
+
+  <p>The critical constraint: <strong>only <code>@tool</code>-decorated functions can register</strong>. If you pass an undecorated function, you get a clear error. This eliminates an entire class of runtime surprises — every registered tool is guaranteed to have a well-formed schema.</p>
+
+  <h3>Execution — Sync, Async, and Auto-Wrapping</h3>
+
+  <p>The execution pipeline handles three concerns: dispatch (sync vs async), wrapping (raw returns into envelopes), and timing.</p>
+
+  <div class="code-wrapper">
+    <div class="code-header">
+      <div class="dots"><span></span><span></span><span></span></div>
+      <span class="filename">registry.py</span>
+      <span class="tag tag-impl">Execute</span>
+    </div>
+    <pre><span class="kw">async def</span> <span class="fn">execute</span>(<span class="pa">self</span>, <span class="pa">tool_name</span>, <span class="pa">tool_id</span>, <span class="pa">tool_input</span>) -> <span class="tp">ToolResultEnvelope</span>:
+    <span class="kw">if</span> tool_name <span class="kw">not in</span> self._tools:
+        <span class="kw">return</span> ToolResultEnvelope.error(tool_name, tool_id, <span class="kw">f</span><span class="st">"Unknown tool"</span>)
+
+    registered = self._tools[tool_name]
+    start = time.monotonic()
+
+    <span class="kw">try</span>:
+<span class="hl">        <span class="kw">if</span> inspect.iscoroutinefunction(registered.func):</span>
+<span class="hl">            result = <span class="kw">await</span> registered.func(**tool_input)</span>
+<span class="hl">        <span class="kw">else</span>:</span>
+<span class="hl">            result = <span class="kw">await</span> asyncio.to_thread(registered.func, **tool_input)</span>
+
+        envelope = self._wrap_result(result, tool_name, tool_id)
+
+    <span class="kw">except</span> Exception <span class="kw">as</span> e:
+        envelope = ToolResultEnvelope.error(tool_name, tool_id, str(e))
+
+    envelope.duration_ms = (time.monotonic() - start) * 1000
+    <span class="kw">return</span> envelope</pre>
+  </div>
+
+  <p>Two key decisions here. First, <strong>sync tools run in a thread</strong> via <code>asyncio.to_thread()</code>. This prevents a blocking tool from freezing the event loop. Second, <strong>every code path returns an envelope</strong> — success, failure, unknown tool. The caller never has to handle raw exceptions from tools.</p>
+
+  <h3>Bounded Parallel Execution</h3>
+
+  <p>LLMs often request multiple tool calls in a single response. The registry executes them concurrently with a semaphore-based bound.</p>
+
+  <div class="code-wrapper">
+    <div class="code-header">
+      <div class="dots"><span></span><span></span><span></span></div>
+      <span class="filename">registry.py</span>
+      <span class="tag tag-impl">Parallel</span>
+    </div>
+    <pre><span class="kw">async def</span> <span class="fn">execute_tools</span>(<span class="pa">self</span>, <span class="pa">tool_calls</span>, <span class="pa">max_parallel</span>=5):
+    <span class="cm"># Fast path: single call, no concurrency overhead</span>
+    <span class="kw">if</span> len(tool_calls) == 1:
+        <span class="kw">return</span> [<span class="kw">await</span> self.execute(tc.name, tc.tool_id, tc.input)]
+
+<span class="hl">    semaphore = asyncio.Semaphore(max_parallel)</span>
+    results = [<span class="kw">None</span>] * len(tool_calls)
+
+    <span class="kw">async def</span> <span class="fn">_run_one</span>(index, tc):
+<span class="hl">        <span class="kw">async with</span> semaphore:</span>
+            results[index] = <span class="kw">await</span> self.execute(tc.name, tc.tool_id, tc.input)
+
+    <span class="kw">await</span> asyncio.gather(*[
+        asyncio.create_task(_run_one(i, tc))
+        <span class="kw">for</span> i, tc <span class="kw">in</span> enumerate(tool_calls)
+    ])
+    <span class="kw">return</span> results</pre>
+  </div>
+
+  <p>Results are returned in <strong>input order</strong> regardless of execution order — the indexed results array guarantees this. The single-call fast path avoids semaphore and gather overhead for the common case.</p>
+
+  <h3>Relay Classification</h3>
+
+  <p>Not all tools execute the same way. Backend tools run immediately on the server. Frontend tools relay to the browser. Confirmation tools need user approval first. The registry classifies each batch of tool calls into three buckets:</p>
+
+  <div class="code-wrapper">
+    <div class="code-header">
+      <div class="dots"><span></span><span></span><span></span></div>
+      <span class="filename">registry.py</span>
+      <span class="tag tag-impl">Classification</span>
+    </div>
+    <pre><span class="decorator">@dataclass</span>
+<span class="kw">class</span> <span class="tp">ToolCallClassification</span>:
+<span class="hl">    backend_calls: list[ToolCallInfo]       <span class="cm"># Execute immediately on server</span></span>
+<span class="hl">    frontend_calls: list[ToolCallInfo]      <span class="cm"># Relay to browser for client-side execution</span></span>
+<span class="hl">    confirmation_calls: list[ToolCallInfo]  <span class="cm"># Requires user approval before execution</span></span>
+
+    <span class="decorator">@property</span>
+    <span class="kw">def</span> <span class="fn">needs_relay</span>(<span class="pa">self</span>) -> bool:
+        <span class="kw">return</span> bool(self.frontend_calls <span class="kw">or</span> self.confirmation_calls)</pre>
+  </div>
+
+  <p>The agent loop checks <code>classification.needs_relay</code> to decide whether to execute all tools immediately or pause for frontend/user input. Unknown tools go to the backend bucket — <code>execute()</code> will return an error envelope for them.</p>
+
+  <div class="insight blue">
+    <span class="insight-label">🧩 Design Principle — Separation of Dispatch and Execution</span>
+    <p>The registry is a <strong>dispatcher</strong>, not an executor. It routes calls to the right function and wraps results, but it never interprets tool semantics. It doesn't know what "code execution" means or what "frontend" means — it just reads the <code>executor</code> attribute and sorts. This keeps the registry stable as new tool types and execution modes appear.</p>
+  </div>
+</section>
+
+
+<!-- ================================================================ -->
+<!-- CHAPTER 8: THE DECORATOR & SCHEMA GENERATION                   -->
+<!-- ================================================================ -->
+<div class="chapter-divider reveal"><span>Chapter 8 — The Decorator</span></div>
+
+<section class="entry reveal">
+  <div class="entry-date">Schema from Source</div>
+  <h2>The <code>@tool</code> Decorator — Turning Functions into Tools</h2>
+
+  <p>There's a question that comes before registration: <strong>how does a plain Python function become a tool?</strong> The answer is the <code>@tool</code> decorator, which generates a complete schema from the function's type hints and docstring — no hand-written JSON, no separate schema file, no divergence between implementation and description.</p>
+
+  <div class="thought">
+    <span class="label">Developer's inner voice</span>
+    "I've been burned by hand-maintained schemas before. The function signature says <code>limit: int</code> but the schema says <code>type: string</code>. The docstring says 'Maximum number of results' but the schema says 'Limit parameter'. Two sources of truth that inevitably drift apart. The solution is obvious: there should be exactly one source of truth, and it should be the code itself."
+  </div>
+
+  <h3>How It Works</h3>
+
+  <p>The decorator is non-invasive — it returns the original function unchanged, only adding metadata attributes. This means the function remains callable as normal Python, testable without framework scaffolding.</p>
+
+  <div class="code-wrapper">
+    <div class="code-header">
+      <div class="dots"><span></span><span></span><span></span></div>
+      <span class="filename">decorators.py</span>
+      <span class="tag tag-contract">Contract</span>
+    </div>
+    <pre><span class="kw">def</span> <span class="fn">tool</span>(<span class="pa">func</span>=<span class="kw">None</span>, *, <span class="pa">executor</span>=<span class="st">"backend"</span>, <span class="pa">needs_user_confirmation</span>=<span class="kw">False</span>):
+    <span class="st">"""Decorator that generates and attaches a tool schema to a function."""</span>
+    <span class="kw">def</span> <span class="fn">decorator</span>(fn):
+        schema = generate_tool_schema(fn)
+<span class="hl">        fn.__tool_schema__ = schema           <span class="cm"># The canonical schema dict</span></span>
+<span class="hl">        fn.__tool_executor__ = executor        <span class="cm"># "backend" or "frontend"</span></span>
+<span class="hl">        fn.__tool_needs_confirmation__ = needs_user_confirmation</span>
+        <span class="kw">return</span> fn  <span class="cm"># ← Returns the original function, unchanged</span>
+
+    <span class="kw">if</span> func <span class="kw">is not None</span>:
+        <span class="kw">return</span> decorator(func)  <span class="cm"># @tool (no parens)</span>
+    <span class="kw">return</span> decorator            <span class="cm"># @tool(executor="frontend")</span></pre>
+  </div>
+
+  <p>Three usage forms, all supported by a single implementation using the <code>func=None</code> sentinel:</p>
+
+  <div class="code-wrapper">
+    <div class="code-header">
+      <div class="dots"><span></span><span></span><span></span></div>
+      <span class="filename">usage_examples.py</span>
+      <span class="tag tag-use">Usage</span>
+    </div>
+    <pre><span class="cm"># Simple — all defaults (backend, no confirmation)</span>
+<span class="decorator">@tool</span>
+<span class="kw">def</span> <span class="fn">add</span>(<span class="pa">a</span>: float, <span class="pa">b</span>: float) -> str:
+    <span class="st">"""Add two numbers.
+
+    Args:
+        a: First operand.
+        b: Second operand.
+    """</span>
+    <span class="kw">return</span> str(a + b)
+
+<span class="cm"># Frontend tool — schema-only on server, executes in browser</span>
+<span class="decorator">@tool</span>(executor=<span class="st">"frontend"</span>)
+<span class="kw">def</span> <span class="fn">user_confirm</span>(<span class="pa">message</span>: str) -> str:
+    <span class="st">"""Ask the user for confirmation.
+
+    Args:
+        message: The question to present.
+    """</span>
+    <span class="kw">pass</span>  <span class="cm"># Execution happens client-side</span>
+
+<span class="cm"># Dangerous backend tool — needs user approval before running</span>
+<span class="decorator">@tool</span>(needs_user_confirmation=<span class="kw">True</span>)
+<span class="kw">def</span> <span class="fn">delete_file</span>(<span class="pa">path</span>: str) -> str:
+    <span class="st">"""Delete a file permanently.
+
+    Args:
+        path: Path to the file to delete.
+    """</span>
+    ...</pre>
+  </div>
+
+  <h3>Schema Generation — The Engine Inside</h3>
+
+  <p>The real complexity lives in <code>generate_tool_schema()</code>. It does three things: parses type hints into JSON Schema types, parses Google-style docstrings for descriptions, and merges them into a canonical schema.</p>
+
+  <div class="code-wrapper">
+    <div class="code-header">
+      <div class="dots"><span></span><span></span><span></span></div>
+      <span class="filename">schema_utils.py</span>
+      <span class="tag tag-impl">Type Mapping</span>
+    </div>
+    <pre><span class="cm"># Python type → JSON Schema type</span>
+_BASE_TYPE_MAPPING = {
+    int:   {<span class="st">"type"</span>: <span class="st">"integer"</span>},
+    float: {<span class="st">"type"</span>: <span class="st">"number"</span>},
+    str:   {<span class="st">"type"</span>: <span class="st">"string"</span>},
+    bool:  {<span class="st">"type"</span>: <span class="st">"boolean"</span>},
+    list:  {<span class="st">"type"</span>: <span class="st">"array"</span>},
+    dict:  {<span class="st">"type"</span>: <span class="st">"object"</span>},
+    Any:   {},  <span class="cm"># Empty schema = unconstrained</span>
+}
+
+<span class="cm"># Recursive type parsing handles generics, unions, optionals, literals</span>
+<span class="kw">def</span> <span class="fn">_parse_type_hint</span>(hint) -> dict:
+    origin = get_origin(hint)
+    args = get_args(hint)
+
+    <span class="kw">if</span> origin <span class="kw">is None</span>:
+        <span class="kw">return</span> _get_json_schema_type(hint)
+
+    <span class="kw">elif</span> origin <span class="kw">is</span> Union:
+        <span class="kw">return</span> _parse_union_type(args)  <span class="cm"># Handles Optional[X] → nullable</span>
+
+    <span class="kw">elif</span> origin <span class="kw">is</span> list:
+        <span class="kw">return</span> {<span class="st">"type"</span>: <span class="st">"array"</span>, <span class="st">"items"</span>: _parse_type_hint(args[0])}
+
+    <span class="kw">elif</span> origin <span class="kw">is</span> dict:
+        <span class="kw">return</span> {<span class="st">"type"</span>: <span class="st">"object"</span>, <span class="st">"additionalProperties"</span>: _parse_type_hint(args[1])}
+
+    <span class="kw">elif</span> origin <span class="kw">is</span> Literal:
+        <span class="kw">return</span> {<span class="st">"enum"</span>: list(args)}  <span class="cm"># Literal["a", "b"] → enum</span>
+    ...</pre>
+  </div>
+
+  <p>The docstring parser extracts three pieces from Google-style docstrings: the function description (everything before <code>Args:</code>), per-parameter descriptions (the <code>Args:</code> block), and the return description (the <code>Returns:</code> block).</p>
+
+  <div class="code-wrapper">
+    <div class="code-header">
+      <div class="dots"><span></span><span></span><span></span></div>
+      <span class="filename">schema_utils.py</span>
+      <span class="tag tag-impl">Output</span>
+    </div>
+    <pre><span class="cm"># For the add() function above, generate_tool_schema produces:</span>
+{
+    <span class="st">"name"</span>: <span class="st">"add"</span>,
+    <span class="st">"description"</span>: <span class="st">"Add two numbers."</span>,
+    <span class="st">"input_schema"</span>: {
+        <span class="st">"type"</span>: <span class="st">"object"</span>,
+        <span class="st">"properties"</span>: {
+            <span class="st">"a"</span>: {<span class="st">"type"</span>: <span class="st">"number"</span>, <span class="st">"description"</span>: <span class="st">"First operand."</span>},
+            <span class="st">"b"</span>: {<span class="st">"type"</span>: <span class="st">"number"</span>, <span class="st">"description"</span>: <span class="st">"Second operand."</span>},
+        },
+        <span class="st">"required"</span>: [<span class="st">"a"</span>, <span class="st">"b"</span>],
+    }
+}</pre>
+  </div>
+
+  <div class="insight green">
+    <span class="insight-label">✅ Single Source of Truth</span>
+    <p>The function's type hints define the JSON Schema types. The function's docstring defines the description and parameter descriptions. The function's default values define which parameters are required vs optional. There is exactly <strong>one place</strong> to look, and it's the code itself. The schema is always correct because it's derived, not maintained.</p>
+  </div>
+</section>
+
+
+<!-- ================================================================ -->
+<!-- CHAPTER 9: CONFIGURABLE TOOL BASE                              -->
+<!-- ================================================================ -->
+<div class="chapter-divider reveal"><span>Chapter 9 — Configurable Tools</span></div>
+
+<section class="entry reveal">
+  <div class="entry-date">When Simple Functions Aren't Enough</div>
+  <h2>ConfigurableToolBase — Tools with Runtime Identity</h2>
+
+  <p>The <code>@tool</code> decorator works beautifully for stateless functions. But some tools need configuration that changes their description. A code execution tool's prompt might say <em>"Execute Python code. Maximum execution time: 30s"</em> — but that 30s is a runtime value that varies per deployment. The library caller sets it, and the LLM needs to see it in the tool description.</p>
+
+  <div class="thought">
+    <span class="label">Developer's inner voice</span>
+    "This is a tension between the decorator's simplicity and real-world needs. The decorator generates the schema at import time from a static docstring. But for configurable tools, the schema depends on constructor arguments — things that aren't known until runtime. I need a way to defer schema generation to instantiation time."
+  </div>
+
+  <p>The solution is <code>ConfigurableToolBase</code>, an abstract base class that defers docstring rendering to instantiation and supports three levels of customization:</p>
+
+  <table class="compare-table">
+    <thead>
+      <tr>
+        <th>Level</th>
+        <th>Mechanism</th>
+        <th>When to Use</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Default template</strong></td>
+        <td>Class-level <code>DOCSTRING_TEMPLATE</code> with <code>{placeholders}</code></td>
+        <td>Tool author provides sensible defaults; callers just instantiate</td>
+      </tr>
+      <tr>
+        <td><strong>Custom template</strong></td>
+        <td>Constructor's <code>docstring_template=</code> parameter</td>
+        <td>Caller wants a different description but same schema structure</td>
+      </tr>
+      <tr>
+        <td><strong>Full override</strong></td>
+        <td>Constructor's <code>schema_override=</code> parameter</td>
+        <td>Caller wants complete control — different name, different params</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="code-wrapper">
+    <div class="code-header">
+      <div class="dots"><span></span><span></span><span></span></div>
+      <span class="filename">base.py</span>
+      <span class="tag tag-contract">Abstract Base</span>
+    </div>
+    <pre><span class="kw">class</span> <span class="tp">ConfigurableToolBase</span>(ABC):
+    <span class="st">"""Abstract base for tools with templated docstrings."""</span>
+
+<span class="hl">    DOCSTRING_TEMPLATE: str = <span class="st">""</span>  <span class="cm"># Subclasses override with {placeholders}</span></span>
+
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="pa">self</span>, <span class="pa">docstring_template</span>=<span class="kw">None</span>, <span class="pa">schema_override</span>=<span class="kw">None</span>):
+        self._docstring_template = docstring_template
+        self._schema_override = schema_override
+        self._sandbox = <span class="kw">None</span>  <span class="cm"># Injected later by ToolRegistry</span>
+
+    <span class="kw">def</span> <span class="fn">_render_docstring</span>(<span class="pa">self</span>) -> str:
+        <span class="st">"""Replace {placeholders} with values from _get_template_context()."""</span>
+        template = self._docstring_template <span class="kw">or</span> self.DOCSTRING_TEMPLATE
+        context = self._get_template_context()
+<span class="hl">        <span class="kw">return</span> template.format(**context)</span>
+
+    <span class="kw">def</span> <span class="fn">_apply_schema</span>(<span class="pa">self</span>, <span class="pa">func</span>):
+        <span class="st">"""Apply schema to the inner function — override or generated."""</span>
+<span class="hl">        <span class="kw">if</span> self._schema_override <span class="kw">is not None</span>:</span>
+<span class="hl">            func.__tool_schema__ = self._schema_override</span>
+<span class="hl">            func.__tool_executor__ = <span class="st">"backend"</span></span>
+<span class="hl">            func.__tool_needs_confirmation__ = <span class="kw">False</span></span>
+<span class="hl">            <span class="kw">return</span> func</span>
+        <span class="cm"># Normal path: render template → set as docstring → run @tool</span>
+        func.__doc__ = self._render_docstring()
+        <span class="kw">return</span> tool(func)
+
+    <span class="decorator">@abstractmethod</span>
+    <span class="kw">def</span> <span class="fn">get_tool</span>(<span class="pa">self</span>) -> Callable: ...</pre>
+  </div>
+
+  <h3>A Concrete Example</h3>
+
+  <p>Here's how a code execution tool uses this pattern. The <code>{timeout_seconds}</code> placeholder gets replaced with the actual configured value:</p>
+
+  <div class="code-wrapper">
+    <div class="code-header">
+      <div class="dots"><span></span><span></span><span></span></div>
+      <span class="filename">code_exec_tool.py</span>
+      <span class="tag tag-impl">Concrete Tool</span>
+    </div>
+    <pre><span class="kw">class</span> <span class="tp">CodeExecTool</span>(<span class="tp">ConfigurableToolBase</span>):
+    DOCSTRING_TEMPLATE = <span class="st">"""Execute Python code in a sandboxed environment.
+
+    The code runs in an isolated sandbox with a maximum execution time of
+    {timeout_seconds} seconds. Standard library imports are available.
+
+    Args:
+        code: The Python code to execute.
+    """</span>
+
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="pa">self</span>, <span class="pa">timeout</span>=30, **kwargs):
+        <span class="kw">super</span>().__init__(**kwargs)
+        self.timeout = timeout
+
+    <span class="kw">def</span> <span class="fn">_get_template_context</span>(<span class="pa">self</span>):
+<span class="hl">        <span class="kw">return</span> {<span class="st">"timeout_seconds"</span>: self.timeout}</span>
+
+    <span class="kw">def</span> <span class="fn">get_tool</span>(<span class="pa">self</span>):
+        instance = self
+        <span class="kw">def</span> <span class="fn">execute_code</span>(<span class="pa">code</span>: str) -> str:
+            <span class="st">"""Placeholder"""</span>  <span class="cm"># Replaced by _apply_schema</span>
+            result = instance._sandbox.exec(code, timeout=instance.timeout)
+            <span class="kw">return</span> result.stdout
+        func = self._apply_schema(execute_code)
+<span class="hl">        func.__tool_instance__ = instance  <span class="cm"># ← Key: enables sandbox injection</span></span>
+        <span class="kw">return</span> func</pre>
+  </div>
+
+  <h3>Sandbox Injection via the Registry</h3>
+
+  <p>Notice <code>func.__tool_instance__ = instance</code>. This is the bridge that enables sandbox injection. When the agent initializes, the registry calls <code>attach_sandbox()</code>, which walks all registered tools looking for this attribute:</p>
+
+  <div class="code-wrapper">
+    <div class="code-header">
+      <div class="dots"><span></span><span></span><span></span></div>
+      <span class="filename">registry.py</span>
+      <span class="tag tag-impl">Injection</span>
+    </div>
+    <pre><span class="kw">def</span> <span class="fn">attach_sandbox</span>(<span class="pa">self</span>, <span class="pa">sandbox</span>):
+    self._sandbox = sandbox
+    <span class="kw">for</span> registered <span class="kw">in</span> self._tools.values():
+<span class="hl">        instance = getattr(registered.func, <span class="st">"__tool_instance__"</span>, <span class="kw">None</span>)</span>
+<span class="hl">        <span class="kw">if</span> instance <span class="kw">and</span> callable(getattr(instance, <span class="st">"set_sandbox"</span>, <span class="kw">None</span>)):</span>
+<span class="hl">            instance.set_sandbox(sandbox)</span></pre>
+  </div>
+
+  <p>The lifecycle flows naturally: construct tool → register → attach sandbox → tool calls use <code>self._sandbox</code> for all I/O. Tools never import or create sandboxes themselves.</p>
+
+  <div class="insight purple">
+    <span class="insight-label">💡 Template Method Pattern</span>
+    <p><code>ConfigurableToolBase</code> is a textbook <strong>Template Method</strong>. The base class defines the algorithm skeleton (<code>_render_docstring</code> → <code>_apply_schema</code> → register), and subclasses fill in the blanks (<code>DOCSTRING_TEMPLATE</code>, <code>_get_template_context()</code>, <code>get_tool()</code>). The framework controls the flow; the tool author provides the specifics.</p>
+  </div>
+</section>
+
+
+<!-- ================================================================ -->
+<!-- CHAPTER 10: THE SCHEMA BOUNDARY                                -->
+<!-- ================================================================ -->
+<div class="chapter-divider reveal"><span>Chapter 10 — The Schema Boundary</span></div>
+
+<section class="entry reveal">
+  <div class="entry-date">A Refactoring Story</div>
+  <h2>Moving Provider Knowledge Out of the Registry</h2>
+
+  <p>The ToolRegistry originally had a method that knew about providers:</p>
+
+  <div class="code-wrapper">
+    <div class="code-header">
+      <div class="dots"><span></span><span></span><span></span></div>
+      <span class="filename">registry.py</span>
+      <span class="tag tag-bad">Before — The Smell</span>
+    </div>
+    <pre><span class="kw">def</span> <span class="fn">get_schemas</span>(<span class="pa">self</span>, <span class="pa">format</span>=<span class="st">"anthropic"</span>) -> list[dict]:
+    schemas = [t.schema <span class="kw">for</span> t <span class="kw">in</span> self._tools.values()]
+
+<span class="hl">    <span class="kw">if</span> format == <span class="st">"anthropic"</span>:</span>
+<span class="hl">        <span class="kw">return</span> [s.copy() <span class="kw">for</span> s <span class="kw">in</span> schemas]</span>
+
+<span class="hl">    <span class="kw">if</span> format == <span class="st">"openai"</span>:</span>
+<span class="hl">        <span class="kw">return</span> [{</span>
+<span class="hl">            <span class="st">"type"</span>: <span class="st">"function"</span>,</span>
+<span class="hl">            <span class="st">"function"</span>: {</span>
+<span class="hl">                <span class="st">"name"</span>: s[<span class="st">"name"</span>],</span>
+<span class="hl">                <span class="st">"description"</span>: s[<span class="st">"description"</span>],</span>
+<span class="hl">                <span class="st">"parameters"</span>: s[<span class="st">"input_schema"</span>],</span>
+<span class="hl">            }</span>
+<span class="hl">        } <span class="kw">for</span> s <span class="kw">in</span> schemas]</span>
+
+    <span class="kw">raise</span> ValueError(<span class="kw">f</span><span class="st">"Unsupported format '{format}'"</span>)</pre>
+  </div>
+
+  <div class="thought">
+    <span class="label">Developer's inner voice</span>
+    "This method is a code smell. The ToolRegistry lives in <code>agent_base/tools/</code> — it's framework-level infrastructure. But it knows about Anthropic's schema format vs OpenAI's. Why should the tool registry care which LLM provider you're using? If I add a Google Gemini provider tomorrow, I'd have to edit <code>registry.py</code>. That violates the Open-Closed Principle and creates a dependency from the tool layer into the provider layer."
+  </div>
+
+  <!-- Dependency arrow diagram -->
+  <div class="diagram-wrapper">
+    <svg viewBox="0 0 760 240" xmlns="http://www.w3.org/2000/svg">
+      <text x="380" y="20" text-anchor="middle" font-family="DM Sans, sans-serif" font-size="11" font-weight="700" fill="#7f8c8d" letter-spacing="2">THE DEPENDENCY PROBLEM</text>
+
+      <!-- Before side -->
+      <text x="190" y="50" text-anchor="middle" font-family="DM Sans, sans-serif" font-size="10" font-weight="700" fill="#c0392b" letter-spacing="1.5">BEFORE — WRONG DEPENDENCY</text>
+
+      <rect x="80" y="65" width="220" height="40" rx="6" fill="#c0392b" opacity="0.08" stroke="#c0392b" stroke-width="1.5"/>
+      <text x="190" y="90" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="#c0392b">ToolRegistry</text>
+
+      <line x1="190" y1="105" x2="110" y2="140" stroke="#c0392b" stroke-width="1.5"/>
+      <polygon points="107,137 113,137 110,143" fill="#c0392b"/>
+      <line x1="190" y1="105" x2="270" y2="140" stroke="#c0392b" stroke-width="1.5"/>
+      <polygon points="267,137 273,137 270,143" fill="#c0392b"/>
+
+      <rect x="40" y="145" width="140" height="35" rx="5" fill="#c0392b" opacity="0.06" stroke="#c0392b" stroke-width="1"/>
+      <text x="110" y="167" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="#c0392b">Anthropic format</text>
+
+      <rect x="200" y="145" width="140" height="35" rx="5" fill="#c0392b" opacity="0.06" stroke="#c0392b" stroke-width="1"/>
+      <text x="270" y="167" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="#c0392b">OpenAI format</text>
+
+      <text x="190" y="205" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="#888" font-style="italic">Tools layer knows about providers ✗</text>
+
+      <!-- Divider -->
+      <line x1="380" y1="40" x2="380" y2="220" stroke="#ccc" stroke-width="1" stroke-dasharray="4,4"/>
+
+      <!-- After side -->
+      <text x="570" y="50" text-anchor="middle" font-family="DM Sans, sans-serif" font-size="10" font-weight="700" fill="#1e8449" letter-spacing="1.5">AFTER — CORRECT BOUNDARY</text>
+
+      <rect x="460" y="65" width="220" height="40" rx="6" fill="#1e8449" opacity="0.08" stroke="#1e8449" stroke-width="1.5"/>
+      <text x="570" y="90" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="#1e8449">ToolRegistry</text>
+      <text x="570" y="80" text-anchor="middle" font-family="EB Garamond, serif" font-size="10" fill="#888">(canonical only)</text>
+
+      <line x1="570" y1="105" x2="570" y2="135" stroke="#1e8449" stroke-width="1.5"/>
+      <polygon points="567,132 573,132 570,138" fill="#1e8449"/>
+
+      <rect x="460" y="140" width="220" height="40" rx="6" fill="#2471a3" opacity="0.08" stroke="#2471a3" stroke-width="1.5"/>
+      <text x="570" y="158" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="#2471a3">MessageFormatter</text>
+      <text x="570" y="172" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="10" fill="#2471a3">.format_tool_schemas()</text>
+
+      <text x="570" y="205" text-anchor="middle" font-family="EB Garamond, serif" font-size="13" fill="#888" font-style="italic">Each provider owns its own conversion ✓</text>
+    </svg>
+    <div class="diagram-caption">Fig 4 — Provider knowledge moves from tools layer to provider layer</div>
+  </div>
+
+  <h3>The Refactoring</h3>
+
+  <p>The fix is clean. <code>ToolRegistry.get_schemas()</code> drops the <code>format</code> parameter and returns only canonical schemas. A new abstract method on <code>MessageFormatter</code> takes responsibility for provider-specific conversion:</p>
+
+  <div class="code-wrapper">
+    <div class="code-header">
+      <div class="dots"><span></span><span></span><span></span></div>
+      <span class="filename">registry.py</span>
+      <span class="tag tag-v3">After — Canonical Only</span>
+    </div>
+    <pre><span class="kw">def</span> <span class="fn">get_schemas</span>(<span class="pa">self</span>) -> list[dict]:
+    <span class="st">"""Get tool schemas in canonical format.
+
+    Provider-specific conversion is the responsibility
+    of each provider's MessageFormatter.format_tool_schemas().
+    """</span>
+<span class="hl">    <span class="kw">return</span> [t.schema.copy() <span class="kw">for</span> t <span class="kw">in</span> self._tools.values()]</span></pre>
+  </div>
+
+  <div class="code-wrapper">
+    <div class="code-header">
+      <div class="dots"><span></span><span></span><span></span></div>
+      <span class="filename">messages.py</span>
+      <span class="tag tag-contract">New Abstract Method</span>
+    </div>
+    <pre><span class="kw">class</span> <span class="tp">MessageFormatter</span>(ABC):
+    <span class="st">"""Translates canonical types into provider wire format."""</span>
+
+    <span class="decorator">@abstractmethod</span>
+    <span class="kw">def</span> <span class="fn">format_messages</span>(<span class="pa">self</span>, <span class="pa">messages</span>, <span class="pa">params</span>) -> dict: ...
+
+    <span class="decorator">@abstractmethod</span>
+    <span class="kw">def</span> <span class="fn">parse_response</span>(<span class="pa">self</span>, <span class="pa">raw_response</span>) -> Message: ...
+
+<span class="hl">    <span class="decorator">@abstractmethod</span></span>
+<span class="hl">    <span class="kw">def</span> <span class="fn">format_tool_schemas</span>(<span class="pa">self</span>, <span class="pa">schemas</span>: list[dict]) -> list[dict]:</span>
+<span class="hl">        <span class="st">"""Convert canonical tool schemas into provider wire format.</span></span>
+<span class="hl">        </span>
+<span class="hl">        <span class="st">ToolRegistry returns schemas in canonical form</span></span>
+<span class="hl">        <span class="st">(name, description, input_schema). Each provider</span></span>
+<span class="hl">        <span class="st">formatter converts them into its API's expected shape.</span></span>
+<span class="hl">        <span class="st">"""</span></span>
+<span class="hl">        ...</span></pre>
+  </div>
+
+  <p>The <code>MessageFormatter</code> already owns message translation — canonical <code>Message</code> objects in, provider wire format out. Tool schema conversion is the same kind of translation. It belongs in the same class.</p>
+
+  <div class="thought">
+    <span class="label">Developer's inner voice</span>
+    "This refactoring follows a pattern I keep seeing: <strong>the canonical boundary</strong>. Everything inside <code>agent_base/</code> speaks canonical types — <code>ContentBlock</code>, <code>Message</code>, <code>ToolResultEnvelope</code>, canonical schemas. Everything outside — the provider layer — speaks provider-specific types. The <code>MessageFormatter</code> is the membrane between these two worlds. The registry was poking through that membrane, and now it doesn't."
+  </div>
+
+  <div class="insight green">
+    <span class="insight-label">✅ The Canonical Boundary Principle</span>
+    <p>The framework core (<code>agent_base/</code>) should <strong>never import or reference provider-specific formats</strong>. It only speaks canonical types. The provider layer owns the translation. This means adding a new provider (Gemini, Mistral, local models) requires <strong>zero changes to the framework core</strong> — you implement three methods on a new <code>MessageFormatter</code> subclass and you're done.</p>
+  </div>
+
+  <table class="compare-table">
+    <thead>
+      <tr>
+        <th>Aspect</th>
+        <th>Before</th>
+        <th>After</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Adding a provider</strong></td>
+        <td>Edit <code>registry.py</code> + write provider adapter</td>
+        <td>Write provider adapter only</td>
+      </tr>
+      <tr>
+        <td><strong>Registry's imports</strong></td>
+        <td>Knows <code>Literal["anthropic", "openai"]</code></td>
+        <td>No provider awareness at all</td>
+      </tr>
+      <tr>
+        <td><strong>Schema conversion</strong></td>
+        <td>In <code>get_schemas(format=...)</code></td>
+        <td>In <code>MessageFormatter.format_tool_schemas()</code></td>
+      </tr>
+      <tr>
+        <td><strong>Responsibility</strong></td>
+        <td>Registry knows about providers</td>
+        <td>Registry knows about tools; providers know about formats</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+
+<!-- ================================================================ -->
+<!-- EPILOGUE: THOUGHT PROCESS                                      -->
 <!-- ================================================================ -->
 <div class="chapter-divider reveal"><span>Epilogue — The Thought Process</span></div>
 
@@ -1195,14 +1786,75 @@
       <text x="380" y="290" text-anchor="middle" font-family="EB Garamond, serif" font-size="17" fill="#333" font-style="italic">The pattern is just the name we give the solution so we can talk about it."</text>
       <text x="380" y="314" text-anchor="middle" font-family="DM Sans, sans-serif" font-size="11" fill="#888">— The developer's diary</text>
     </svg>
-    <div class="diagram-caption">Fig 4 — Pain → Axes of Change → Boundary → Named Pattern → Iterate</div>
+    <div class="diagram-caption">Fig 5 — Pain → Axes of Change → Boundary → Named Pattern → Iterate</div>
   </div>
 
   <p>In this specific case, we identified <strong>two orthogonal axes of variation</strong>: tool type (code exec vs. web search vs. sub-agent) and consumer type (LLM context vs. UI log). The canonical model was trying to collapse both axes into one flat hierarchy, which is why it was breaking. The envelope introduces a new layer that handles the tool-type axis, while the projection methods handle the consumer-type axis. Each axis can now vary independently.</p>
 
+  <p>The same principle drove every design in this diary. The <code>@tool</code> decorator eliminates the axis of divergence between code and schema. <code>ConfigurableToolBase</code> separates the axis of "tool behavior" from the axis of "tool description." And the schema boundary refactoring separates the axis of "what tools exist" from "what format the provider expects." Each time we found two things changing for different reasons, we drew a boundary.</p>
+
+  <h3>All the Patterns, Gathered</h3>
+
+  <table class="compare-table">
+    <thead>
+      <tr>
+        <th>Pattern</th>
+        <th>Where</th>
+        <th>What It Isolates</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Dual Projection</strong></td>
+        <td><code>for_context_window()</code> / <code>for_conversation_log()</code></td>
+        <td>Same data, different consumer needs</td>
+      </tr>
+      <tr>
+        <td><strong>Envelope / Rich Result</strong></td>
+        <td><code>ToolResultEnvelope</code> subclasses</td>
+        <td>Tool-specific data from canonical model</td>
+      </tr>
+      <tr>
+        <td><strong>Information Expert</strong></td>
+        <td>Tools own their envelope definitions</td>
+        <td>Serialization lives with the data owner</td>
+      </tr>
+      <tr>
+        <td><strong>Adapter (legacy wrapping)</strong></td>
+        <td><code>GenericTextEnvelope</code>, auto-wrapping in <code>execute()</code></td>
+        <td>Old tools from new interface requirements</td>
+      </tr>
+      <tr>
+        <td><strong>Single Source of Truth</strong></td>
+        <td><code>@tool</code> decorator, <code>generate_tool_schema()</code></td>
+        <td>Schema from code itself — no separate manifest</td>
+      </tr>
+      <tr>
+        <td><strong>Template Method</strong></td>
+        <td><code>ConfigurableToolBase</code></td>
+        <td>Framework skeleton from tool-specific details</td>
+      </tr>
+      <tr>
+        <td><strong>Dependency Injection</strong></td>
+        <td><code>attach_sandbox()</code> via <code>__tool_instance__</code></td>
+        <td>Tool I/O from tool construction</td>
+      </tr>
+      <tr>
+        <td><strong>Canonical Boundary</strong></td>
+        <td><code>MessageFormatter.format_tool_schemas()</code></td>
+        <td>Framework core from provider-specific formats</td>
+      </tr>
+      <tr>
+        <td><strong>Open-Closed</strong></td>
+        <td>New tools, new envelopes, new providers</td>
+        <td>Extension without modification</td>
+      </tr>
+    </tbody>
+  </table>
+
   <div class="insight green">
     <span class="insight-label">✅ The Litmus Test</span>
-    <p>Ask yourself these two questions about the design: <em>"If I add a new tool type (say, a database query tool), how many files do I touch?"</em> Answer: one — the new tool's file, where I define both the envelope and the tool. <em>"If I add a new consumer (say, a billing/analytics system), how many files do I touch?"</em> Answer: one — the <code>ToolResultEnvelope</code> base, where I add a third projection method. If both answers are "one", the factoring is right.</p>
+    <p>For each axis of change, ask: <em>"How many files do I touch?"</em> New tool type → one file (tool + envelope). New consumer → one file (add projection method). New provider → one file (implement <code>MessageFormatter</code>). New tool configuration → one file (subclass <code>ConfigurableToolBase</code>). If the answer is always "one," the factoring is right.</p>
   </div>
 </section>
 

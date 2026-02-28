@@ -5,7 +5,7 @@ import asyncio
 import inspect
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Literal, TYPE_CHECKING
+from typing import Any, Callable, Dict, TYPE_CHECKING
 
 from .types import ToolResultEnvelope, GenericTextEnvelope
 from .decorators import ExecutorType
@@ -57,7 +57,7 @@ class ToolRegistry:
     Handles:
     - Registration of ``@tool``-decorated functions (backend and frontend)
     - Single and parallel async execution with auto-wrapping to ``ToolResultEnvelope``
-    - Schema export in Anthropic and OpenAI formats
+    - Schema export in canonical format (provider conversion is done by ``MessageFormatter``)
     - Sandbox injection into ``ConfigurableToolBase`` instances
     - Classification of tool calls for relay (frontend / confirmation)
     """
@@ -115,42 +115,20 @@ class ToolRegistry:
 
     # ─── Schema Export ─────────────────────────────────────────────
 
-    def get_schemas(self, format: Literal["anthropic", "openai"] = "anthropic") -> list[dict]:
-        """Get registered tool schemas in the requested provider format.
+    def get_schemas(self) -> list[dict]:
+        """Get registered tool schemas in canonical format.
 
-        All tools (backend and frontend) are included since the LLM needs
-        to see all available tools.
+        Returns copies of the canonical schema dicts (``name``, ``description``,
+        ``input_schema``). All tools (backend and frontend) are included since
+        the LLM needs to see all available tools.
 
-        Args:
-            format: Output format — ``"anthropic"`` returns the canonical
-                schema dicts, ``"openai"`` converts to OpenAI's function-call
-                payload.
+        Provider-specific format conversion (e.g. Anthropic → OpenAI) is the
+        responsibility of each provider's ``MessageFormatter.format_tool_schemas()``.
 
         Returns:
-            List of schema dictionaries.
-
-        Raises:
-            ValueError: If an unsupported format is requested.
+            List of canonical schema dictionaries.
         """
-        schemas = [t.schema for t in self._tools.values()]
-
-        if format == "anthropic":
-            return [s.copy() for s in schemas]
-
-        if format == "openai":
-            return [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": s["name"],
-                        "description": s["description"],
-                        "parameters": s["input_schema"],
-                    },
-                }
-                for s in schemas
-            ]
-
-        raise ValueError(f"Unsupported schema format '{format}'. Expected 'anthropic' or 'openai'.")
+        return [t.schema.copy() for t in self._tools.values()]
 
     # ─── Sandbox ───────────────────────────────────────────────────
 

@@ -109,7 +109,8 @@ class Message:
 class MessageFormatter(ABC):
     """
     Translates canonical Messages into the provider's wire format and back.
-    This is where provider-specific content type mappings live.
+    This is where provider-specific content type mappings live —
+    including tool schema conversion.
     """
 
     @abstractmethod
@@ -131,4 +132,19 @@ class MessageFormatter(ABC):
         raw_response: The raw response from the provider.
     Returns:
         The parsed message.
+    """
+
+    @abstractmethod
+    def format_tool_schemas(self, schemas: List[Dict[str, Any]]) -> List[Dict[str, Any]]: ...
+    """
+    Convert canonical tool schemas into the provider's wire format.
+
+    The ToolRegistry returns schemas in the canonical form
+    (``name``, ``description``, ``input_schema``). Each provider
+    formatter converts them into whatever shape its API expects.
+
+    Args:
+        schemas: List of canonical tool schema dicts from ToolRegistry.get_schemas().
+    Returns:
+        List of provider-formatted tool schema dicts ready for the API call.
     """

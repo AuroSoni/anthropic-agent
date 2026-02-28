@@ -118,7 +118,8 @@ __all__ = [
     "ExitPlanModeTool",
     "CreatePlanTool",
     "EditPlanTool",
-    # Stubs (not yet fully implemented)
+    # Code execution
     "CodeExecutionTool",
+    # Stubs (not yet fully implemented)
     "SubAgentTool",
 ]

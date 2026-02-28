@@ -94,17 +94,13 @@ def test_register_reads_executor_and_confirmation() -> None:
 # ─── Schema Export ───────────────────────────────────────────────────
 
 
-def test_get_schemas_anthropic_format(registry) -> None:
-    schemas = registry.get_schemas(format="anthropic")
+def test_get_schemas_returns_canonical(registry) -> None:
+    schemas = registry.get_schemas()
     assert isinstance(schemas, list)
     assert len(schemas) == 2
     assert all("input_schema" in s for s in schemas)
-
-
-def test_get_schemas_openai_format(registry) -> None:
-    schemas = registry.get_schemas(format="openai")
-    assert all(s["type"] == "function" for s in schemas)
-    assert "parameters" in schemas[0]["function"]
+    assert all("name" in s for s in schemas)
+    assert all("description" in s for s in schemas)
 
 
 def test_get_schemas_returns_copies(registry) -> None:
@@ -113,11 +109,6 @@ def test_get_schemas_returns_copies(registry) -> None:
     schemas[0]["name"] = "hacked"
     original = registry.get_schemas()
     assert original[0]["name"] != "hacked"
-
-
-def test_get_schemas_invalid_format(registry) -> None:
-    with pytest.raises(ValueError, match="Unsupported schema format"):
-        registry.get_schemas(format="unsupported")
 
 
 # ─── Single Execution ───────────────────────────────────────────────
