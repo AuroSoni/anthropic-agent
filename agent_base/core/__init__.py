@@ -8,10 +8,12 @@ their respective modules to avoid circular imports:
 - ``agent_base.core.config``: AgentConfig, Conversation, LLMConfig, etc.
 - ``agent_base.core.result``: AgentResult, AgentRunLog, LogEntry
 - ``agent_base.core.agent_base``: Agent
+- ``agent_base.core.provider``: Provider
 """
 
 from .types import ContentBlock, Role, ContentBlockType
 from .messages import Message, Usage, MessageFormatter
+from .provider import Provider
 
 __all__ = [
     # Content model
@@ -22,4 +24,6 @@ __all__ = [
     "Message",
     "Usage",
     "MessageFormatter",
+    # Provider ABC
+    "Provider",
 ]

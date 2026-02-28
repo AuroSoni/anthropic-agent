@@ -1,9 +1,38 @@
+from __future__ import annotations
+
+import asyncio
+import uuid
+from dataclasses import dataclass
+from typing import Any, Callable, Optional, TYPE_CHECKING
+
 from agent_base.core.agent_base import Agent
 from agent_base.core.config import AgentConfig, Conversation, LLMConfig
 from agent_base.core.messages import Message
-from typing import Optional, Callable, Any
-from dataclasses import dataclass
-import uuid
+from agent_base.compaction.strategies import SummarizingCompactor
+from agent_base.memory.stores import NoOpMemoryStore
+from agent_base.sandbox.local import LocalSandbox
+from agent_base.storage.adapters.memory import (
+    MemoryAgentConfigAdapter,
+    MemoryConversationAdapter,
+    MemoryAgentRunAdapter,
+)
+from agent_base.media_backend.local import LocalMediaBackend
+from .formatters import AnthropicMessageFormatter
+from .provider import AnthropicProvider
+
+if TYPE_CHECKING:
+    from agent_base.compaction.base import Compactor
+    from agent_base.core.result import AgentResult
+    from agent_base.media_backend.types import MediaBackend
+    from agent_base.memory.base import MemoryStore
+    from agent_base.sandbox.types import Sandbox
+    from agent_base.storage.base import (
+        AgentConfigAdapter,
+        ConversationAdapter,
+        AgentRunAdapter,
+    )
+    from agent_base.streaming.base import StreamFormatter
+    from agent_base.tools.registry import ToolRegistry
 
 MAX_PARALLEL_TOOL_CALLS = 5
 DEFAULT_MAX_RETRIES = 5
@@ -79,10 +108,10 @@ class AnthropicAgent(Agent):
         
         # Compactor and memory store.
         self.compactor = compactor or SummarizingCompactor()
-        self.memory_store = memory_store or MemoryStore()
+        self.memory_store = memory_store or NoOpMemoryStore()
         
         # Sandbox configuration.
-        self.sandbox = sandbox or Sandbox()
+        self.sandbox = sandbox or LocalSandbox()
         
         # Final answer validation checker. Cannot be loaded from database.
         self.final_answer_check = final_answer_check
@@ -119,7 +148,7 @@ class AnthropicAgent(Agent):
         
         # Composition 
         self.message_formatter = AnthropicMessageFormatter()
-        self.provider = AnthropicProvider()
+        self.provider = AnthropicProvider(formatter=self.message_formatter)
         
         
         #################################################################### 
@@ -177,7 +206,7 @@ class AnthropicAgent(Agent):
         
         except Exception as e:
             # TODO: Raise proper initialization error.
-            raise InitializationError(f"Failed to load agent state: {e}")
+            raise RuntimeError(f"Failed to load agent state: {e}") from e
         
     
     async def run(self, prompt: str | Message ) -> AgentResult:
