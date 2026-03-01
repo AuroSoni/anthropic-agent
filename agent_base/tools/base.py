@@ -1,6 +1,7 @@
 """Abstract base class for configurable tools with templated docstrings."""
 from __future__ import annotations
 
+import functools
 import warnings
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
@@ -34,8 +35,7 @@ class ConfigurableToolBase(ABC):
         ...         input: The input to process.
         ...     '''
         ...
-        ...     def __init__(self, max_items: int = 10, **kwargs):
-        ...         super().__init__(**kwargs)
+        ...     def __init__(self, max_items: int = 10):
         ...         self.max_items = max_items
         ...
         ...     def _get_template_context(self) -> Dict[str, Any]:
@@ -55,6 +55,34 @@ class ConfigurableToolBase(ABC):
     # Class-level docstring template with {placeholder} syntax.
     # Subclasses should override this with their specific template.
     DOCSTRING_TEMPLATE: str = ""
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Wrap subclass ``__init__`` to guarantee base fields are initialized.
+
+        If a subclass defines ``__init__`` without calling ``super().__init__()``,
+        the base fields (``_docstring_template``, ``_schema_override``,
+        ``_sandbox``) would be missing, causing cryptic ``AttributeError``
+        later. This hook wraps the subclass ``__init__`` to set safe defaults
+        before the subclass body runs.
+
+        Subclasses that *do* call ``super().__init__(docstring_template=...,
+        schema_override=...)`` will simply overwrite these defaults — no
+        behaviour change.
+        """
+        super().__init_subclass__(**kwargs)
+        original_init = cls.__dict__.get("__init__")
+        if original_init is None:
+            return
+
+        @functools.wraps(original_init)
+        def _safe_init(self: Any, *args: Any, **kw: Any) -> None:
+            if not hasattr(self, "_schema_override"):
+                self._docstring_template: str | None = None
+                self._schema_override: dict | None = None
+                self._sandbox: Sandbox | None = None
+            original_init(self, *args, **kw)
+
+        cls.__init__ = _safe_init  # type: ignore[method-assign]
 
     def __init__(
         self,
