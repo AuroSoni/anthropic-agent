@@ -28,7 +28,7 @@ def test_enter_plan_mode_schema() -> None:
     tool = EnterPlanModeTool()
     func = tool.get_tool()
     assert hasattr(func, "__tool_schema__")
-    assert func.__tool_schema__["name"] == "enter_plan_mode"
+    assert func.__tool_schema__.name == "enter_plan_mode"
     assert func.__tool_executor__ == "frontend"
 
 
@@ -36,7 +36,7 @@ def test_exit_plan_mode_schema() -> None:
     tool = ExitPlanModeTool()
     func = tool.get_tool()
     assert hasattr(func, "__tool_schema__")
-    assert func.__tool_schema__["name"] == "exit_plan_mode"
+    assert func.__tool_schema__.name == "exit_plan_mode"
     assert func.__tool_executor__ == "frontend"
 
 

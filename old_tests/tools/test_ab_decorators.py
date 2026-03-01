@@ -19,9 +19,9 @@ def test_bare_decorator_attaches_schema() -> None:
 
     assert hasattr(add, "__tool_schema__")
     schema = add.__tool_schema__
-    assert schema["name"] == "add"
-    assert schema["description"] == "Add two numbers."
-    assert schema["input_schema"]["properties"]["a"]["type"] == "number"
+    assert schema.name == "add"
+    assert schema.description == "Add two numbers."
+    assert schema.input_schema["properties"]["a"]["type"] == "number"
 
 
 def test_bare_decorator_sets_defaults() -> None:
@@ -114,6 +114,6 @@ def test_optional_params_not_required() -> None:
         """
         return f"Hello {name}"
 
-    schema = greet.__tool_schema__["input_schema"]
+    schema = greet.__tool_schema__.input_schema
     assert "name" in schema.get("required", [])
     assert "language" not in schema.get("required", [])

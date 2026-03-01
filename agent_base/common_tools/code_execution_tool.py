@@ -148,7 +148,7 @@ Example:
         for tool_func in self.embedded_tools:
             # Get tool name from schema if available, else use __name__
             if hasattr(tool_func, "__tool_schema__"):
-                name = tool_func.__tool_schema__.get("name", tool_func.__name__)
+                name = tool_func.__tool_schema__.name
             else:
                 name = tool_func.__name__
 
@@ -191,11 +191,11 @@ Example:
         for tool_func in self.embedded_tools:
             if hasattr(tool_func, "__tool_schema__"):
                 schema = tool_func.__tool_schema__
-                name = schema.get("name", tool_func.__name__)
-                description = schema.get("description", "No description available.")
+                name = schema.name
+                description = schema.description
 
                 # Format input parameters
-                input_schema = schema.get("input_schema", {})
+                input_schema = schema.input_schema
                 properties = input_schema.get("properties", {})
                 required = set(input_schema.get("required", []))
 

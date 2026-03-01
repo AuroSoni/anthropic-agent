@@ -4,12 +4,23 @@ import asyncio
 import os
 import shutil
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator
 
 import aiofiles
 
-from .types import ExecResult, FileEntry, Sandbox
+from .sandbox_types import ExecResult, FileEntry, Sandbox, SandboxConfig
+
+
+@dataclass
+class LocalSandboxConfig(SandboxConfig):
+    """Serializable configuration for LocalSandbox."""
+
+    sandbox_type: str = "local"
+    sandbox_id: str = ""
+    base_dir: str = ""
+    default_timeout: float = 30.0
 
 
 class LocalSandbox(Sandbox):
@@ -47,6 +58,26 @@ class LocalSandbox(Sandbox):
         self.root: Path = Path(base_dir).resolve() / sandbox_id
         self.workspace: Path = self.root / "workspace"
         self.default_timeout: float = default_timeout
+        self._cwd: Path = self.workspace
+
+    # ─── Configuration ─────────────────────────────────────────────────
+
+    @property
+    def config(self) -> LocalSandboxConfig:
+        return LocalSandboxConfig(
+            sandbox_id=self.sandbox_id,
+            base_dir=str(self.root.parent),
+            default_timeout=self.default_timeout,
+        )
+
+    @classmethod
+    def from_config(cls, config: LocalSandboxConfig) -> LocalSandbox:
+        """Create a LocalSandbox from a serialized config."""
+        return cls(
+            sandbox_id=config.sandbox_id,
+            base_dir=config.base_dir,
+            default_timeout=config.default_timeout,
+        )
 
     # ─── Path containment ────────────────────────────────────────────
 
@@ -70,6 +101,7 @@ class LocalSandbox(Sandbox):
         self.root.mkdir(parents=True, exist_ok=True)
         for zone in (".imported", "workspace", ".exports"):
             (self.root / zone).mkdir(exist_ok=True)
+        self._cwd = self.workspace
 
     async def teardown(self) -> None:
         if self.root.exists():
@@ -141,8 +173,6 @@ class LocalSandbox(Sandbox):
     async def import_file(self, file_id: str, filename: str, content: bytes) -> str:
         sandbox_path = f".imported/{file_id}/{filename}"
         resolved = self._resolve(sandbox_path)
-        if resolved.exists():
-            return sandbox_path
         resolved.parent.mkdir(parents=True, exist_ok=True)
         async with aiofiles.open(resolved, "wb") as f:
             await f.write(content)
@@ -171,6 +201,9 @@ class LocalSandbox(Sandbox):
 
     # ─── Execution ───────────────────────────────────────────────────
 
+    # Unique marker to separate command output from the pwd probe.
+    _PWD_MARKER = "__SANDBOX_PWD_8f3a1b__"
+
     async def exec(
         self,
         command: str,
@@ -179,13 +212,20 @@ class LocalSandbox(Sandbox):
         env: dict[str, str] | None = None,
     ) -> ExecResult:
         effective_timeout = timeout if timeout is not None else self.default_timeout
-        work_dir = self._resolve(cwd) if cwd is not None else self.workspace
+        if cwd is not None:
+            work_dir = self._resolve(cwd)
+            self._cwd = work_dir
+        else:
+            work_dir = self._cwd
         effective_env = {**os.environ, **(env or {})}
+
+        # Append a pwd probe so we can track directory changes from cd commands.
+        probed_command = f"{command}\n__exit_code=$?\necho {self._PWD_MARKER}\npwd\nexit $__exit_code"
 
         start = time.monotonic()
         try:
             proc = await asyncio.create_subprocess_shell(
-                command,
+                probed_command,
                 cwd=str(work_dir),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -205,10 +245,16 @@ class LocalSandbox(Sandbox):
                     duration_ms=(time.monotonic() - start) * 1000,
                 )
 
+            stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+            stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+
+            # Extract the pwd probe output and update _cwd.
+            stdout_text = self._extract_cwd(stdout_text)
+
             return ExecResult(
                 exit_code=proc.returncode if proc.returncode is not None else -1,
-                stdout=stdout_bytes.decode("utf-8", errors="replace"),
-                stderr=stderr_bytes.decode("utf-8", errors="replace"),
+                stdout=stdout_text,
+                stderr=stderr_text,
                 duration_ms=(time.monotonic() - start) * 1000,
             )
         except Exception as exc:
@@ -218,6 +264,29 @@ class LocalSandbox(Sandbox):
                 duration_ms=(time.monotonic() - start) * 1000,
             )
 
+    def _extract_cwd(self, stdout: str) -> str:
+        """Parse the pwd probe from stdout, update self._cwd, and return clean output."""
+        marker_pos = stdout.rfind(self._PWD_MARKER)
+        if marker_pos == -1:
+            return stdout
+
+        clean_output = stdout[:marker_pos]
+        # Strip trailing newline that precedes the marker
+        if clean_output.endswith("\n"):
+            clean_output = clean_output[:-1]
+
+        after_marker = stdout[marker_pos + len(self._PWD_MARKER):]
+        pwd_line = after_marker.strip()
+        if pwd_line:
+            new_cwd = Path(pwd_line).resolve()
+            try:
+                new_cwd.relative_to(self.root.resolve())
+                self._cwd = new_cwd
+            except ValueError:
+                pass  # cd'd outside sandbox — keep previous _cwd
+
+        return clean_output
+
     async def exec_stream(
         self,
         command: str,
@@ -226,7 +295,11 @@ class LocalSandbox(Sandbox):
         env: dict[str, str] | None = None,
     ) -> AsyncIterator[str]:
         effective_timeout = timeout if timeout is not None else self.default_timeout
-        work_dir = self._resolve(cwd) if cwd is not None else self.workspace
+        if cwd is not None:
+            work_dir = self._resolve(cwd)
+            self._cwd = work_dir
+        else:
+            work_dir = self._cwd
         effective_env = {**os.environ, **(env or {})}
 
         proc = await asyncio.create_subprocess_shell(

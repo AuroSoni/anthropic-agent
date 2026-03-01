@@ -7,9 +7,10 @@ from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
 
 from .decorators import tool
+from .tool_types import ToolSchema
 
 if TYPE_CHECKING:
-    from agent_base.sandbox.types import Sandbox
+    from agent_base.sandbox.sandbox_types import Sandbox
 
 
 class ConfigurableToolBase(ABC):
@@ -19,7 +20,7 @@ class ConfigurableToolBase(ABC):
     - Docstrings use ``{placeholder}`` syntax that gets replaced with actual
       instance values at schema generation time
     - Library callers can provide custom docstring templates
-    - Library callers can provide complete schema overrides for full control
+    - Library callers can provide complete ``ToolSchema`` overrides for full control
     - A sandbox is injected at runtime for all file and command I/O
 
     Subclasses should:
@@ -78,7 +79,7 @@ class ConfigurableToolBase(ABC):
         def _safe_init(self: Any, *args: Any, **kw: Any) -> None:
             if not hasattr(self, "_schema_override"):
                 self._docstring_template: str | None = None
-                self._schema_override: dict | None = None
+                self._schema_override: ToolSchema | None = None
                 self._sandbox: Sandbox | None = None
             original_init(self, *args, **kw)
 
@@ -87,7 +88,7 @@ class ConfigurableToolBase(ABC):
     def __init__(
         self,
         docstring_template: Optional[str] = None,
-        schema_override: Optional[dict] = None,
+        schema_override: Optional[ToolSchema] = None,
     ):
         """Initialize the configurable tool base.
 
@@ -95,9 +96,8 @@ class ConfigurableToolBase(ABC):
             docstring_template: Optional custom docstring template with {placeholder}
                 syntax. If provided, overrides the class-level DOCSTRING_TEMPLATE.
                 Placeholders are replaced using values from _get_template_context().
-            schema_override: Optional complete tool schema dict. If provided,
+            schema_override: Optional ``ToolSchema`` override. If provided,
                 bypasses all docstring processing and uses this schema directly.
-                Must include 'name', 'description', and 'input_schema' keys.
         """
         self._docstring_template = docstring_template
         self._schema_override = schema_override

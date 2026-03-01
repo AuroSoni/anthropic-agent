@@ -70,7 +70,7 @@ def tool(
         ...         b: Second number
         ...     '''
         ...     return str(a + b)
-        >>> add.__tool_schema__['name']
+        >>> add.__tool_schema__.name
         'add'
         >>> add.__tool_executor__
         'backend'

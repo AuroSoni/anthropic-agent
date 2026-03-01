@@ -29,7 +29,7 @@ def tool(sandbox):
 def test_tool_has_schema(tool) -> None:
     func = tool.get_tool()
     assert hasattr(func, "__tool_schema__")
-    assert func.__tool_schema__["name"] == "grep_search"
+    assert func.__tool_schema__.name == "grep_search"
 
 
 # ─── Happy Path ────────────────────────────────────────────────────

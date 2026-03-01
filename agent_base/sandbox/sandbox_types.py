@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import asyncio
+import dataclasses
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 
 @dataclass
@@ -43,6 +43,43 @@ class FileEntry:
     """File size in bytes. 0 for directories."""
 
 
+@dataclass
+class SandboxConfig:
+    """Base sandbox configuration for serialization and reconstruction.
+
+    Every Sandbox implementation defines a corresponding SandboxConfig subclass
+    that captures all constructor parameters. This enables:
+
+      1. Serialization — ``config.to_dict()`` produces a JSON-safe dict.
+      2. Reconstruction — ``SandboxConfig.from_dict(d)`` restores the config,
+         and the sandbox's ``from_config()`` classmethod recreates the instance.
+
+    The ``sandbox_type`` field acts as a dispatch key so callers can determine
+    which Sandbox subclass to instantiate (analogous to ``provider`` on
+    ``AgentConfig`` for LLMConfig dispatch).
+
+    Subclasses add implementation-specific fields (paths, container IDs, etc.).
+    """
+
+    sandbox_type: str = ""
+    """Dispatch key identifying the Sandbox implementation (e.g. "local")."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a JSON-safe dict."""
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SandboxConfig:
+        """Reconstruct a SandboxConfig from a dict.
+
+        Filters keys to only those that are valid dataclass fields on ``cls``,
+        so unknown keys from older/newer schemas are silently ignored.
+        """
+        valid_fields = {f.name for f in dataclasses.fields(cls)}
+        filtered = {k: v for k, v in data.items() if k in valid_fields}
+        return cls(**filtered)
+
+
 class Sandbox(ABC):
     """Abstract execution environment for agent tools.
 
@@ -64,6 +101,20 @@ class Sandbox(ABC):
       - DockerSandbox (sandbox/docker.py)  — container isolation (future)
       - E2BSandbox    (sandbox/e2b.py)     — remote VM isolation (future)
     """
+
+    # ─── Configuration ─────────────────────────────────────────────────
+
+    @property
+    @abstractmethod
+    def config(self) -> SandboxConfig:
+        """Return a serializable config that can recreate this sandbox."""
+        ...
+
+    @classmethod
+    @abstractmethod
+    def from_config(cls, config: SandboxConfig) -> Sandbox:
+        """Recreate a sandbox instance from a serialized config."""
+        ...
 
     # ─── Lifecycle ────────────────────────────────────────────────────
 
@@ -198,8 +249,8 @@ class Sandbox(ABC):
     async def import_file(self, file_id: str, filename: str, content: bytes) -> str:
         """Accept a file for tool use, placing it where tools can access it.
 
-        Idempotent: if a file with this file_id and filename already exists,
-        skip the write and return the existing path.
+        If a file with this file_id and filename already exists, it is
+        overwritten with the new content.
 
         The sandbox decides the internal layout. Callers must not assume
         a specific path structure.

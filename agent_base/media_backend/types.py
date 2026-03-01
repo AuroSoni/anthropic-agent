@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from agent_base.sandbox.types import Sandbox
+    from agent_base.sandbox.sandbox_types import Sandbox
 
 
 @dataclass
@@ -294,8 +294,8 @@ class MediaBackend(ABC):
     async def materialize(self, media_id: str, agent_uuid: str) -> str:
         """Retrieve a file from storage and import it into the sandbox.
 
-        Idempotent: sandbox.import_file() skips the write if the file
-        already exists, so repeated calls are safe.
+        Repeated calls overwrite the imported file content for the same
+        media_id + filename path.
 
         Args:
             media_id: The media identifier in the backend.

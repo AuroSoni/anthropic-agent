@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from agent_base.core.result import AgentResult
     from agent_base.media_backend.types import MediaBackend
     from agent_base.memory.base import MemoryStore
-    from agent_base.sandbox.types import Sandbox
+    from agent_base.sandbox.sandbox_types import Sandbox
     from agent_base.storage.base import (
         AgentConfigAdapter,
         ConversationAdapter,

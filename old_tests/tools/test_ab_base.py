@@ -98,8 +98,8 @@ def test_get_tool_returns_decorated_function() -> None:
     assert hasattr(func, "__tool_instance__")
 
     schema = func.__tool_schema__
-    assert schema["name"] == "read_file"
-    assert "200" in schema["description"]
+    assert schema.name == "read_file"
+    assert "200" in schema.description
 
 
 def test_get_tool_function_still_callable() -> None:
@@ -110,15 +110,17 @@ def test_get_tool_function_still_callable() -> None:
 
 
 def test_schema_override_bypasses_docstring() -> None:
-    custom_schema = {
-        "name": "custom_read",
-        "description": "A fully custom schema.",
-        "input_schema": {
+    from agent_base.tools.tool_types import ToolSchema
+
+    custom_schema = ToolSchema(
+        name="custom_read",
+        description="A fully custom schema.",
+        input_schema={
             "type": "object",
             "properties": {"file": {"type": "string"}},
             "required": ["file"],
         },
-    }
+    )
 
     tool_instance = ReadToolStub(max_lines=50, schema_override=custom_schema)
     func = tool_instance.get_tool()

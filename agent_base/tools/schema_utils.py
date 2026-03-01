@@ -1,13 +1,15 @@
 """Schema generation utilities for tool functions.
 
 Analyzes Python function type hints and Google-style docstrings to produce
-canonical tool schemas in the format: {"name", "description", "input_schema"}.
+canonical ``ToolSchema`` objects.
 """
 import inspect
 import types
 import re
 from copy import copy
 from typing import get_type_hints, get_origin, get_args, Union, Literal, Any, Callable
+
+from .tool_types import ToolSchema
 
 
 _BASE_TYPE_MAPPING = {
@@ -199,12 +201,12 @@ def _convert_type_hints_to_json_schema(func: callable, error_on_missing_type_hin
     return schema
 
 
-def generate_tool_schema(func: Callable) -> dict:
+def generate_tool_schema(func: Callable) -> ToolSchema:
     """Generate a canonical tool schema from a function's type hints and docstring.
 
-    The schema format is: {"name", "description", "input_schema"}.
-    This is the framework's internal canonical form — provider-specific
-    conversions (Anthropic, OpenAI) happen at schema export time.
+    Analyzes the function's type hints and Google-style docstring to produce
+    a ``ToolSchema``. Provider-specific conversions (Anthropic, OpenAI)
+    happen at schema export time.
 
     Args:
         func: The function to generate a schema for. Must have type hints
@@ -212,7 +214,7 @@ def generate_tool_schema(func: Callable) -> dict:
             a fallback description is generated if missing.
 
     Returns:
-        Schema dict with "name", "description", and "input_schema" keys.
+        A ``ToolSchema`` with name, description, and input_schema populated.
 
     Raises:
         TypeHintParsingException: If type hints are missing or cannot be parsed.
@@ -248,8 +250,8 @@ def generate_tool_schema(func: Callable) -> dict:
             param_type = param_schema.get("type", "any")
             param_schema["description"] = f"Parameter of type {param_type}"
 
-    return {
-        "name": func_name,
-        "description": description,
-        "input_schema": json_schema,
-    }
+    return ToolSchema(
+        name=func_name,
+        description=description,
+        input_schema=json_schema,
+    )

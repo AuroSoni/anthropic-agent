@@ -25,14 +25,14 @@ def test_basic_schema_generation() -> None:
         return str(a + b)
 
     schema = generate_tool_schema(add)
-    assert schema["name"] == "add"
-    assert schema["description"] == "Add two numbers."
-    assert "input_schema" in schema
+    assert schema.name == "add"
+    assert schema.description == "Add two numbers."
+    assert schema.input_schema is not None
 
-    props = schema["input_schema"]["properties"]
+    props = schema.input_schema["properties"]
     assert props["a"]["type"] == "number"
     assert props["b"]["type"] == "number"
-    assert set(schema["input_schema"]["required"]) == {"a", "b"}
+    assert set(schema.input_schema["required"]) == {"a", "b"}
 
 
 def test_optional_params_not_required() -> None:
@@ -46,7 +46,7 @@ def test_optional_params_not_required() -> None:
         return f"Hello {name}"
 
     schema = generate_tool_schema(greet)
-    required = schema["input_schema"].get("required", [])
+    required = schema.input_schema.get("required", [])
     assert "name" in required
     assert "language" not in required
 
@@ -62,7 +62,7 @@ def test_nested_types() -> None:
         return "ok"
 
     schema = generate_tool_schema(plan)
-    props = schema["input_schema"]["properties"]
+    props = schema.input_schema["properties"]
     assert props["destinations"]["type"] == "array"
     assert props["destinations"]["items"]["type"] == "string"
     assert props["meta"]["type"] == "object"
@@ -81,7 +81,7 @@ def test_no_docstring_uses_fallback_description() -> None:
         return str(x)
 
     schema = generate_tool_schema(no_doc)
-    assert schema["description"] == "Function: no_doc"
+    assert schema.description == "Function: no_doc"
 
 
 def test_simple_docstring_fallback() -> None:
@@ -90,9 +90,9 @@ def test_simple_docstring_fallback() -> None:
         return str(x)
 
     schema = generate_tool_schema(simple)
-    assert schema["description"] == "Simple description only."
+    assert schema.description == "Simple description only."
     # 'x' has no Args: section, so gets fallback description
-    assert "Parameter of type" in schema["input_schema"]["properties"]["x"]["description"]
+    assert "Parameter of type" in schema.input_schema["properties"]["x"]["description"]
 
 
 def test_return_type_excluded_from_properties() -> None:
@@ -105,7 +105,7 @@ def test_return_type_excluded_from_properties() -> None:
         return str(a)
 
     schema = generate_tool_schema(func)
-    assert "return" not in schema["input_schema"]["properties"]
+    assert "return" not in schema.input_schema["properties"]
 
 
 def test_nullable_type() -> None:
@@ -118,7 +118,7 @@ def test_nullable_type() -> None:
         return value or ""
 
     schema = generate_tool_schema(func)
-    prop = schema["input_schema"]["properties"]["value"]
+    prop = schema.input_schema["properties"]["value"]
     # Should be ["string", "null"] or have "null" included
     assert "null" in str(prop)
 

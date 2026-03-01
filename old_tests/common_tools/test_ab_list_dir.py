@@ -31,7 +31,7 @@ def tool(sandbox):
 def test_tool_has_schema(tool) -> None:
     func = tool.get_tool()
     assert hasattr(func, "__tool_schema__")
-    assert func.__tool_schema__["name"] == "list_dir"
+    assert func.__tool_schema__.name == "list_dir"
 
 
 # ─── Happy Path ────────────────────────────────────────────────────

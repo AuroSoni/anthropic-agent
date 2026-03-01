@@ -59,7 +59,7 @@ def registry(sample_tools):
 
 def test_register_tools_populates_registry(registry) -> None:
     schemas = registry.get_schemas()
-    names = {s["name"] for s in schemas}
+    names = {s.name for s in schemas}
     assert names == {"add", "multiply"}
 
 
@@ -98,17 +98,17 @@ def test_get_schemas_returns_canonical(registry) -> None:
     schemas = registry.get_schemas()
     assert isinstance(schemas, list)
     assert len(schemas) == 2
-    assert all("input_schema" in s for s in schemas)
-    assert all("name" in s for s in schemas)
-    assert all("description" in s for s in schemas)
+    assert all(hasattr(s, "input_schema") for s in schemas)
+    assert all(hasattr(s, "name") for s in schemas)
+    assert all(hasattr(s, "description") for s in schemas)
 
 
 def test_get_schemas_returns_copies(registry) -> None:
     """Mutations to returned schemas should not affect the registry."""
     schemas = registry.get_schemas()
-    schemas[0]["name"] = "hacked"
+    schemas[0].name = "hacked"
     original = registry.get_schemas()
-    assert original[0]["name"] != "hacked"
+    assert original[0].name != "hacked"
 
 
 # ─── Single Execution ───────────────────────────────────────────────

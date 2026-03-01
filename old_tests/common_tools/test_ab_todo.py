@@ -35,13 +35,13 @@ def check_tool(sandbox):
 def test_write_tool_has_schema(write_tool) -> None:
     func = write_tool.get_tool()
     assert hasattr(func, "__tool_schema__")
-    assert func.__tool_schema__["name"] == "todo_write"
+    assert func.__tool_schema__.name == "todo_write"
 
 
 def test_check_tool_has_schema(check_tool) -> None:
     func = check_tool.get_tool()
     assert hasattr(func, "__tool_schema__")
-    assert func.__tool_schema__["name"] == "check_todo"
+    assert func.__tool_schema__.name == "check_todo"
 
 
 # ─── Happy Path ────────────────────────────────────────────────────

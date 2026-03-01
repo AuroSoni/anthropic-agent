@@ -31,7 +31,7 @@ def code_tool(sandbox):
 def test_tool_has_schema(code_tool) -> None:
     func = code_tool.get_tool()
     assert hasattr(func, "__tool_schema__")
-    assert func.__tool_schema__["name"] == "code_execution"
+    assert func.__tool_schema__.name == "code_execution"
 
 
 def test_tool_has_instance_ref(code_tool) -> None:
@@ -164,7 +164,7 @@ def test_embedded_tool_docs_in_schema() -> None:
         agent_uuid="test",
     )
     func = t.get_tool()
-    desc = func.__tool_schema__["description"]
+    desc = func.__tool_schema__.description
     assert "add" in desc
 
 
@@ -191,7 +191,7 @@ def test_docstring_includes_authorized_imports() -> None:
         max_output_chars=5_000,
     )
     func = t.get_tool()
-    desc = func.__tool_schema__["description"]
+    desc = func.__tool_schema__.description
     assert "numpy" in desc
     assert "pandas" in desc
 
@@ -203,5 +203,5 @@ def test_docstring_unrestricted_imports() -> None:
         max_output_chars=5_000,
     )
     func = t.get_tool()
-    desc = func.__tool_schema__["description"]
+    desc = func.__tool_schema__.description
     assert "unrestricted" in desc.lower()

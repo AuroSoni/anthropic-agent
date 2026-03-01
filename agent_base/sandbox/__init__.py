@@ -1,9 +1,11 @@
-from .types import ExecResult, FileEntry, Sandbox
-from .local import LocalSandbox
+from .sandbox_types import ExecResult, FileEntry, Sandbox, SandboxConfig
+from .local import LocalSandbox, LocalSandboxConfig
 
 __all__ = [
     "ExecResult",
     "FileEntry",
-    "Sandbox",
     "LocalSandbox",
+    "LocalSandboxConfig",
+    "Sandbox",
+    "SandboxConfig",
 ]

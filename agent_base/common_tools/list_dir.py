@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, TYPE_CH
 from ..tools.base import ConfigurableToolBase
 
 if TYPE_CHECKING:
-    from ..sandbox.types import FileEntry
+    from ..sandbox.sandbox_types import FileEntry
 
 # ---------------------------------------------------------------------------
 # Constants

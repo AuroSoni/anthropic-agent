@@ -2,16 +2,17 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, TYPE_CHECKING
 
-from .tool_types import ToolResultEnvelope, GenericTextEnvelope
+from .tool_types import ToolResultEnvelope, GenericTextEnvelope, ToolSchema
 from .decorators import ExecutorType
 
 if TYPE_CHECKING:
-    from agent_base.sandbox.types import Sandbox
+    from agent_base.sandbox.sandbox_types import Sandbox
 
 
 # ─── Data Structures ───────────────────────────────────────────────────
@@ -21,7 +22,7 @@ class RegisteredTool:
     """Internal metadata for a registered tool."""
     name: str
     func: Callable
-    schema: dict
+    schema: ToolSchema
     executor: ExecutorType = "backend"
     needs_confirmation: bool = False
 
@@ -68,7 +69,7 @@ class ToolRegistry:
 
     # ─── Registration ──────────────────────────────────────────────
 
-    def register(self, name: str, func: Callable, schema: dict) -> None:
+    def register(self, name: str, func: Callable, schema: ToolSchema) -> None:
         """Register a single tool with its function and schema.
 
         Reads ``__tool_executor__`` and ``__tool_needs_confirmation__`` from
@@ -78,7 +79,7 @@ class ToolRegistry:
         Args:
             name: Tool name (must be unique within the registry).
             func: The callable to execute.
-            schema: Canonical tool schema dict (``name``, ``description``, ``input_schema``).
+            schema: Canonical ``ToolSchema`` for this tool.
         """
         executor: ExecutorType = getattr(func, "__tool_executor__", "backend")
         needs_confirmation: bool = getattr(func, "__tool_needs_confirmation__", False)
@@ -109,26 +110,25 @@ class ToolRegistry:
                     f"Function '{func.__name__}' is missing __tool_schema__ attribute. "
                     f"Did you forget to apply the @tool decorator?"
                 )
-            schema = func.__tool_schema__
-            name = schema["name"]
-            self.register(name, func, schema)
+            schema: ToolSchema = func.__tool_schema__
+            self.register(schema.name, func, schema)
 
     # ─── Schema Export ─────────────────────────────────────────────
 
-    def get_schemas(self) -> list[dict]:
+    def get_schemas(self) -> list[ToolSchema]:
         """Get registered tool schemas in canonical format.
 
-        Returns copies of the canonical schema dicts (``name``, ``description``,
-        ``input_schema``). All tools (backend and frontend) are included since
-        the LLM needs to see all available tools.
+        Returns copies of the canonical ``ToolSchema`` objects. All tools
+        (backend and frontend) are included since the LLM needs to see all
+        available tools.
 
         Provider-specific format conversion (e.g. Anthropic → OpenAI) is the
         responsibility of each provider's ``MessageFormatter.format_tool_schemas()``.
 
         Returns:
-            List of canonical schema dictionaries.
+            List of ``ToolSchema`` copies (safe to mutate without affecting the registry).
         """
-        return [t.schema.copy() for t in self._tools.values()]
+        return [copy.copy(t.schema) for t in self._tools.values()]
 
     # ─── Sandbox ───────────────────────────────────────────────────
 
