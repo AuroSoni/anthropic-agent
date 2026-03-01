@@ -334,8 +334,8 @@ class MediaBackend(ABC):
     async def flush_exports(self, agent_uuid: str) -> list[MediaMetadata]:
         """Collect files from the sandbox exports area and store them.
 
-        Calls sandbox.get_exported_files() to discover all files tools
-        have produced, then stores each one in the backend.
+        Lists exported files, then streams and stores each one individually
+        so that only one file's bytes are in memory at a time.
 
         Args:
             agent_uuid: Agent session UUID.
@@ -351,10 +351,15 @@ class MediaBackend(ABC):
                 "No sandbox attached. Call attach_sandbox() before flush_exports()."
             )
 
-        exported = await self._sandbox.get_exported_files()
+        paths = await self._sandbox.list_exported_files()
         results: list[MediaMetadata] = []
 
-        for rel_path, content in exported:
+        for rel_path in paths:
+            chunks: list[bytes] = []
+            async for chunk in self._sandbox.get_exported_file(rel_path):
+                chunks.append(chunk)
+            content = b"".join(chunks)
+
             basename = os.path.basename(rel_path)
             mime_type = (
                 mimetypes.guess_type(basename)[0] or "application/octet-stream"

@@ -9,8 +9,21 @@ from pathlib import Path
 from typing import AsyncIterator
 
 import aiofiles
+import blake3
 
-from .sandbox_types import ExecResult, FileEntry, Sandbox, SandboxConfig
+from .sandbox_types import (
+    ExecResult,
+    ExportedFileMetadata,
+    FileEntry,
+    MAX_READ_LINES,
+    READ_CHUNK_SIZE,
+    Sandbox,
+    SandboxConfig,
+    SandboxNotATextFileError,
+    SandboxPathEscapeError,
+    TEXT_EXTENSIONS,
+    TOKEN_COUNTING_SIZE_THRESHOLD,
+)
 
 
 @dataclass
@@ -84,16 +97,34 @@ class LocalSandbox(Sandbox):
     def _resolve(self, path: str) -> Path:
         """Resolve a relative path to an absolute path within the sandbox root.
 
-        Raises ValueError if the resolved path escapes the sandbox boundary.
+        Raises SandboxPathEscapeError if the resolved path escapes the sandbox.
         """
         resolved = (self.root / path).resolve()
         try:
             resolved.relative_to(self.root.resolve())
         except ValueError:
-            raise ValueError(
-                f"Path traversal blocked: '{path}' resolves outside sandbox"
-            ) from None
+            raise SandboxPathEscapeError(path) from None
         return resolved
+
+    # ─── Helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _build_file_entry(name: str, is_dir: bool, size: int, ext: str) -> FileEntry:
+        """Build a FileEntry with token estimation for text files."""
+        tokens = None
+        if (
+            not is_dir
+            and ext.lower() in TEXT_EXTENSIONS
+            and size <= TOKEN_COUNTING_SIZE_THRESHOLD
+        ):
+            tokens = size // 3 # We're deliberately overestimating tokens here.
+        return FileEntry(
+            name=name,
+            is_dir=is_dir,
+            size_bytes=size,
+            extension=ext,
+            tokens=tokens,
+        )
 
     # ─── Lifecycle ───────────────────────────────────────────────────
 
@@ -109,10 +140,29 @@ class LocalSandbox(Sandbox):
 
     # ─── Filesystem ──────────────────────────────────────────────────
 
-    async def read_file(self, path: str) -> str:
+    async def read_file(
+        self,
+        path: str,
+        offset: int = 0,
+        limit: int | None = None,
+    ) -> str:
         resolved = self._resolve(path)
+        ext = resolved.suffix.lower()
+        if ext and ext not in TEXT_EXTENSIONS:
+            raise SandboxNotATextFileError(path, ext)
+        effective_limit = min(limit, MAX_READ_LINES) if limit is not None else MAX_READ_LINES
+        selected: list[str] = []
         async with aiofiles.open(resolved, "r", encoding="utf-8", errors="replace") as f:
-            return await f.read()
+            line_num = 0
+            async for line in f:
+                if line_num < offset:
+                    line_num += 1
+                    continue
+                selected.append(line)
+                if len(selected) >= effective_limit:
+                    break
+                line_num += 1
+        return "".join(selected)
 
     async def write_file(self, path: str, content: str) -> None:
         resolved = self._resolve(path)
@@ -120,16 +170,23 @@ class LocalSandbox(Sandbox):
         async with aiofiles.open(resolved, "w", encoding="utf-8") as f:
             await f.write(content)
 
-    async def read_file_bytes(self, path: str) -> bytes:
+    async def read_file_bytes(self, path: str) -> AsyncIterator[bytes]:
         resolved = self._resolve(path)
         async with aiofiles.open(resolved, "rb") as f:
-            return await f.read()
+            while True:
+                chunk = await f.read(READ_CHUNK_SIZE)
+                if not chunk:
+                    break
+                yield chunk
 
-    async def write_file_bytes(self, path: str, content: bytes) -> None:
+    async def write_file_bytes(
+        self, path: str, data: AsyncIterator[bytes]
+    ) -> None:
         resolved = self._resolve(path)
         resolved.parent.mkdir(parents=True, exist_ok=True)
         async with aiofiles.open(resolved, "wb") as f:
-            await f.write(content)
+            async for chunk in data:
+                await f.write(chunk)
 
     async def list_dir(self, path: str = ".") -> list[FileEntry]:
         resolved = self._resolve(path)
@@ -141,22 +198,28 @@ class LocalSandbox(Sandbox):
         entries: list[FileEntry] = []
         for item in sorted(resolved.iterdir(), key=lambda p: p.name):
             try:
-                size = item.stat().st_size if item.is_file() else 0
+                is_dir = item.is_dir()
+                size = item.stat().st_size if not is_dir else 0
+                ext = item.suffix if not is_dir else ""
             except OSError:
+                is_dir = False
                 size = 0
-            entries.append(FileEntry(
-                name=item.name,
-                is_dir=item.is_dir(),
-                size_bytes=size,
-            ))
+                ext = ""
+            entries.append(self._build_file_entry(item.name, is_dir, size, ext))
         return entries
 
-    async def file_exists(self, path: str) -> bool:
+    async def file_exists(self, path: str) -> tuple[bool, FileEntry | None]:
         try:
             resolved = self._resolve(path)
-        except ValueError:
-            return False
-        return resolved.exists()
+        except SandboxPathEscapeError:
+            return (False, None)
+        if not resolved.exists():
+            return (False, None)
+        is_dir = resolved.is_dir()
+        size = resolved.stat().st_size if not is_dir else 0
+        ext = resolved.suffix if not is_dir else ""
+        entry = self._build_file_entry(resolved.name, is_dir, size, ext)
+        return (True, entry)
 
     async def delete(self, path: str) -> bool:
         resolved = self._resolve(path)
@@ -170,34 +233,61 @@ class LocalSandbox(Sandbox):
 
     # ─── File Coordination ────────────────────────────────────────────
 
-    async def import_file(self, file_id: str, filename: str, content: bytes) -> str:
-        sandbox_path = f".imported/{file_id}/{filename}"
-        resolved = self._resolve(sandbox_path)
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        async with aiofiles.open(resolved, "wb") as f:
-            await f.write(content)
+    async def import_file(
+        self, filename: str, data: AsyncIterator[bytes]
+    ) -> str:
+        sandbox_path = f".imported/{filename}"
+        await self.write_file_bytes(sandbox_path, data)
         return sandbox_path
 
-    async def get_exported_files(self) -> list[tuple[str, bytes]]:
+    async def list_exported_files(self) -> list[str]:
         exports_root = self.root / ".exports"
         if not exports_root.exists():
             return []
-        results: list[tuple[str, bytes]] = []
-        await self._collect_exports(exports_root, exports_root, results)
+        results: list[str] = []
+        self._collect_export_paths(exports_root, exports_root, results)
         return results
 
-    async def _collect_exports(
-        self, current: Path, root: Path, results: list[tuple[str, bytes]]
+    def _collect_export_paths(
+        self, current: Path, root: Path, results: list[str]
     ) -> None:
-        """Recursively collect files from the exports directory."""
+        """Recursively collect relative paths from the exports directory."""
         for item in sorted(current.iterdir(), key=lambda p: p.name):
             if item.is_dir():
-                await self._collect_exports(item, root, results)
+                self._collect_export_paths(item, root, results)
             elif item.is_file():
-                relative = str(item.relative_to(root))
-                async with aiofiles.open(item, "rb") as f:
-                    content = await f.read()
-                results.append((relative, content))
+                results.append(str(item.relative_to(root)))
+
+    async def get_exported_file(self, path: str) -> AsyncIterator[bytes]:
+        exports_root = self.root / ".exports"
+        resolved = (exports_root / path).resolve()
+        try:
+            resolved.relative_to(exports_root.resolve())
+        except ValueError:
+            raise SandboxPathEscapeError(path) from None
+        if not resolved.is_file():
+            raise FileNotFoundError(f"Exported file not found: '{path}'")
+        sandbox_relative = str(resolved.relative_to(self.root))
+        async for chunk in self.read_file_bytes(sandbox_relative):
+            yield chunk
+
+    async def get_exported_file_metadata(self) -> list[ExportedFileMetadata]:
+        paths = await self.list_exported_files()
+        results: list[ExportedFileMetadata] = []
+        exports_root = self.root / ".exports"
+        for path in paths:
+            resolved = exports_root / path
+            hasher = blake3.blake3()
+            async for chunk in self.get_exported_file(path):
+                hasher.update(chunk)
+            results.append(ExportedFileMetadata(
+                filename=resolved.name,
+                extension=resolved.suffix,
+                size_bytes=resolved.stat().st_size,
+                blake3_hash=hasher.hexdigest(),
+                path=path,
+            ))
+        return results
 
     # ─── Execution ───────────────────────────────────────────────────
 

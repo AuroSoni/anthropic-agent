@@ -6,6 +6,54 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
 
+# ─── Constants ────────────────────────────────────────────────────────
+
+TOKEN_COUNTING_SIZE_THRESHOLD: int = 1 * 1024 * 1024  # 1MB
+"""Files larger than this are skipped for token counting."""
+
+READ_CHUNK_SIZE: int = 64 * 1024  # 64KB
+"""Chunk size for streaming file reads/writes."""
+
+MAX_READ_LINES: int = 10_000
+"""Maximum number of lines read_file can return in a single call."""
+
+TEXT_EXTENSIONS: frozenset[str] = frozenset({
+    ".txt", ".md", ".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".yaml", ".yml",
+    ".xml", ".html", ".htm", ".css", ".csv", ".toml", ".cfg", ".ini", ".sh",
+    ".bash", ".c", ".h", ".cpp", ".hpp", ".java", ".rs", ".go", ".rb",
+    ".sql", ".log", ".env", ".rst", ".tex", ".svg", ".graphql", ".proto",
+    ".swift", ".kt", ".scala", ".lua",
+})
+"""File extensions considered text-based for token counting and read_file."""
+
+
+# ─── Exceptions ───────────────────────────────────────────────────────
+
+
+class SandboxPathEscapeError(ValueError):
+    """Raised when a path resolves outside the sandbox boundary."""
+
+    def __init__(self, path: str):
+        self.path = path
+        super().__init__(f"Path traversal blocked: '{path}' resolves outside sandbox")
+
+
+class SandboxNotATextFileError(Exception):
+    """Raised when read_file is called on a non-text file."""
+
+    def __init__(self, path: str, extension: str):
+        self.path = path
+        self.extension = extension
+        super().__init__(
+            f"Cannot read non-text file with read_file: '{path}' "
+            f"(extension '{extension}' not in TEXT_EXTENSIONS). "
+            f"Use read_file_bytes for binary files."
+        )
+
+
+# ─── Data types ───────────────────────────────────────────────────────
+
+
 @dataclass
 class ExecResult:
     """Captured output of a command executed inside a sandbox.
@@ -31,7 +79,7 @@ class ExecResult:
 
 @dataclass
 class FileEntry:
-    """A single entry returned by Sandbox.list_dir()."""
+    """A single entry returned by Sandbox.list_dir() and Sandbox.file_exists()."""
 
     name: str
     """Bare filename or directory name (no path prefix)."""
@@ -41,6 +89,33 @@ class FileEntry:
 
     size_bytes: int = 0
     """File size in bytes. 0 for directories."""
+
+    extension: str = ""
+    """File extension including the dot (e.g. ".py"). Empty for directories."""
+
+    tokens: int | None = None
+    """Estimated LLM token count (size_bytes // 3). None for directories,
+    binary files, or files exceeding TOKEN_COUNTING_SIZE_THRESHOLD."""
+
+
+@dataclass
+class ExportedFileMetadata:
+    """Metadata for a file in the sandbox exports area."""
+
+    filename: str
+    """Bare filename (e.g. "report.csv")."""
+
+    extension: str
+    """File extension including the dot (e.g. ".csv")."""
+
+    size_bytes: int
+    """File size in bytes."""
+
+    blake3_hash: str
+    """Hex digest of the file contents (BLAKE3)."""
+
+    path: str
+    """Path relative to the exports root (e.g. "subdir/report.csv")."""
 
 
 @dataclass
@@ -78,6 +153,9 @@ class SandboxConfig:
         valid_fields = {f.name for f in dataclasses.fields(cls)}
         filtered = {k: v for k, v in data.items() if k in valid_fields}
         return cls(**filtered)
+
+
+# ─── Sandbox ABC ──────────────────────────────────────────────────────
 
 
 class Sandbox(ABC):
@@ -149,17 +227,27 @@ class Sandbox(ABC):
     # ─── Filesystem ──────────────────────────────────────────────────
 
     @abstractmethod
-    async def read_file(self, path: str) -> str:
+    async def read_file(
+        self,
+        path: str,
+        offset: int = 0,
+        limit: int | None = None,
+    ) -> str:
         """Read a text file and return its contents as a string.
+
+        Only works with text-based files (extension in TEXT_EXTENSIONS).
 
         Args:
             path: Relative path within the sandbox (e.g. "src/main.py").
+            offset: Number of lines to skip from the start.
+            limit: Maximum number of lines to return. Capped at MAX_READ_LINES.
 
         Returns:
             File contents decoded as UTF-8 (errors='replace').
 
         Raises:
-            ValueError: If path resolves outside the sandbox.
+            SandboxPathEscapeError: If path resolves outside the sandbox.
+            SandboxNotATextFileError: If the file is not a text file.
             FileNotFoundError: If the file does not exist.
             IsADirectoryError: If path is a directory.
         """
@@ -176,33 +264,41 @@ class Sandbox(ABC):
             content: String content to write (UTF-8 encoded).
 
         Raises:
-            ValueError: If path resolves outside the sandbox.
+            SandboxPathEscapeError: If path resolves outside the sandbox.
         """
         ...
 
     @abstractmethod
-    async def read_file_bytes(self, path: str) -> bytes:
-        """Read a binary file and return its raw bytes.
+    async def read_file_bytes(self, path: str) -> AsyncIterator[bytes]:
+        """Read a file and yield its contents as a stream of byte chunks.
 
         Args:
             path: Relative path within the sandbox.
 
+        Yields:
+            Byte chunks of up to READ_CHUNK_SIZE bytes.
+
         Raises:
-            ValueError: If path resolves outside the sandbox.
+            SandboxPathEscapeError: If path resolves outside the sandbox.
             FileNotFoundError: If the file does not exist.
         """
         ...
+        yield b""  # pragma: no cover
 
     @abstractmethod
-    async def write_file_bytes(self, path: str, content: bytes) -> None:
-        """Write raw bytes to a file, creating parent directories as needed.
+    async def write_file_bytes(
+        self, path: str, data: AsyncIterator[bytes]
+    ) -> None:
+        """Write a stream of byte chunks to a file.
+
+        Creates parent directories as needed. Overwrites the file if it exists.
 
         Args:
             path: Relative path within the sandbox.
-            content: Raw bytes to write.
+            data: Async iterator yielding byte chunks.
 
         Raises:
-            ValueError: If path resolves outside the sandbox.
+            SandboxPathEscapeError: If path resolves outside the sandbox.
         """
         ...
 
@@ -217,17 +313,20 @@ class Sandbox(ABC):
             Sorted list of FileEntry objects (sorted by name, ascending).
 
         Raises:
-            ValueError: If path resolves outside the sandbox.
+            SandboxPathEscapeError: If path resolves outside the sandbox.
             NotADirectoryError: If path is a file.
             FileNotFoundError: If path does not exist.
         """
         ...
 
     @abstractmethod
-    async def file_exists(self, path: str) -> bool:
+    async def file_exists(self, path: str) -> tuple[bool, FileEntry | None]:
         """Check whether a file or directory exists at the given path.
 
-        Returns False (does not raise) if path escapes the sandbox.
+        Returns (False, None) without raising if path escapes the sandbox.
+
+        Returns:
+            Tuple of (exists, file_entry). file_entry is None when not found.
         """
         ...
 
@@ -239,26 +338,24 @@ class Sandbox(ABC):
             True if deleted, False if it did not exist.
 
         Raises:
-            ValueError: If path resolves outside the sandbox.
+            SandboxPathEscapeError: If path resolves outside the sandbox.
         """
         ...
 
     # ─── File Coordination ────────────────────────────────────────────
 
     @abstractmethod
-    async def import_file(self, file_id: str, filename: str, content: bytes) -> str:
-        """Accept a file for tool use, placing it where tools can access it.
-
-        If a file with this file_id and filename already exists, it is
-        overwritten with the new content.
+    async def import_file(
+        self, filename: str, data: AsyncIterator[bytes]
+    ) -> str:
+        """Accept a file stream for tool use, placing it where tools can access it.
 
         The sandbox decides the internal layout. Callers must not assume
         a specific path structure.
 
         Args:
-            file_id: Unique identifier for the file (typically a media_id).
             filename: Human-readable filename (e.g. "photo.png").
-            content: Raw file bytes.
+            data: Async iterator yielding byte chunks of the file content.
 
         Returns:
             Sandbox-relative path where the file is accessible.
@@ -266,15 +363,44 @@ class Sandbox(ABC):
         ...
 
     @abstractmethod
-    async def get_exported_files(self) -> list[tuple[str, bytes]]:
-        """Collect all files that tools have produced in the exports area.
+    async def list_exported_files(self) -> list[str]:
+        """List all file paths in the exports area.
 
-        Scans the exports zone recursively and returns every file found.
+        Scans the exports zone recursively and returns every file path found.
 
         Returns:
-            List of (relative_filename, content) tuples. relative_filename
-            is the path relative to the exports area root (e.g. "report.csv"
-            or "subdir/data.json"). Empty list if no exports exist.
+            List of paths relative to the exports root (e.g. ["report.csv",
+            "subdir/data.json"]). Empty list if no exports exist.
+        """
+        ...
+
+    @abstractmethod
+    async def get_exported_file(self, path: str) -> AsyncIterator[bytes]:
+        """Read a single exported file as a byte stream.
+
+        Args:
+            path: Path relative to the exports root (as returned by
+                  list_exported_files).
+
+        Yields:
+            Byte chunks of up to READ_CHUNK_SIZE bytes.
+
+        Raises:
+            FileNotFoundError: If the file does not exist in the exports area.
+            SandboxPathEscapeError: If path escapes the exports area.
+        """
+        ...
+        yield b""  # pragma: no cover
+
+    @abstractmethod
+    async def get_exported_file_metadata(self) -> list[ExportedFileMetadata]:
+        """Return metadata for all files in the exports area.
+
+        Scans the exports zone recursively and returns metadata (filename,
+        extension, size, blake3 hash, relative path) for every file found.
+
+        Returns:
+            List of ExportedFileMetadata objects. Empty list if no exports exist.
         """
         ...
 
@@ -306,7 +432,7 @@ class Sandbox(ABC):
             if timeout was exceeded.
 
         Raises:
-            ValueError: If cwd resolves outside the sandbox.
+            SandboxPathEscapeError: If cwd resolves outside the sandbox.
         """
         ...
 
@@ -332,7 +458,7 @@ class Sandbox(ABC):
             Lines of output (stdout + stderr merged) as produced.
 
         Raises:
-            ValueError: If cwd resolves outside the sandbox.
+            SandboxPathEscapeError: If cwd resolves outside the sandbox.
         """
         ...
         # Make this an abstract async generator — yield is needed for type

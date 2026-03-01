@@ -125,8 +125,11 @@ async def test_read_nonexistent_raises(live_sandbox):
 
 @pytest.mark.asyncio
 async def test_read_file_utf8_replacement(live_sandbox):
-    # Write raw bytes that aren't valid UTF-8, then read as text
-    await live_sandbox.write_file_bytes("bad_utf8.txt", b"hello \xff world")
+    # Write raw bytes that aren't valid UTF-8 via streaming, then read as text
+    async def _data():
+        yield b"hello \xff world"
+
+    await live_sandbox.write_file_bytes("bad_utf8.txt", _data())
     content = await live_sandbox.read_file("bad_utf8.txt")
     assert "hello" in content
     assert "world" in content
@@ -138,8 +141,15 @@ async def test_read_file_utf8_replacement(live_sandbox):
 @pytest.mark.asyncio
 async def test_write_and_read_bytes(live_sandbox):
     data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
-    await live_sandbox.write_file_bytes("image.png", data)
-    result = await live_sandbox.read_file_bytes("image.png")
+
+    async def _data():
+        yield data
+
+    await live_sandbox.write_file_bytes("image.png", _data())
+    chunks = []
+    async for chunk in live_sandbox.read_file_bytes("image.png"):
+        chunks.append(chunk)
+    result = b"".join(chunks)
     assert result == data
 
 
@@ -191,24 +201,36 @@ async def test_symlink_escape_blocked(live_sandbox):
 @pytest.mark.asyncio
 async def test_file_exists_true_for_file(live_sandbox):
     await live_sandbox.write_file("exists.txt", "yes")
-    assert await live_sandbox.file_exists("exists.txt") is True
+    exists, entry = await live_sandbox.file_exists("exists.txt")
+    assert exists is True
+    assert entry is not None
+    assert entry.name == "exists.txt"
+    assert entry.is_dir is False
+    assert entry.extension == ".txt"
 
 
 @pytest.mark.asyncio
 async def test_file_exists_true_for_dir(live_sandbox):
     await live_sandbox.write_file("subdir/file.txt", "data")
-    assert await live_sandbox.file_exists("subdir") is True
+    exists, entry = await live_sandbox.file_exists("subdir")
+    assert exists is True
+    assert entry is not None
+    assert entry.is_dir is True
 
 
 @pytest.mark.asyncio
 async def test_file_exists_false_for_missing(live_sandbox):
-    assert await live_sandbox.file_exists("nope.txt") is False
+    exists, entry = await live_sandbox.file_exists("nope.txt")
+    assert exists is False
+    assert entry is None
 
 
 @pytest.mark.asyncio
 async def test_file_exists_false_for_escaped_path(live_sandbox):
-    # Should return False, not raise ValueError
-    assert await live_sandbox.file_exists("../../etc/passwd") is False
+    # Should return (False, None), not raise
+    exists, entry = await live_sandbox.file_exists("../../etc/passwd")
+    assert exists is False
+    assert entry is None
 
 
 # ─── delete ──────────────────────────────────────────────────────────
@@ -218,7 +240,8 @@ async def test_file_exists_false_for_escaped_path(live_sandbox):
 async def test_delete_file(live_sandbox):
     await live_sandbox.write_file("doomed.txt", "bye")
     assert await live_sandbox.delete("doomed.txt") is True
-    assert await live_sandbox.file_exists("doomed.txt") is False
+    exists, _ = await live_sandbox.file_exists("doomed.txt")
+    assert exists is False
 
 
 @pytest.mark.asyncio
@@ -226,7 +249,8 @@ async def test_delete_directory_recursive(live_sandbox):
     await live_sandbox.write_file("dir/a.txt", "a")
     await live_sandbox.write_file("dir/b.txt", "b")
     assert await live_sandbox.delete("dir") is True
-    assert await live_sandbox.file_exists("dir") is False
+    exists, _ = await live_sandbox.file_exists("dir")
+    assert exists is False
 
 
 @pytest.mark.asyncio
