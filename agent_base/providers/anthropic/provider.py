@@ -22,7 +22,7 @@ from .retry import anthropic_stream_with_backoff, retry_with_backoff
 if TYPE_CHECKING:
     from agent_base.core.config import LLMConfig
     from agent_base.core.messages import Message
-    from agent_base.media_backend.types import MediaBackend
+    from agent_base.media_backend.media_types import MediaBackend
     from agent_base.streaming.base import StreamFormatter
     from agent_base.tools.tool_types import ToolSchema
 

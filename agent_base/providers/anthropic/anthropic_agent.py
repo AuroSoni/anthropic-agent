@@ -23,7 +23,7 @@ from .provider import AnthropicProvider
 if TYPE_CHECKING:
     from agent_base.compaction.base import Compactor
     from agent_base.core.result import AgentResult
-    from agent_base.media_backend.types import MediaBackend
+    from agent_base.media_backend.media_types import MediaBackend
     from agent_base.memory.base import MemoryStore
     from agent_base.sandbox.sandbox_types import Sandbox
     from agent_base.storage.base import (

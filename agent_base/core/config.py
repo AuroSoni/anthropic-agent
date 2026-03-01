@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
 
 from agent_base.core.messages import Message, Usage
-from agent_base.media_backend.types import MediaMetadata
+from agent_base.media_backend.media_types import MediaMetadata
 from agent_base.tools.tool_types import ToolSchema
 
 if TYPE_CHECKING:

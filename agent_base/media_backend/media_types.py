@@ -20,7 +20,7 @@ class MediaMetadata:
     media_extension: str  # Extension without dot (e.g. "png", "pdf")
     media_size: int  # Size in bytes
     storage_type: str  # Backend type (e.g. "local", "s3", "cloudflare_r2")
-    storage_location: str  # Backend-specific location (file path, S3 key, etc.)
+    storage_location: str  # Backend-specific location (file path, S3 URL, etc.)
 
     extras: dict[str, Any] = field(default_factory=dict)
     """Backend-specific extension point (must be JSON serializable)."""

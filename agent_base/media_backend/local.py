@@ -9,8 +9,7 @@ from typing import Any
 
 import aiofiles
 
-from .types import MediaBackend, MediaMetadata
-
+from .media_types import MediaBackend, MediaMetadata
 
 class LocalMediaBackend(MediaBackend):
     """Filesystem-backed media storage.

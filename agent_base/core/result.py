@@ -11,7 +11,7 @@ from typing import Any
 
 from agent_base.core.config import CostBreakdown
 from agent_base.core.messages import Message, Usage
-from agent_base.media_backend.types import MediaMetadata
+from agent_base.media_backend.media_types import MediaMetadata
 
 
 @dataclass
