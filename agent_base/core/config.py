@@ -17,7 +17,7 @@ from typing import Any, TYPE_CHECKING
 
 from agent_base.core.messages import Message, Usage
 from agent_base.media_backend.types import MediaMetadata
-from agent_base.tools.types import ToolSchema
+from agent_base.tools.tool_types import ToolSchema
 
 if TYPE_CHECKING:
     from agent_base.tools.registry import ToolCallInfo

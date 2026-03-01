@@ -12,7 +12,7 @@ from agent_base.tools.registry import (
     ToolCallInfo,
     ToolCallClassification,
 )
-from agent_base.tools.types import (
+from agent_base.tools.tool_types import (
     ToolResultEnvelope,
     GenericTextEnvelope,
     GenericErrorEnvelope,

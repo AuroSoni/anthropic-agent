@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from agent_base.core.config import LLMConfig
     from agent_base.core.messages import Message, MessageFormatter
     from agent_base.streaming.base import StreamFormatter
-    from agent_base.tools.types import ToolSchema
+    from agent_base.tools.tool_types import ToolSchema
 
 
 class Provider(ABC):

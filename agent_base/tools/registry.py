@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, TYPE_CHECKING
 
-from .types import ToolResultEnvelope, GenericTextEnvelope
+from .tool_types import ToolResultEnvelope, GenericTextEnvelope
 from .decorators import ExecutorType
 
 if TYPE_CHECKING:

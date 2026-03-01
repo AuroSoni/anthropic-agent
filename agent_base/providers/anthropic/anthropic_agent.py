@@ -309,6 +309,7 @@ class AnthropicAgent(Agent):
                     stream_formatter=stream_formatter if stream_formatter is not None else DEFAULT_STREAM_FORMATTER,
                     stream_tool_results=self.stream_meta_history_and_tool_results,
                     agent_uuid=self.agent_config.agent_uuid,
+                    media_backend=self.media_backend,
                 )
             else:
                 response_message: Message = await self.provider.generate(
@@ -320,6 +321,7 @@ class AnthropicAgent(Agent):
                     max_retries=self.max_retries,
                     base_delay=self.base_delay,
                     agent_uuid=self.agent_config.agent_uuid,
+                    media_backend=self.media_backend,
                 )
                 
             self.agent_config.current_step += 1

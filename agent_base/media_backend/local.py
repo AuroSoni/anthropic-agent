@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import mimetypes
 import uuid
 from pathlib import Path
@@ -91,6 +92,24 @@ class LocalMediaBackend(MediaBackend):
             storage_location=str(path.absolute()),
         )
 
+    def _extras_path(self, agent_uuid: str, media_id: str) -> Path:
+        """Path to the sidecar JSON file that stores extras for a media file."""
+        return self.base_path / agent_uuid / f"{media_id}.meta.json"
+
+    async def _load_extras(self, agent_uuid: str, media_id: str) -> dict[str, Any]:
+        """Load extras from sidecar file, returning empty dict if none exists."""
+        path = self._extras_path(agent_uuid, media_id)
+        if not path.exists():
+            return {}
+        async with aiofiles.open(path, "r") as f:
+            return json.loads(await f.read())
+
+    async def _save_extras(self, agent_uuid: str, media_id: str, extras: dict[str, Any]) -> None:
+        """Write extras to sidecar JSON file."""
+        path = self._extras_path(agent_uuid, media_id)
+        async with aiofiles.open(path, "w") as f:
+            await f.write(json.dumps(extras))
+
     # ─── Storage operations ───────────────────────────────────────────
 
     async def store(
@@ -159,13 +178,30 @@ class LocalMediaBackend(MediaBackend):
         mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
         size = path.stat().st_size
 
-        return self._build_metadata(
+        metadata = self._build_metadata(
             media_id=media_id,
             filename=filename,
             mime_type=mime_type,
             size=size,
             path=path,
         )
+        metadata.extras = await self._load_extras(agent_uuid, media_id)
+        return metadata
+
+    async def update_metadata(
+        self,
+        media_id: str,
+        agent_uuid: str,
+        extras: dict[str, Any],
+    ) -> None:
+        path = self._find_file(agent_uuid, media_id)
+        if path is None:
+            raise FileNotFoundError(
+                f"Media not found: media_id={media_id!r}, agent_uuid={agent_uuid!r}"
+            )
+        existing = await self._load_extras(agent_uuid, media_id)
+        existing.update(extras)
+        await self._save_extras(agent_uuid, media_id, existing)
 
     # ─── Resolution ───────────────────────────────────────────────────
 

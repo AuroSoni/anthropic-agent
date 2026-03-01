@@ -23,7 +23,7 @@ from agent_base.core.messages import Message, Usage
 from agent_base.core.result import LogEntry
 from agent_base.media_backend.types import MediaMetadata
 from agent_base.tools.registry import ToolCallInfo
-from agent_base.tools.types import ToolSchema
+from agent_base.tools.tool_types import ToolSchema
 
 
 # =============================================================================

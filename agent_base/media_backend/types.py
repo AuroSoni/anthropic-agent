@@ -186,6 +186,28 @@ class MediaBackend(ABC):
         """
         ...
 
+    @abstractmethod
+    async def update_metadata(
+        self,
+        media_id: str,
+        agent_uuid: str,
+        extras: dict[str, Any],
+    ) -> None:
+        """Merge extra metadata for a stored media file.
+
+        Updates the ``extras`` dict on the stored metadata by merging
+        the provided keys. Existing keys not in ``extras`` are preserved.
+
+        Args:
+            media_id: The media identifier.
+            agent_uuid: Agent session UUID.
+            extras: Key-value pairs to merge into the metadata extras.
+
+        Raises:
+            FileNotFoundError: If the media_id does not exist.
+        """
+        ...
+
     # ─── Resolution (projections for different consumers) ─────────────
 
     @abstractmethod

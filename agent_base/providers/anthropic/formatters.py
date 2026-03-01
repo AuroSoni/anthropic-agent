@@ -35,6 +35,7 @@ from agent_base.logging import get_logger
 
 if TYPE_CHECKING:
     from agent_base.providers.anthropic.anthropic_agent import AnthropicLLMConfig
+    from anthropic.types.beta import BetaMessage, BetaContentBlock, BetaUsage
 
 logger = get_logger(__name__)
 
@@ -49,7 +50,6 @@ DEFAULT_MAX_TOKENS = 16384
 # Content block conversion: canonical → Anthropic wire format
 # ---------------------------------------------------------------------------
 
-
 def _content_block_to_anthropic(block: ContentBlock) -> dict[str, Any] | None:
     """Convert a single canonical ContentBlock to Anthropic wire-format dict.
 
@@ -60,10 +60,18 @@ def _content_block_to_anthropic(block: ContentBlock) -> dict[str, Any] | None:
         return {"type": "text", "text": block.text}
 
     if isinstance(block, ThinkingContent):
-        d: dict[str, Any] = {"type": "thinking", "thinking": block.thinking}
-        if block.signature:
-            d["signature"] = block.signature
-        return d
+        if not block.signature:
+            logger.warning(
+                "thinking_block_missing_signature",
+                thinking_preview=block.thinking[:80] if block.thinking else "",
+                msg="Omitting thinking block without signature — Anthropic API requires it",
+            )
+            return None
+        return {
+            "type": "thinking",
+            "thinking": block.thinking,
+            "signature": block.signature,
+        }
 
     if isinstance(block, ImageContent):
         return {
@@ -83,6 +91,20 @@ def _content_block_to_anthropic(block: ContentBlock) -> dict[str, Any] | None:
                 "media_type": block.media_type,
                 "data": block.data,
             },
+        }
+
+    if isinstance(block, AttachmentContent):
+        if block.source_type != "file_id" or not block.data:
+            logger.warning(
+                "attachment_missing_file_id",
+                media_id=block.media_id,
+                source_type=block.source_type,
+                msg="AttachmentContent requires file_id for container_upload — upload first",
+            )
+            return None
+        return {
+            "type": "container_upload",
+            "file_id": block.data,
         }
 
     if isinstance(block, ToolUseContent):
@@ -109,7 +131,29 @@ def _content_block_to_anthropic(block: ContentBlock) -> dict[str, Any] | None:
             "input": block.tool_input,
         }
 
-    if isinstance(block, (ToolResultContent, ServerToolResultContent, MCPToolResultContent)):
+    # Server tool results keep their original type (e.g., web_search_tool_result)
+    # and live in assistant messages — they must NOT become "tool_result".
+    if isinstance(block, ServerToolResultContent):
+        if block.raw and hasattr(block.raw, "model_dump"):
+            return block.raw.model_dump()
+        # Fallback: reconstruct with original type stored in tool_name
+        return {
+            "type": block.tool_name,
+            "tool_use_id": block.tool_id,
+            "content": block.tool_result,
+        }
+
+    # MCP tool results also keep their original type in assistant messages.
+    if isinstance(block, MCPToolResultContent):
+        if block.raw and hasattr(block.raw, "model_dump"):
+            return block.raw.model_dump()
+        return {
+            "type": "mcp_tool_result",
+            "tool_use_id": block.tool_id,
+            "content": block.tool_result,
+        }
+
+    if isinstance(block, ToolResultContent):
         content: list[dict[str, Any]] = []
         if isinstance(block.tool_result, str):
             if block.tool_result:
@@ -161,8 +205,7 @@ def _format_message(msg: Message) -> dict[str, Any]:
 # Response parsing: Anthropic wire format → canonical
 # ---------------------------------------------------------------------------
 
-
-def _parse_content_block(raw_block: Any) -> ContentBlock | None:
+def _parse_content_block(raw_block: BetaContentBlock) -> ContentBlock | None:
     """Convert an Anthropic response content block to a canonical ContentBlock."""
     block_type = getattr(raw_block, "type", None)
 
@@ -173,6 +216,13 @@ def _parse_content_block(raw_block: Any) -> ContentBlock | None:
         return ThinkingContent(
             thinking=getattr(raw_block, "thinking", ""),
             signature=getattr(raw_block, "signature", None),
+        )
+
+    if block_type == "redacted_thinking":
+        return ThinkingContent(
+            thinking="[redacted]",
+            signature=None,
+            kwargs={"redacted": True, "redacted_data": getattr(raw_block, "data", "")},
         )
 
     if block_type == "tool_use":
@@ -191,12 +241,45 @@ def _parse_content_block(raw_block: Any) -> ContentBlock | None:
             raw=raw_block,
         )
 
+    if block_type == "mcp_tool_use":
+        return MCPToolUseContent(
+            tool_name=getattr(raw_block, "name", ""),
+            tool_id=getattr(raw_block, "id", ""),
+            tool_input=getattr(raw_block, "input", {}),
+            mcp_server_name=getattr(raw_block, "server_name", ""),
+            raw=raw_block,
+        )
+
+    if block_type == "mcp_tool_result":
+        content = getattr(raw_block, "content", "")
+        return MCPToolResultContent(
+            tool_name="mcp_tool_result",
+            tool_id=getattr(raw_block, "tool_use_id", "") or getattr(raw_block, "id", "unknown"),
+            tool_result=content if isinstance(content, str) else str(content),
+            is_error=getattr(raw_block, "is_error", False),
+            raw=raw_block,
+        )
+
     if block_type and block_type.endswith("_tool_result"):
         content = getattr(raw_block, "content", "")
         return ServerToolResultContent(
             tool_name=block_type,
             tool_id=getattr(raw_block, "tool_use_id", "") or getattr(raw_block, "id", "unknown"),
             tool_result=content if isinstance(content, str) else str(content),
+            raw=raw_block,
+        )
+
+    if block_type == "container_upload":
+        file_id = getattr(raw_block, "file_id", "")
+        if not file_id:
+            logger.warning("container_upload_missing_file_id")
+            return None
+        return AttachmentContent(
+            filename="",
+            source_type="file_id",
+            data=file_id,
+            media_type="",
+            media_id=file_id,
             raw=raw_block,
         )
 
@@ -433,7 +516,7 @@ class AnthropicMessageFormatter(MessageFormatter):
 
         return request_params
 
-    def parse_response(self, raw_response: Any) -> Message:
+    def parse_response(self, raw_response: BetaMessage) -> Message:
         """Convert an Anthropic BetaMessage to a canonical Message.
 
         Args:
