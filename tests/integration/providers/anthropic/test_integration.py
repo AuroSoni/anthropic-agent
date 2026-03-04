@@ -1,7 +1,7 @@
 """Real-API integration tests for the Anthropic message formatter round-trip.
 
 Validates that canonical content types survive the full pipeline:
-    format_messages() → Anthropic API → parse_response() → canonical Message
+    format_blocks_to_wire() → Anthropic API → parse_wire_to_blocks() → canonical ContentBlocks
 
 Uses claude-haiku-4-5-20251001 by default to keep costs low.
 Requires ANTHROPIC_API_KEY to be set (tests skip otherwise).
@@ -41,7 +41,7 @@ from agent_base.core.types import (
 )
 from agent_base.providers.anthropic.anthropic_agent import AnthropicLLMConfig
 from agent_base.providers.anthropic.formatters import AnthropicMessageFormatter
-from agent_base.providers.anthropic.provider import AnthropicProvider
+from agent_base.providers.anthropic.provider import AnthropicProvider, _apply_cache_control, DEFAULT_MAX_TOKENS
 from agent_base.tools.tool_types import ToolSchema
 
 # ---------------------------------------------------------------------------
@@ -108,6 +108,70 @@ def _calculator_tool_schema() -> ToolSchema:
             "required": ["expression"],
         },
     )
+
+
+def _build_wire_request(
+    formatter: AnthropicMessageFormatter,
+    messages: list[Message],
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a full Anthropic API request dict using the new formatter+provider API.
+
+    This helper replaces the old ``formatter.format_messages(messages, params)``
+    pattern used across integration tests.
+    """
+    wire_messages = [
+        {
+            "role": msg.role.value,
+            "content": formatter.format_blocks_to_wire(msg.content),
+        }
+        for msg in messages
+    ]
+
+    llm_config = params.get("llm_config")
+    model = params.get("model", "")
+    enable_cache = params.get("enable_cache_control", True)
+
+    wire_messages, processed_system = _apply_cache_control(
+        wire_messages, params.get("system_prompt"), model, enable=enable_cache
+    )
+
+    max_tokens = (
+        llm_config.max_tokens
+        if llm_config and llm_config.max_tokens
+        else DEFAULT_MAX_TOKENS
+    )
+
+    request: dict[str, Any] = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": wire_messages,
+    }
+
+    if processed_system:
+        request["system"] = processed_system
+
+    if llm_config and getattr(llm_config, "thinking_tokens", None) and llm_config.thinking_tokens > 0:
+        request["thinking"] = {"type": "enabled", "budget_tokens": llm_config.thinking_tokens}
+
+    combined_tools: list[dict[str, Any]] = list(params.get("tool_schemas", []))
+    if llm_config and getattr(llm_config, "server_tools", None):
+        combined_tools.extend(llm_config.server_tools)
+    if combined_tools:
+        request["tools"] = combined_tools
+
+    if llm_config and getattr(llm_config, "beta_headers", None):
+        request["betas"] = llm_config.beta_headers
+
+    container: dict[str, Any] = {}
+    if llm_config and getattr(llm_config, "container_id", None):
+        container["id"] = llm_config.container_id
+    if llm_config and getattr(llm_config, "skills", None):
+        container["skills"] = llm_config.skills
+    if container:
+        request["container"] = container
+
+    return request
 
 
 def _get_text(msg: Message) -> str:
@@ -286,7 +350,7 @@ class TestExtendedThinking:
         messages.append(Message.user("Now what is 10 + 7?"))
 
         # Format the messages — this exercises _block_to_wire on thinking blocks
-        wire = formatter.format_messages(messages, {
+        wire = _build_wire_request(formatter, messages, {
             "system_prompt": None,
             "llm_config": config,
             "model": HAIKU,
@@ -637,7 +701,7 @@ class TestFormatterWireFormat:
             Message.user("Hello"),
             Message.assistant("Hi there"),
         ]
-        wire = formatter.format_messages(messages, {
+        wire = _build_wire_request(formatter, messages, {
             "system_prompt": "Be helpful",
             "model": HAIKU,
             "llm_config": AnthropicLLMConfig(max_tokens=256),
@@ -654,7 +718,7 @@ class TestFormatterWireFormat:
     async def test_wire_format_with_thinking(self, formatter: AnthropicMessageFormatter):
         config = AnthropicLLMConfig(max_tokens=4096, thinking_tokens=2048)
         messages = [Message.user("test")]
-        wire = formatter.format_messages(messages, {
+        wire = _build_wire_request(formatter, messages, {
             "model": HAIKU,
             "llm_config": config,
             "tool_schemas": [],
@@ -668,14 +732,10 @@ class TestFormatterWireFormat:
             server_tools=[{"type": "web_search_20250305", "name": "web_search"}],
         )
         schema = _calculator_tool_schema()
-        tool_dicts = formatter.format_tool_schemas([{
-            "name": schema.name,
-            "description": schema.description,
-            "input_schema": schema.input_schema,
-        }])
+        tool_dicts = formatter.format_tool_schemas([schema])
 
         messages = [Message.user("test")]
-        wire = formatter.format_messages(messages, {
+        wire = _build_wire_request(formatter, messages, {
             "model": HAIKU,
             "llm_config": config,
             "tool_schemas": tool_dicts,
@@ -692,7 +752,7 @@ class TestFormatterWireFormat:
             beta_headers=["files-api-2025-04-14"],
         )
         messages = [Message.user("test")]
-        wire = formatter.format_messages(messages, {
+        wire = _build_wire_request(formatter, messages, {
             "model": HAIKU,
             "llm_config": config,
             "tool_schemas": [],
@@ -707,7 +767,7 @@ class TestFormatterWireFormat:
             skills=[{"name": "code_exec"}],
         )
         messages = [Message.user("test")]
-        wire = formatter.format_messages(messages, {
+        wire = _build_wire_request(formatter, messages, {
             "model": HAIKU,
             "llm_config": config,
             "tool_schemas": [],
@@ -726,7 +786,7 @@ class TestFormatterWireFormat:
                 ),
             ]),
         ]
-        wire = formatter.format_messages(messages, {
+        wire = _build_wire_request(formatter, messages, {
             "model": HAIKU,
             "tool_schemas": [],
             "enable_cache_control": False,
@@ -745,7 +805,7 @@ class TestFormatterWireFormat:
                 ),
             ]),
         ]
-        wire = formatter.format_messages(messages, {
+        wire = _build_wire_request(formatter, messages, {
             "model": HAIKU,
             "tool_schemas": [],
             "enable_cache_control": False,
@@ -763,7 +823,7 @@ class TestFormatterWireFormat:
                 ),
             ]),
         ]
-        wire = formatter.format_messages(messages, {
+        wire = _build_wire_request(formatter, messages, {
             "model": HAIKU,
             "tool_schemas": [],
             "enable_cache_control": False,
@@ -783,7 +843,7 @@ class TestFormatterWireFormat:
                 TextContent(text="answer"),
             ]),
         ]
-        wire = formatter.format_messages(messages, {
+        wire = _build_wire_request(formatter, messages, {
             "model": HAIKU,
             "tool_schemas": [],
             "enable_cache_control": False,
@@ -820,7 +880,7 @@ class TestFullPipelineRoundTrip:
         messages.append(Message.user("Now tell me another one."))
 
         # Format should not raise
-        wire = formatter.format_messages(messages, {
+        wire = _build_wire_request(formatter, messages, {
             "model": HAIKU,
             "llm_config": config,
             "tool_schemas": [],
@@ -864,14 +924,10 @@ class TestFullPipelineRoundTrip:
         ]))
 
         # Verify wire format is valid
-        wire = formatter.format_messages(messages, {
+        wire = _build_wire_request(formatter, messages, {
             "model": HAIKU,
             "llm_config": config,
-            "tool_schemas": formatter.format_tool_schemas([{
-                "name": schema.name,
-                "description": schema.description,
-                "input_schema": schema.input_schema,
-            }]),
+            "tool_schemas": formatter.format_tool_schemas([schema]),
             "enable_cache_control": False,
         })
 
@@ -969,7 +1025,7 @@ class TestSendingImages:
         messages.append(Message.user("Was there an image in our conversation? Just say yes or no."))
 
         # Verify wire format includes image block in history
-        wire = formatter.format_messages(messages, {
+        wire = _build_wire_request(formatter, messages, {
             "model": HAIKU,
             "llm_config": llm_config,
             "tool_schemas": [],
@@ -1001,7 +1057,7 @@ class TestSendingImages:
                 ),
             ]),
         ]
-        wire = formatter.format_messages(messages, {
+        wire = _build_wire_request(formatter, messages, {
             "model": HAIKU,
             "tool_schemas": [],
             "enable_cache_control": False,
@@ -1114,7 +1170,7 @@ class TestSendingDocuments:
                 ),
             ]),
         ]
-        wire = formatter.format_messages(messages, {
+        wire = _build_wire_request(formatter, messages, {
             "model": HAIKU,
             "tool_schemas": [],
             "enable_cache_control": False,
@@ -1135,7 +1191,7 @@ class TestSendingDocuments:
                 ),
             ]),
         ]
-        wire = formatter.format_messages(messages, {
+        wire = _build_wire_request(formatter, messages, {
             "model": HAIKU,
             "tool_schemas": [],
             "enable_cache_control": False,
@@ -1162,7 +1218,7 @@ class TestSendingDocuments:
                 ),
             ]),
         ]
-        wire = formatter.format_messages(messages, {
+        wire = _build_wire_request(formatter, messages, {
             "model": HAIKU,
             "tool_schemas": [],
             "enable_cache_control": False,
@@ -1241,7 +1297,7 @@ class TestCodeExecution:
         messages.append(Message.user("Now compute factorial of 8 using the result you already have."))
 
         # This exercises _block_to_wire on ServerToolUseContent + ServerToolResultContent
-        wire = formatter.format_messages(messages, {
+        wire = _build_wire_request(formatter, messages, {
             "model": HAIKU,
             "llm_config": code_exec_config,
             "tool_schemas": [],
@@ -1363,7 +1419,7 @@ class TestContainerUploads:
                 attachment,
             ]),
         ]
-        wire = formatter.format_messages(messages, {
+        wire = _build_wire_request(formatter, messages, {
             "model": HAIKU,
             "llm_config": container_config,
             "tool_schemas": [],
@@ -1390,7 +1446,7 @@ class TestContainerUploads:
                 attachment,
             ]),
         ]
-        wire = formatter.format_messages(messages, {
+        wire = _build_wire_request(formatter, messages, {
             "model": HAIKU,
             "tool_schemas": [],
             "enable_cache_control": False,
@@ -1511,7 +1567,7 @@ class TestCodeExecutionWithFiles:
         messages.append(Message.user("Now use Python to compute the average of those numbers."))
 
         # Verify formatting doesn't crash on server tool result blocks
-        wire = formatter.format_messages(messages, {
+        wire = _build_wire_request(formatter, messages, {
             "model": HAIKU,
             "llm_config": code_files_config,
             "tool_schemas": [],
@@ -1649,7 +1705,7 @@ class TestServerToolResultRoundTrip:
         messages.append(Message.user("Now print 'goodbye world' using Python."))
 
         # Format should not raise (exercises _block_to_wire on all server tool types)
-        wire = formatter.format_messages(messages, {
+        wire = _build_wire_request(formatter, messages, {
             "model": HAIKU,
             "llm_config": config,
             "tool_schemas": [],
@@ -1690,7 +1746,7 @@ class TestServerToolResultRoundTrip:
         messages.append(Message.user("When was it first performed?"))
 
         # Re-format and verify API accepts
-        wire = formatter.format_messages(messages, {
+        wire = _build_wire_request(formatter, messages, {
             "model": HAIKU,
             "llm_config": config,
             "tool_schemas": [],

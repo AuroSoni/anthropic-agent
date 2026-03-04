@@ -3,6 +3,7 @@ from typing import Dict, Any, List, Optional
 from abc import ABC, abstractmethod
 import uuid
 from .types import ContentBlock, Role, TextContent
+from agent_base.tools.tool_types import ToolSchema
 
 # --- Message ---
 
@@ -104,47 +105,45 @@ class Message:
     def add_content(self, content: ContentBlock) -> None:
         self.content.append(content)
 
-#TODO: A formatter should take care of all types of content blocks to and fro conversions ideally.
-# Otherwise, it should have a default conversion method.
 class MessageFormatter(ABC):
-    """
-    Translates canonical Messages into the provider's wire format and back.
-    This is where provider-specific content type mappings live —
-    including tool schema conversion.
+    """Translates canonical content blocks to/from the provider's wire format.
+
+    Pure block-level conversion — no request building, no usage parsing,
+    no provider configuration.  The Provider is responsible for assembling
+    messages, building request dicts, and constructing canonical ``Message``
+    objects from responses.
     """
 
     @abstractmethod
-    def format_messages(self, messages: List[Message], params: dict[str, Any]) -> Dict[str, Any]: ...
-    """
-    Format the messages into the provider wire format. This is the input to the LLM.
-    Args:
-        messages: The messages to format.
-        params: The parameters to use for formatting.
-    Returns:
-        The formatted messages.
-    """
+    def format_blocks_to_wire(
+        self, blocks: List[ContentBlock]
+    ) -> List[Dict[str, Any]]:
+        """Convert canonical ContentBlocks to provider wire-format dicts.
+
+        Args:
+            blocks: List of canonical ContentBlock objects.
+        Returns:
+            List of provider-specific wire-format dicts.
+        """
 
     @abstractmethod
-    def parse_response(self, raw_response: Any) -> Message: ...
-    """
-    Parse the raw response from the provider into the canonical Message format.
-    Args:
-        raw_response: The raw response from the provider.
-    Returns:
-        The parsed message.
-    """
+    def parse_wire_to_blocks(self, raw_blocks: Any) -> List[ContentBlock]:
+        """Parse raw provider content blocks into canonical ContentBlocks.
+
+        Args:
+            raw_blocks: Provider-specific raw content block list.
+        Returns:
+            List of canonical ContentBlock objects.
+        """
 
     @abstractmethod
-    def format_tool_schemas(self, schemas: List[Dict[str, Any]]) -> List[Dict[str, Any]]: ...
-    """
-    Convert canonical tool schemas into the provider's wire format.
+    def format_tool_schemas(
+        self, schemas: List[ToolSchema]
+    ) -> List[Dict[str, Any]]:
+        """Convert canonical ToolSchemas into the provider's wire format.
 
-    The ToolRegistry returns schemas in the canonical form
-    ToolSchema(``name``, ``description``, ``input_schema``). Each provider
-    formatter converts them into whatever shape its API expects.
-
-    Args:
-        schemas: List of canonical tool schema dicts from ToolRegistry.get_schemas().
-    Returns:
-        List of provider-formatted tool schema dicts ready for the API call.
-    """
+        Args:
+            schemas: List of ToolSchema objects from ToolRegistry.
+        Returns:
+            List of provider-formatted tool schema dicts ready for the API call.
+        """

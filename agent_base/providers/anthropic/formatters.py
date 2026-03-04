@@ -1,23 +1,20 @@
-"""Anthropic message formatter — translates canonical types to/from Anthropic wire format.
+"""Anthropic message formatter — translates canonical content blocks to/from Anthropic wire format.
 
 Implements the ``MessageFormatter`` ABC from ``agent_base.core.messages``.
 This is a pure translator: no HTTP calls, no retries, no side effects.
 
 Responsibilities:
-    - ``format_messages()`` — canonical ``Message`` list → Anthropic API request dict
-    - ``parse_response()`` — Anthropic ``BetaMessage`` → canonical ``Message``
-    - ``format_tool_schemas()`` — canonical tool schema dicts → Anthropic format (pass-through)
-    - Cache control injection (``_apply_cache_control``)
+    - ``format_blocks_to_wire()`` — canonical ``ContentBlock`` list → Anthropic wire-format dicts
+    - ``parse_wire_to_blocks()`` — Anthropic ``BetaContentBlock`` list → canonical ``ContentBlock`` list
+    - ``format_tool_schemas()`` — ``ToolSchema`` list → Anthropic tool schema dicts
 """
 from __future__ import annotations
 
 from typing import Any, Dict, List, TYPE_CHECKING
 
-from agent_base.core.messages import MessageFormatter, Message, Usage
+from agent_base.core.messages import MessageFormatter
 from agent_base.core.types import (
     ContentBlock,
-    ContentBlockType,
-    Role,
     SourceType,
     TextContent,
     ThinkingContent,
@@ -38,141 +35,12 @@ from agent_base.core.types import (
     WebSearchResultCitation,
 )
 from agent_base.logging import get_logger
+from agent_base.tools.tool_types import ToolSchema
 
 if TYPE_CHECKING:
-    from agent_base.providers.anthropic.anthropic_agent import AnthropicLLMConfig
-    from anthropic.types.beta import BetaMessage, BetaContentBlock, BetaUsage
+    from anthropic.types.beta import BetaContentBlock
 
 logger = get_logger(__name__)
-
-MAX_CACHE_BLOCKS = 4
-MIN_CACHE_TOKENS_SONNET = 1024
-MIN_CACHE_TOKENS_HAIKU = 2048
-DEFAULT_MAX_TOKENS = 16384
-_NON_CACHEABLE_CACHE_CONTROL_TYPES = {"thinking", "redacted_thinking"}
-
-
-# ---------------------------------------------------------------------------
-# Cache control (pure dict→dict utility, kept module-level)
-# ---------------------------------------------------------------------------
-
-def _apply_cache_control(
-    messages: list[dict[str, Any]],
-    system: str | None,
-    model: str,
-    enable: bool,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | str | None]:
-    """Apply Anthropic cache_control to message content blocks.
-
-    Anthropic limits cache_control to 4 blocks maximum.  Priority order:
-    1. System prompt (if large enough)
-    2. Document/image blocks
-    3. Large text blocks (sorted by size descending)
-    4. Recent message blocks (fallback)
-    """
-    if not enable:
-        return messages, system
-
-    min_tokens = (
-        MIN_CACHE_TOKENS_HAIKU
-        if "haiku" in model.lower()
-        else MIN_CACHE_TOKENS_SONNET
-    )
-    remaining_slots = MAX_CACHE_BLOCKS
-    blocks_to_cache: list[tuple[int, int]] = []
-
-    # Priority 1: System prompt
-    processed_system: list[dict[str, Any]] | str | None = system
-    if system and remaining_slots > 0:
-        system_tokens = len(system) // 4
-        if system_tokens >= min_tokens:
-            processed_system = [{
-                "type": "text",
-                "text": system,
-                "cache_control": {"type": "ephemeral"},
-            }]
-            remaining_slots -= 1
-
-    # Priority 2: Document/image blocks
-    doc_image_blocks: list[tuple[int, int]] = []
-    for msg_idx, msg in enumerate(messages):
-        content = msg.get("content", [])
-        if not isinstance(content, list):
-            continue
-        for block_idx, block in enumerate(content):
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") in ("document", "image"):
-                doc_image_blocks.append((msg_idx, block_idx))
-
-    for loc in doc_image_blocks:
-        if remaining_slots <= 0:
-            break
-        blocks_to_cache.append(loc)
-        remaining_slots -= 1
-
-    # Priority 3: Large text blocks (sorted by size descending)
-    if remaining_slots > 0:
-        large_text_blocks: list[tuple[int, int, int]] = []
-        for msg_idx, msg in enumerate(messages):
-            content = msg.get("content", [])
-            if not isinstance(content, list):
-                continue
-            for block_idx, block in enumerate(content):
-                if not isinstance(block, dict):
-                    continue
-                if block.get("type") == "text" and "text" in block:
-                    text_len = len(block["text"])
-                    if text_len // 4 >= min_tokens:
-                        if (msg_idx, block_idx) not in blocks_to_cache:
-                            large_text_blocks.append((msg_idx, block_idx, text_len))
-
-        large_text_blocks.sort(key=lambda x: x[2], reverse=True)
-        for msg_idx, block_idx, _ in large_text_blocks:
-            if remaining_slots <= 0:
-                break
-            blocks_to_cache.append((msg_idx, block_idx))
-            remaining_slots -= 1
-
-    # Priority 4: Recent message blocks (fallback)
-    if remaining_slots > 0:
-        for msg_idx in range(len(messages) - 1, -1, -1):
-            if remaining_slots <= 0:
-                break
-            msg = messages[msg_idx]
-            role = msg.get("role")
-            content = msg.get("content", [])
-            if role not in ("user", "assistant") or not isinstance(content, list):
-                continue
-            for block_idx in range(len(content) - 1, -1, -1):
-                if remaining_slots <= 0:
-                    break
-                block = content[block_idx]
-                if not isinstance(block, dict):
-                    continue
-                block_type = block.get("type")
-                if isinstance(block_type, str) and block_type not in _NON_CACHEABLE_CACHE_CONTROL_TYPES:
-                    if (msg_idx, block_idx) not in blocks_to_cache:
-                        blocks_to_cache.append((msg_idx, block_idx))
-                        remaining_slots -= 1
-
-    # Build result with cache_control injected
-    blocks_to_cache_set = set(blocks_to_cache)
-    result: list[dict[str, Any]] = []
-    for msg_idx, msg in enumerate(messages):
-        content = msg.get("content", [])
-        if not isinstance(content, list):
-            result.append(msg)
-            continue
-        new_msg = {"role": msg.get("role"), "content": []}
-        for block_idx, block in enumerate(content):
-            new_block = dict(block) if isinstance(block, dict) else block
-            if (msg_idx, block_idx) in blocks_to_cache_set:
-                new_block["cache_control"] = {"type": "ephemeral"}
-            new_msg["content"].append(new_block)
-        result.append(new_msg)
-
-    return result, processed_system
 
 
 # ---------------------------------------------------------------------------
@@ -202,9 +70,6 @@ class AnthropicMessageFormatter(MessageFormatter):
             return {"type": "file", "file_id": block.data}
         # Default / base64
         return {"type": "base64", "media_type": block.media_type, "data": block.data}
-    # TODO: Media resolver for the transport layer?
-    # Idea: Remove media id from the content blocks entirely. 
-    # It is a higher level construct that can be utilized in the agent layer itself.
 
     @staticmethod
     def _resolve_document_source(block: DocumentContent) -> dict[str, Any]:
@@ -660,115 +525,29 @@ class AnthropicMessageFormatter(MessageFormatter):
 
     # -- Public API ---------------------------------------------------------
 
-    def format_messages(
-        self, messages: List[Message], params: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Build a complete Anthropic API request dict."""
-        system_prompt: str | None = params.get("system_prompt")
-        llm_config: AnthropicLLMConfig | None = params.get("llm_config")
-        model: str = params.get("model", "")
-        tool_schemas: list[dict[str, Any]] = params.get("tool_schemas", [])
-        enable_cache_control: bool = params.get("enable_cache_control", True)
-
-        wire_messages = [
-            {
-                "role": msg.role.value,
-                "content": [
-                    wire for block in msg.content
-                    if (wire := self._block_to_wire(block)) is not None
-                ],
-            }
-            for msg in messages
+    def format_blocks_to_wire(self, blocks: List[ContentBlock]) -> list[dict[str, Any]]:
+        """Convert canonical ContentBlocks to Anthropic wire-format dicts."""
+        return [
+            wire for block in blocks
+            if (wire := self._block_to_wire(block)) is not None
         ]
 
-        wire_messages, processed_system = _apply_cache_control(
-            wire_messages, system_prompt, model, enable_cache_control
-        )
-
-        max_tokens = (
-            llm_config.max_tokens
-            if llm_config and llm_config.max_tokens
-            else DEFAULT_MAX_TOKENS
-        )
-
-        request_params: dict[str, Any] = {
-            "model": model,
-            "max_tokens": max_tokens,
-            "messages": wire_messages,
-        }
-
-        if processed_system:
-            request_params["system"] = processed_system
-
-        if llm_config and llm_config.thinking_tokens and llm_config.thinking_tokens > 0:
-            request_params["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": llm_config.thinking_tokens,
-            }
-
-        combined_tools: list[dict[str, Any]] = []
-        if tool_schemas:
-            combined_tools.extend(tool_schemas)
-        if llm_config and llm_config.server_tools:
-            combined_tools.extend(llm_config.server_tools)
-        if combined_tools:
-            request_params["tools"] = combined_tools
-
-        if llm_config and llm_config.beta_headers:
-            request_params["betas"] = llm_config.beta_headers
-
-        container: dict[str, Any] = {}
-        if llm_config and llm_config.container_id:
-            container["id"] = llm_config.container_id
-        if llm_config and llm_config.skills:
-            container["skills"] = llm_config.skills
-        if container:
-            request_params["container"] = container
-
-        return request_params
-
-    def parse_response(self, raw_response: BetaMessage) -> Message:
-        """Convert an Anthropic BetaMessage to a canonical Message."""
-        content_blocks: list[ContentBlock] = [
-            parsed for raw_block in raw_response.content
+    def parse_wire_to_blocks(self, raw_blocks: list[BetaContentBlock]) -> list[ContentBlock]:
+        """Convert Anthropic BetaContentBlocks to canonical ContentBlocks."""
+        return [
+            parsed for raw_block in raw_blocks
             if (parsed := self._parse_block(raw_block)) is not None
         ]
 
-        usage = None
-        raw_usage = raw_response.usage
-        if raw_usage:
-            usage = Usage(
-                input_tokens=raw_usage.input_tokens,
-                output_tokens=raw_usage.output_tokens,
-                cache_write_tokens=raw_usage.cache_creation_input_tokens,
-                cache_read_tokens=raw_usage.cache_read_input_tokens,
-                raw_usage={
-                    k: v for k, v in raw_usage.model_dump().items()
-                    if v is not None
-                },
-            )
-
-        usage_kwargs: dict[str, Any] = {}
-        raw_context_management = getattr(raw_response, "context_management", None)
-        if raw_context_management:
-            usage_kwargs["context_management"] = (
-                raw_context_management.model_dump()
-                if hasattr(raw_context_management, "model_dump")
-                else raw_context_management
-            )
-
-        return Message(
-            role=Role.ASSISTANT,
-            content=content_blocks,
-            stop_reason=raw_response.stop_reason,
-            usage=usage,
-            provider="anthropic",
-            model=raw_response.model,
-            usage_kwargs=usage_kwargs,
-        )
-
     def format_tool_schemas(
-        self, schemas: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
+        self, schemas: list[ToolSchema]
+    ) -> list[dict[str, Any]]:
         """Pass-through — Anthropic canonical format matches wire format."""
-        return schemas
+        return [
+            {
+                "name": schema.name,
+                "description": schema.description,
+                "input_schema": schema.input_schema,
+            }
+            for schema in schemas
+        ]

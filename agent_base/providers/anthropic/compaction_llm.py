@@ -74,7 +74,6 @@ class AnthropicCompactionLLM:
             The summary text.
         """
         from agent_base.core.messages import Message
-        from agent_base.core.config import LLMConfig
 
         # Add the summarization prompt as a final user message
         all_messages = list(messages) + [Message.user(prompt)]
@@ -82,18 +81,20 @@ class AnthropicCompactionLLM:
         model = kwargs.get("model", self.model)
         max_tokens = kwargs.get("max_tokens", 4096)
 
-        # Build minimal request params via the formatter
-        request_params = self.formatter.format_messages(
-            all_messages,
-            params={
-                "system_prompt": "You are a conversation summarizer. Produce concise, structured summaries.",
-                "llm_config": LLMConfig(),
-                "model": model,
-                "tool_schemas": [],
-                "enable_cache_control": False,
-            },
-        )
-        request_params["max_tokens"] = max_tokens
+        # Build minimal request params using formatter for block conversion only
+        wire_messages = [
+            {
+                "role": msg.role.value,
+                "content": self.formatter.format_blocks_to_wire(msg.content),
+            }
+            for msg in all_messages
+        ]
+        request_params: dict[str, Any] = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": wire_messages,
+            "system": "You are a conversation summarizer. Produce concise, structured summaries.",
+        }
 
         logger.debug(
             "compaction_llm_call",

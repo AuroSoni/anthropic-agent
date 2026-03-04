@@ -35,10 +35,8 @@ from agent_base.core.types import (
     SearchResultCitation,
     WebSearchResultCitation,
 )
-from agent_base.providers.anthropic.formatters import (
-    AnthropicMessageFormatter,
-    _apply_cache_control,
-)
+from agent_base.providers.anthropic.formatters import AnthropicMessageFormatter
+from agent_base.providers.anthropic.provider import _apply_cache_control
 
 
 # ---------------------------------------------------------------------------
@@ -1314,228 +1312,121 @@ class TestRoundTrip:
 # ===========================================================================
 
 
-class TestParseResponse:
-    """Tests for parse_response() — full BetaMessage → canonical Message."""
+class TestParseWireToBlocks:
+    """Tests for parse_wire_to_blocks() — raw content blocks → canonical ContentBlocks."""
 
-    def test_simple_text_response(self, fmt: AnthropicMessageFormatter):
-        stub = StubBetaMessage(
-            content=[StubTextBlock(text="Hello!")],
-            usage=StubUsage(input_tokens=10, output_tokens=5),
-            stop_reason="end_turn",
-            model="claude-haiku-4-5-20251001",
-        )
-        msg = fmt.parse_response(stub)
-        assert msg.role == Role.ASSISTANT
-        assert len(msg.content) == 1
-        assert isinstance(msg.content[0], TextContent)
-        assert msg.content[0].text == "Hello!"
-        assert msg.stop_reason == "end_turn"
-        assert msg.model == "claude-haiku-4-5-20251001"
-        assert msg.provider == "anthropic"
+    def test_simple_text(self, fmt: AnthropicMessageFormatter):
+        blocks = fmt.parse_wire_to_blocks([StubTextBlock(text="Hello!")])
+        assert len(blocks) == 1
+        assert isinstance(blocks[0], TextContent)
+        assert blocks[0].text == "Hello!"
 
-    def test_usage_parsing(self, fmt: AnthropicMessageFormatter):
-        stub = StubBetaMessage(
-            content=[StubTextBlock(text="hi")],
-            usage=StubUsage(
-                input_tokens=100, output_tokens=50,
-                cache_creation_input_tokens=20, cache_read_input_tokens=30,
-            ),
-            stop_reason="end_turn",
-        )
-        msg = fmt.parse_response(stub)
-        assert msg.usage is not None
-        assert msg.usage.input_tokens == 100
-        assert msg.usage.output_tokens == 50
-        assert msg.usage.cache_write_tokens == 20
-        assert msg.usage.cache_read_tokens == 30
-
-    def test_multi_block_response(self, fmt: AnthropicMessageFormatter):
-        stub = StubBetaMessage(
-            content=[
-                StubThinkingBlock(thinking="analysis", signature="sig_001"),
-                StubTextBlock(text="answer"),
-                StubToolUseBlock(id="toolu_001", name="calc", input={"x": 1}),
-            ],
-            usage=StubUsage(input_tokens=10, output_tokens=20),
-            stop_reason="tool_use",
-        )
-        msg = fmt.parse_response(stub)
-        assert len(msg.content) == 3
-        assert isinstance(msg.content[0], ThinkingContent)
-        assert isinstance(msg.content[1], TextContent)
-        assert isinstance(msg.content[2], ToolUseContent)
-        assert msg.stop_reason == "tool_use"
+    def test_multi_block(self, fmt: AnthropicMessageFormatter):
+        raw_blocks = [
+            StubThinkingBlock(thinking="analysis", signature="sig_001"),
+            StubTextBlock(text="answer"),
+            StubToolUseBlock(id="toolu_001", name="calc", input={"x": 1}),
+        ]
+        blocks = fmt.parse_wire_to_blocks(raw_blocks)
+        assert len(blocks) == 3
+        assert isinstance(blocks[0], ThinkingContent)
+        assert isinstance(blocks[1], TextContent)
+        assert isinstance(blocks[2], ToolUseContent)
 
     def test_unknown_blocks_filtered(self, fmt: AnthropicMessageFormatter):
-        stub = StubBetaMessage(
-            content=[StubTextBlock(text="ok"), StubUnknownBlock()],
-            usage=StubUsage(input_tokens=5, output_tokens=5),
-            stop_reason="end_turn",
-        )
-        msg = fmt.parse_response(stub)
-        assert len(msg.content) == 1  # unknown block filtered out
+        blocks = fmt.parse_wire_to_blocks([StubTextBlock(text="ok"), StubUnknownBlock()])
+        assert len(blocks) == 1  # unknown block filtered out
 
-    def test_no_usage(self, fmt: AnthropicMessageFormatter):
-        stub = StubBetaMessage(
-            content=[StubTextBlock(text="hi")],
-            usage=None,
-            stop_reason="end_turn",
-        )
-        msg = fmt.parse_response(stub)
-        assert msg.usage is None
+    def test_empty_list(self, fmt: AnthropicMessageFormatter):
+        blocks = fmt.parse_wire_to_blocks([])
+        assert blocks == []
 
-    def test_context_management_saved_in_usage_kwargs(self, fmt: AnthropicMessageFormatter):
-        stub = StubBetaMessage(
-            content=[StubTextBlock(text="hi")],
-            usage=StubUsage(input_tokens=1, output_tokens=1),
-            stop_reason="end_turn",
-            context_management=StubContextManagement(
-                cleared_tool_uses=["toolu_123"],
-                trigger="auto",
+
+# ===========================================================================
+# format_blocks_to_wire tests
+# ===========================================================================
+
+
+class TestFormatBlocksToWire:
+    """Tests for format_blocks_to_wire() — canonical ContentBlocks → wire dicts."""
+
+    def test_simple_text(self, fmt: AnthropicMessageFormatter):
+        result = fmt.format_blocks_to_wire([TextContent(text="Hello")])
+        assert result == [{"type": "text", "text": "Hello"}]
+
+    def test_thinking_with_signature(self, fmt: AnthropicMessageFormatter):
+        blocks = [
+            ThinkingContent(thinking="let me analyze", signature="sig_abc"),
+            TextContent(text="Here's my answer"),
+        ]
+        result = fmt.format_blocks_to_wire(blocks)
+        assert result[0]["type"] == "thinking"
+        assert result[0]["signature"] == "sig_abc"
+        assert result[1]["type"] == "text"
+
+    def test_redacted_thinking(self, fmt: AnthropicMessageFormatter):
+        blocks = [
+            ThinkingContent(thinking="[redacted]", signature=None,
+                            kwargs={"redacted": True, "redacted_data": "enc_blob"}),
+            TextContent(text="answer"),
+        ]
+        result = fmt.format_blocks_to_wire(blocks)
+        assert result[0]["type"] == "redacted_thinking"
+        assert result[0]["data"] == "enc_blob"
+
+    def test_image_source_types(self, fmt: AnthropicMessageFormatter):
+        blocks = [
+            TextContent(text="Describe these"),
+            ImageContent(source_type="url", data="https://img.com/a.png",
+                         media_type="image/png"),
+            ImageContent(source_type="base64", data="abc=",
+                         media_type="image/jpeg"),
+        ]
+        result = fmt.format_blocks_to_wire(blocks)
+        assert result[1]["source"]["type"] == "url"
+        assert result[2]["source"]["type"] == "base64"
+
+    def test_tool_use(self, fmt: AnthropicMessageFormatter):
+        blocks = [
+            ToolUseContent(tool_name="get_weather", tool_id="toolu_fmt1",
+                           tool_input={"city": "Paris"}),
+        ]
+        result = fmt.format_blocks_to_wire(blocks)
+        assert result[0]["type"] == "tool_use"
+        assert result[0]["name"] == "get_weather"
+
+    def test_tool_result(self, fmt: AnthropicMessageFormatter):
+        blocks = [
+            ToolResultContent(tool_name="get_weather", tool_id="toolu_fmt1",
+                              tool_result="22°C sunny"),
+        ]
+        result = fmt.format_blocks_to_wire(blocks)
+        assert result[0]["type"] == "tool_result"
+
+    def test_mcp_tool_use(self, fmt: AnthropicMessageFormatter):
+        blocks = [
+            MCPToolUseContent(
+                tool_name="slack_send", tool_id="mcptoolu_fmt1",
+                tool_input={"text": "hi"}, mcp_server_name="slack",
             ),
-        )
-        msg = fmt.parse_response(stub)
-        assert msg.usage_kwargs["context_management"] == {
-            "cleared_tool_uses": ["toolu_123"],
-            "trigger": "auto",
-        }
-
-
-# ===========================================================================
-# format_messages tests
-# ===========================================================================
-
-
-class TestFormatMessages:
-    """Tests for format_messages() — canonical Message list → API request dict."""
-
-    def test_simple_text_message(self, fmt: AnthropicMessageFormatter):
-        messages = [Message.user("Hello")]
-        result = fmt.format_messages(messages, {
-            "model": "claude-haiku-4-5-20251001",
-            "enable_cache_control": False,
-        })
-        assert result["model"] == "claude-haiku-4-5-20251001"
-        assert result["max_tokens"] == 16384  # DEFAULT_MAX_TOKENS
-        assert len(result["messages"]) == 1
-        assert result["messages"][0]["role"] == "user"
-        assert result["messages"][0]["content"][0] == {"type": "text", "text": "Hello"}
-
-    def test_system_prompt(self, fmt: AnthropicMessageFormatter):
-        messages = [Message.user("Hi")]
-        result = fmt.format_messages(messages, {
-            "system_prompt": "You are helpful.",
-            "model": "test",
-            "enable_cache_control": False,
-        })
-        assert result["system"] == "You are helpful."
-
-    def test_multi_turn(self, fmt: AnthropicMessageFormatter):
-        messages = [
-            Message.user("What is 2+2?"),
-            Message.assistant("4"),
-            Message.user("And 3+3?"),
         ]
-        result = fmt.format_messages(messages, {
-            "model": "test",
-            "enable_cache_control": False,
-        })
-        assert len(result["messages"]) == 3
-        assert result["messages"][0]["role"] == "user"
-        assert result["messages"][1]["role"] == "assistant"
-        assert result["messages"][2]["role"] == "user"
+        result = fmt.format_blocks_to_wire(blocks)
+        assert result[0]["type"] == "mcp_tool_use"
+        assert result[0]["server_name"] == "slack"
 
-    def test_thinking_blocks_in_messages(self, fmt: AnthropicMessageFormatter):
-        """Thinking blocks with signatures are included in formatted messages."""
-        messages = [
-            Message.user("think about this"),
-            Message(role=Role.ASSISTANT, content=[
-                ThinkingContent(thinking="let me analyze", signature="sig_abc"),
-                TextContent(text="Here's my answer"),
-            ]),
-            Message.user("follow up"),
-        ]
-        result = fmt.format_messages(messages, {
-            "model": "test",
-            "enable_cache_control": False,
-        })
-        assistant_content = result["messages"][1]["content"]
-        assert assistant_content[0]["type"] == "thinking"
-        assert assistant_content[0]["signature"] == "sig_abc"
-        assert assistant_content[1]["type"] == "text"
+    def test_empty_list(self, fmt: AnthropicMessageFormatter):
+        assert fmt.format_blocks_to_wire([]) == []
 
-    def test_redacted_thinking_in_messages(self, fmt: AnthropicMessageFormatter):
-        messages = [
-            Message.user("test"),
-            Message(role=Role.ASSISTANT, content=[
-                ThinkingContent(thinking="[redacted]", signature=None,
-                                kwargs={"redacted": True, "redacted_data": "enc_blob"}),
-                TextContent(text="answer"),
-            ]),
-            Message.user("follow up"),
+    def test_unsupported_blocks_filtered(self, fmt: AnthropicMessageFormatter):
+        """Citation blocks with no wire representation are filtered out."""
+        blocks = [
+            TextContent(text="hi"),
+            CharCitation(cited_text="x", document_index=0,
+                         start_char_index=0, end_char_index=1),
         ]
-        result = fmt.format_messages(messages, {
-            "model": "test",
-            "enable_cache_control": False,
-        })
-        assistant_content = result["messages"][1]["content"]
-        assert assistant_content[0]["type"] == "redacted_thinking"
-        assert assistant_content[0]["data"] == "enc_blob"
-
-    def test_image_source_types_in_messages(self, fmt: AnthropicMessageFormatter):
-        messages = [
-            Message(role=Role.USER, content=[
-                TextContent(text="Describe these"),
-                ImageContent(source_type="url", data="https://img.com/a.png",
-                             media_type="image/png"),
-                ImageContent(source_type="base64", data="abc=",
-                             media_type="image/jpeg"),
-            ]),
-        ]
-        result = fmt.format_messages(messages, {
-            "model": "test",
-            "enable_cache_control": False,
-        })
-        content = result["messages"][0]["content"]
-        assert content[1]["source"]["type"] == "url"
-        assert content[2]["source"]["type"] == "base64"
-
-    def test_tool_use_conversation(self, fmt: AnthropicMessageFormatter):
-        """Full tool use conversation formats correctly."""
-        messages = [
-            Message.user("What's the weather?"),
-            Message(role=Role.ASSISTANT, content=[
-                ToolUseContent(tool_name="get_weather", tool_id="toolu_fmt1",
-                               tool_input={"city": "Paris"}),
-            ]),
-            Message(role=Role.USER, content=[
-                ToolResultContent(tool_name="get_weather", tool_id="toolu_fmt1",
-                                  tool_result="22°C sunny"),
-            ]),
-        ]
-        result = fmt.format_messages(messages, {
-            "model": "test",
-            "enable_cache_control": False,
-        })
-        assert result["messages"][1]["content"][0]["type"] == "tool_use"
-        assert result["messages"][2]["content"][0]["type"] == "tool_result"
-
-    def test_mcp_tool_use_in_messages(self, fmt: AnthropicMessageFormatter):
-        messages = [
-            Message(role=Role.ASSISTANT, content=[
-                MCPToolUseContent(
-                    tool_name="slack_send", tool_id="mcptoolu_fmt1",
-                    tool_input={"text": "hi"}, mcp_server_name="slack",
-                ),
-            ]),
-        ]
-        result = fmt.format_messages(messages, {
-            "model": "test",
-            "enable_cache_control": False,
-        })
-        wire = result["messages"][0]["content"][0]
-        assert wire["type"] == "mcp_tool_use"
-        assert wire["server_name"] == "slack"
+        result = fmt.format_blocks_to_wire(blocks)
+        assert len(result) == 1
+        assert result[0]["type"] == "text"
 
 
 # ===========================================================================

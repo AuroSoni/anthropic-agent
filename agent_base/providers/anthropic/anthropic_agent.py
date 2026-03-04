@@ -55,6 +55,8 @@ class AnthropicLLMConfig(LLMConfig):
     skills: list[dict[str, Any]] | None = None
     beta_headers: list[str] | None = None
     container_id: str | None = None
+    enable_caching: bool = True
+    api_kwargs: dict[str, Any] | None = None
 
 class AnthropicAgent(Agent):
     def __init__(
@@ -75,7 +77,6 @@ class AnthropicAgent(Agent):
         base_delay: float = DEFAULT_BASE_DELAY,
         max_parallel_tool_calls: int = MAX_PARALLEL_TOOL_CALLS,
         max_tool_result_tokens: int = DEFAULT_MAX_TOOL_RESULT_TOKENS,
-        enable_cache_control: bool = True,
         compactor: Compactor | None = None,
         memory_store: MemoryStore | None = None,
         sandbox: Sandbox | None = None,
@@ -117,11 +118,16 @@ class AnthropicAgent(Agent):
         self.final_answer_check = final_answer_check
         
         # Tools (backend and frontend) - registry takes care of how to execute tools.
-        self.tool_registry: Optional[ToolRegistry] = None
-        self.tool_schemas: list[dict[str, Any]] = []
+        self.tool_registry: Optional[ToolRegistry] = ToolRegistry()
         
+        if tools:
+            self.tool_registry.register_tools(tools)
+        if frontend_tools:
+            self.tool_registry.register_tools(frontend_tools)
+            
         if subagents:
             # Create and register the subagent tool in the registry.
+            #TODO: Implementation of this.
             pass
         
         #################################################################### 
@@ -139,17 +145,13 @@ class AnthropicAgent(Agent):
         
         self.stream_meta_history_and_tool_results = stream_meta_history_and_tool_results
         
-        self.enable_cache_control = enable_cache_control
-        
         self._background_tasks: set = set()
         
         self._current_step = 0
         self._awaiting_tool_results = False
         
         # Composition 
-        self.message_formatter = AnthropicMessageFormatter()
-        self.provider = AnthropicProvider(formatter=self.message_formatter)
-        
+        self.provider = AnthropicProvider()
         
         #################################################################### 
         # The agent's persistable state. This is the state that is saved to the database.
@@ -181,6 +183,7 @@ class AnthropicAgent(Agent):
         if not self.agent_uuid:
             # Fresh agent - create a new UUID. Initialize with fresh state.
             self.agent_uuid = str(uuid.uuid4())
+            
             self.agent_config = AgentConfig(agent_uuid=self.agent_uuid)
             self.conversation = Conversation(agent_uuid=self.agent_uuid)
             # TODO: Properly initialize the sandbox. It may fail so surround with try-except and return an error.
