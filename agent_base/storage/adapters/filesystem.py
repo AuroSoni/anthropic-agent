@@ -224,47 +224,99 @@ class FilesystemConversationAdapter(ConversationAdapter):
         self.base_path.mkdir(parents=True, exist_ok=True)
         self._conv_dir.mkdir(exist_ok=True)
 
+    async def _find_existing_file(self, agent_dir: Path, run_id: str) -> Path | None:
+        """Find an existing conversation file by run_id."""
+        for conv_file in agent_dir.glob("[0-9]*.json"):
+            async with aiofiles.open(conv_file, "r") as f:
+                content = await f.read()
+            data = json.loads(content)
+            if data.get("run_id") == run_id:
+                return conv_file
+        return None
+
     async def save(self, conversation: Conversation) -> None:
-        """Save conversation with automatic sequence numbering."""
+        """Save or update a conversation with automatic sequence numbering.
+
+        If a conversation with the same run_id already exists for this agent,
+        it is overwritten in-place (preserving its sequence_number and file).
+        Otherwise, a new sequence number is assigned.
+        """
         agent_dir = self._conv_dir / conversation.agent_uuid
         agent_dir.mkdir(parents=True, exist_ok=True)
 
-        # Get next sequence number from index
-        index_file = agent_dir / "index.json"
-        if index_file.exists():
-            async with aiofiles.open(index_file, "r") as f:
-                content = await f.read()
-            index = json.loads(content)
-            last_sequence = index.get("last_sequence", 0)
+        # Check for existing conversation with same run_id (upsert).
+        existing_file = await self._find_existing_file(agent_dir, conversation.run_id)
+
+        if existing_file is not None:
+            # Update in-place — read existing sequence_number from filename.
+            seq_str = existing_file.stem  # e.g. "003"
+            conversation.sequence_number = int(seq_str)
+
+            data = serialize_conversation(conversation)
+            content = json.dumps(data, indent=2, default=_json_default)
+            async with aiofiles.open(existing_file, "w") as f:
+                await f.write(content)
+
+            logger.debug(
+                "Updated conversation",
+                agent_uuid=conversation.agent_uuid,
+                sequence_number=conversation.sequence_number,
+                backend="filesystem"
+            )
         else:
-            last_sequence = 0
+            # New conversation — assign next sequence number.
+            index_file = agent_dir / "index.json"
+            if index_file.exists():
+                async with aiofiles.open(index_file, "r") as f:
+                    content = await f.read()
+                index = json.loads(content)
+                last_sequence = index.get("last_sequence", 0)
+            else:
+                last_sequence = 0
 
-        next_sequence = last_sequence + 1
-        conversation.sequence_number = next_sequence
+            next_sequence = last_sequence + 1
+            conversation.sequence_number = next_sequence
 
-        # Save conversation with padded sequence number
-        conv_file = agent_dir / f"{next_sequence:03d}.json"
-        data = serialize_conversation(conversation)
-        content = json.dumps(data, indent=2, default=_json_default)
+            conv_file = agent_dir / f"{next_sequence:03d}.json"
+            data = serialize_conversation(conversation)
+            content = json.dumps(data, indent=2, default=_json_default)
 
-        async with aiofiles.open(conv_file, "w") as f:
-            await f.write(content)
+            async with aiofiles.open(conv_file, "w") as f:
+                await f.write(content)
 
-        # Update index
-        index = {
-            "last_sequence": next_sequence,
-            "total_conversations": next_sequence,
-            "updated_at": datetime.now().isoformat()
-        }
-        async with aiofiles.open(index_file, "w") as f:
-            await f.write(json.dumps(index, indent=2))
+            # Update index
+            index = {
+                "last_sequence": next_sequence,
+                "total_conversations": next_sequence,
+                "updated_at": datetime.now().isoformat()
+            }
+            async with aiofiles.open(index_file, "w") as f:
+                await f.write(json.dumps(index, indent=2))
 
-        logger.debug(
-            "Saved conversation",
-            agent_uuid=conversation.agent_uuid,
-            sequence_number=next_sequence,
-            backend="filesystem"
-        )
+            logger.debug(
+                "Saved conversation",
+                agent_uuid=conversation.agent_uuid,
+                sequence_number=next_sequence,
+                backend="filesystem"
+            )
+
+    async def load_by_run_id(
+        self,
+        agent_uuid: str,
+        run_id: str,
+    ) -> Conversation | None:
+        """Load a specific conversation by its run ID."""
+        agent_dir = self._conv_dir / agent_uuid
+        if not agent_dir.exists():
+            return None
+
+        for conv_file in agent_dir.glob("[0-9]*.json"):
+            async with aiofiles.open(conv_file, "r") as f:
+                content = await f.read()
+            data = json.loads(content)
+            if data.get("run_id") == run_id:
+                return deserialize_conversation(data)
+        return None
 
     async def load_history(
         self,

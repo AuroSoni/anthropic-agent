@@ -102,6 +102,7 @@ class PendingToolRelay:
     frontend_calls: list[ToolCallInfo] = field(default_factory=list)
     confirmation_calls: list[ToolCallInfo] = field(default_factory=list)
     completed_results: list[Message] = field(default_factory=list)
+    run_id: str | None = None
 
 
 # ==============================================================================

@@ -4,7 +4,7 @@ Adapters are created once and shared across all agent configurations.
 Connection lifecycle is managed in main.py startup/shutdown hooks.
 """
 import os
-from anthropic_agent.storage import (
+from agent_base.storage import (
     FilesystemAgentConfigAdapter,
     FilesystemConversationAdapter,
     FilesystemAgentRunAdapter,

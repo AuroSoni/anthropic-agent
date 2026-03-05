@@ -260,7 +260,10 @@ class AnthropicProvider(Provider):
         if container:
             request_params["container"] = container
 
-        # TODO: llm_config may contain arbitrary api_kwargs. 
+        if llm_config and llm_config.context_management:
+            request_params["context_management"] = llm_config.context_management
+
+        # TODO: llm_config may contain arbitrary api_kwargs.
         # Add api_kwargs to the request params.
         return request_params
 

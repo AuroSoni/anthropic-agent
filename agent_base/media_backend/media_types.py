@@ -431,9 +431,7 @@ class MediaBackend(ABC):
             RuntimeError: If no sandbox is attached.
         """
         if self._sandbox is None:
-            raise RuntimeError(
-                "No sandbox attached. Call attach_sandbox() before flush_exports()."
-            )
+            return []
 
         export_metas: list[ExportedFileMetadata] = (
             await self._sandbox.get_exported_file_metadata()

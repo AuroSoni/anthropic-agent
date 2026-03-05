@@ -247,6 +247,7 @@ def _serialize_pending_relay(relay: PendingToolRelay | None) -> dict[str, Any] |
         "frontend_calls": [dataclasses.asdict(tc) for tc in relay.frontend_calls],
         "confirmation_calls": [dataclasses.asdict(tc) for tc in relay.confirmation_calls],
         "completed_results": [m.to_dict() for m in relay.completed_results],
+        "run_id": relay.run_id,
     }
 
 
@@ -264,4 +265,5 @@ def _deserialize_pending_relay(data: dict[str, Any] | None) -> PendingToolRelay 
         completed_results=[
             Message.from_dict(m) for m in data.get("completed_results", [])
         ],
+        run_id=data.get("run_id"),
     )

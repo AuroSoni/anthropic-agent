@@ -120,6 +120,6 @@ __all__ = [
     "EditPlanTool",
     # Code execution
     "CodeExecutionTool",
-    # Stubs (not yet fully implemented)
+    # Sub-agent
     "SubAgentTool",
 ]

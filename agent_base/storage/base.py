@@ -161,6 +161,26 @@ class ConversationAdapter(StorageAdapter[Conversation]):
         ...
 
     @abstractmethod
+    async def load_by_run_id(
+        self,
+        agent_uuid: str,
+        run_id: str,
+    ) -> Conversation | None:
+        """Load a specific conversation by its run ID.
+
+        Used when resuming an agent from a relay pause to restore
+        the partial Conversation record from the interrupted run.
+
+        Args:
+            agent_uuid: Agent session UUID
+            run_id: The run ID of the conversation to load
+
+        Returns:
+            The matching Conversation, or None if not found
+        """
+        ...
+
+    @abstractmethod
     async def load_cursor(
         self,
         agent_uuid: str,

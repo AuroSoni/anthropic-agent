@@ -131,28 +131,60 @@ class MemoryConversationAdapter(ConversationAdapter):
         self._sequences: dict[str, int] = {}
 
     async def save(self, conversation: Conversation) -> None:
-        """Save conversation with automatic sequence numbering."""
+        """Save or update a conversation with automatic sequence numbering.
+
+        If a conversation with the same run_id already exists for this agent,
+        it is updated in-place (preserving its sequence_number). Otherwise,
+        a new sequence number is assigned and the conversation is appended.
+        """
         agent_uuid = conversation.agent_uuid
-
-        # Get next sequence number
-        last_seq = self._sequences.get(agent_uuid, 0)
-        next_seq = last_seq + 1
-        self._sequences[agent_uuid] = next_seq
-
-        # Assign sequence and store
-        conversation.sequence_number = next_seq
 
         if agent_uuid not in self._data:
             self._data[agent_uuid] = []
 
-        self._data[agent_uuid].append(deepcopy(conversation))
+        # Check for existing conversation with same run_id (upsert).
+        existing_idx = None
+        for i, c in enumerate(self._data[agent_uuid]):
+            if c.run_id == conversation.run_id:
+                existing_idx = i
+                break
 
-        logger.debug(
-            "Saved conversation",
-            agent_uuid=agent_uuid,
-            sequence_number=next_seq,
-            backend="memory"
-        )
+        if existing_idx is not None:
+            # Update in-place, preserving original sequence_number.
+            existing_seq = self._data[agent_uuid][existing_idx].sequence_number
+            conversation.sequence_number = existing_seq
+            self._data[agent_uuid][existing_idx] = deepcopy(conversation)
+            logger.debug(
+                "Updated conversation",
+                agent_uuid=agent_uuid,
+                sequence_number=existing_seq,
+                backend="memory"
+            )
+        else:
+            # New conversation — assign next sequence number.
+            last_seq = self._sequences.get(agent_uuid, 0)
+            next_seq = last_seq + 1
+            self._sequences[agent_uuid] = next_seq
+            conversation.sequence_number = next_seq
+            self._data[agent_uuid].append(deepcopy(conversation))
+            logger.debug(
+                "Saved conversation",
+                agent_uuid=agent_uuid,
+                sequence_number=next_seq,
+                backend="memory"
+            )
+
+    async def load_by_run_id(
+        self,
+        agent_uuid: str,
+        run_id: str,
+    ) -> Conversation | None:
+        """Load a specific conversation by its run ID."""
+        conversations = self._data.get(agent_uuid, [])
+        for c in conversations:
+            if c.run_id == run_id:
+                return deepcopy(c)
+        return None
 
     async def load_history(
         self,

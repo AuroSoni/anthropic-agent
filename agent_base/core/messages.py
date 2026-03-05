@@ -1,9 +1,13 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, TYPE_CHECKING
 from abc import ABC, abstractmethod
 import uuid
 from .types import ContentBlock, Role, TextContent
-from agent_base.tools.tool_types import ToolSchema
+
+if TYPE_CHECKING:
+    from agent_base.tools.tool_types import ToolSchema
 
 # --- Message ---
 

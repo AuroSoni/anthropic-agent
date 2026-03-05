@@ -294,7 +294,17 @@ class ToolResultBase(ContentBlock):
     def _serialize_tool_result(self) -> Union[str, List[Dict[str, Any]]]:
         if isinstance(self.tool_result, str):
             return self.tool_result
-        return [block.to_dict() for block in self.tool_result]
+        result = []
+        for item in self.tool_result:
+            if isinstance(item, dict):
+                result.append(item)
+            elif isinstance(item, str):
+                result.append({"type": "text", "text": item})
+            elif hasattr(item, "to_dict"):
+                result.append(item.to_dict())
+            else:
+                result.append({"type": "text", "text": str(item)})
+        return result
 
     def _base_dict(self) -> Dict[str, Any]:
         return {
