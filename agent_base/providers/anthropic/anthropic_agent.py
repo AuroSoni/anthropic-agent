@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import mimetypes
 import uuid
@@ -920,7 +921,7 @@ class AnthropicAgent(Agent):
             "stop_reason": result.stop_reason,
             "total_steps": result.total_steps,
             "generated_files": [f.to_dict() for f in result.generated_files] if result.generated_files else None,
-            "cost": result.cost,
+            "cost": dataclasses.asdict(result.cost) if result.cost else None,
             "cumulative_usage": result.cumulative_usage.to_dict() if result.cumulative_usage else None,
         }
 
