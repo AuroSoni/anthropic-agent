@@ -516,20 +516,27 @@ class PostgresConversationAdapter(ConversationAdapter):
     async def save(self, conversation: Conversation) -> None:
         """Save or update a conversation history entry.
 
-        Uses INSERT ... ON CONFLICT to upsert: the sequence_number SERIAL
-        is only assigned on the initial insert. Subsequent saves for the
-        same (agent_uuid, run_id) update the row in-place.
+        Uses INSERT ... ON CONFLICT to upsert. The sequence_number is
+        computed per-agent (max + 1) on initial insert. Subsequent saves
+        for the same (agent_uuid, run_id) update the row in-place without
+        changing the sequence_number.
         """
         pool = await self._get_pool()
 
         query = """
             INSERT INTO conversation_history (
-                agent_uuid, run_id, started_at, completed_at,
+                agent_uuid, run_id, sequence_number,
+                started_at, completed_at,
                 user_message, final_response, messages, stop_reason,
                 total_steps, usage, generated_files, cost,
                 created_at, extras
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8,
+                $1, $2,
+                COALESCE(
+                    (SELECT MAX(sequence_number) FROM conversation_history
+                     WHERE agent_uuid = $1), 0
+                ) + 1,
+                $3, $4, $5, $6, $7, $8,
                 $9, $10, $11, $12, $13, $14
             )
             ON CONFLICT (agent_uuid, run_id) DO UPDATE SET
