@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import mimetypes
 import uuid
 from dataclasses import dataclass
@@ -402,8 +403,8 @@ class AnthropicAgent(Agent):
     async def _resume_loop(self, queue: asyncio.Queue | None = None, stream_formatter: str | StreamFormatter | None = None) -> AgentResult:
 
         # Resolve string formatter names to actual StreamFormatter instances.
+        from agent_base.streaming import get_formatter
         if isinstance(stream_formatter, str):
-            from agent_base.streaming import get_formatter
             stream_formatter = get_formatter(stream_formatter)
 
         # Inject parent's queue/formatter into SubAgentTool for SSE forwarding.
@@ -476,6 +477,11 @@ class AnthropicAgent(Agent):
                                 classification.backend_calls, self.max_parallel_tool_calls
                             )
 
+                        # Stream backend tool results in relay path.
+                        if queue and self.stream_meta_history_and_tool_results and backend_results:
+                            fmt = stream_formatter if stream_formatter is not None else get_formatter(DEFAULT_STREAM_FORMATTER)
+                            await self._stream_tool_results(backend_results, queue, fmt)
+
                         # Build completed result messages from backend calls.
                         completed_result_messages = []
                         if backend_results:
@@ -500,6 +506,12 @@ class AnthropicAgent(Agent):
                         tool_results = await self.tool_registry.execute_tools(
                             tool_calls, self.max_parallel_tool_calls
                         )
+
+                        # Stream client tool results to SSE queue.
+                        if queue and self.stream_meta_history_and_tool_results:
+                            fmt = stream_formatter if stream_formatter is not None else get_formatter(DEFAULT_STREAM_FORMATTER)
+                            await self._stream_tool_results(tool_results, queue, fmt)
+
                         tool_result_message = self._build_tool_result_message(tool_results)
 
                         self.agent_config.context_messages.append(tool_result_message)
@@ -584,6 +596,36 @@ class AnthropicAgent(Agent):
                 is_error=envelope.is_error,
             ))
         return Message.user(result_blocks)
+
+    async def _stream_tool_results(
+        self,
+        envelopes: list[ToolResultEnvelope],
+        queue: asyncio.Queue,
+        stream_formatter: StreamFormatter,
+    ) -> None:
+        """Emit ToolResultDelta events for client-executed tool results."""
+        from agent_base.streaming.types import ToolResultDelta
+
+        for envelope in envelopes:
+            context_blocks = envelope.for_context_window()
+            text_parts = []
+            for block in context_blocks:
+                if isinstance(block, TextContent):
+                    text_parts.append(block.text)
+                else:
+                    text_parts.append(json.dumps(block.to_dict(), default=str))
+            result_content = "\n".join(text_parts) if text_parts else ""
+
+            delta = ToolResultDelta(
+                agent_uuid=self.agent_uuid,
+                tool_name=envelope.tool_name,
+                tool_id=envelope.tool_id,
+                result_content=result_content,
+                envelope_log=envelope.for_conversation_log(),
+                is_server_tool=False,
+                is_final=True,
+            )
+            await stream_formatter.format_delta(delta, queue)
 
     @staticmethod
     def _extract_text(message: Message) -> str:

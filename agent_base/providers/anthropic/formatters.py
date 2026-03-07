@@ -10,6 +10,7 @@ Responsibilities:
 """
 from __future__ import annotations
 
+import dataclasses
 from typing import Any, Dict, List, TYPE_CHECKING
 
 from agent_base.core.messages import MessageFormatter
@@ -36,6 +37,15 @@ from agent_base.core.types import (
 )
 from agent_base.logging import get_logger
 from agent_base.tools.tool_types import ToolSchema
+
+
+def _serialize_obj(obj: Any) -> Any:
+    """Convert an object to a JSON-safe dict. Tries model_dump, then dataclasses.asdict."""
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump()
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        return dataclasses.asdict(obj)
+    return obj
 
 if TYPE_CHECKING:
     from anthropic.types.beta import BetaContentBlock
@@ -357,8 +367,8 @@ class AnthropicMessageFormatter(MessageFormatter):
                             canonical_citations.append(parsed_cit)
                     # Raw wire dicts for round-trip via _block_to_wire
                     kwargs["citations"] = wire_citations
-                    # Typed canonical objects for programmatic access
-                    kwargs["canonical_citations"] = canonical_citations
+                    # Typed canonical objects for programmatic access (serialized for persistence)
+                    kwargs["canonical_citations"] = [c.to_dict() for c in canonical_citations]
                 return TextContent(text=raw_block.text, kwargs=kwargs, raw=raw_block)
 
             # -- Thinking --------------------------------------------------
@@ -383,7 +393,7 @@ class AnthropicMessageFormatter(MessageFormatter):
                 kwargs: dict[str, Any] = {}
                 caller = getattr(raw_block, "caller", None)
                 if caller:
-                    kwargs["caller"] = caller.model_dump() if hasattr(caller, "model_dump") else caller
+                    kwargs["caller"] = _serialize_obj(caller)
                 return ToolUseContent(
                     tool_name=raw_block.name,
                     tool_id=raw_block.id,
@@ -397,7 +407,7 @@ class AnthropicMessageFormatter(MessageFormatter):
                 kwargs: dict[str, Any] = {}
                 caller = getattr(raw_block, "caller", None)
                 if caller:
-                    kwargs["caller"] = caller.model_dump() if hasattr(caller, "model_dump") else caller
+                    kwargs["caller"] = _serialize_obj(caller)
                 return ServerToolUseContent(
                     tool_name=raw_block.name,
                     tool_id=raw_block.id,
@@ -500,7 +510,7 @@ class AnthropicMessageFormatter(MessageFormatter):
         kwargs: dict[str, Any] = {}
         caller = getattr(raw_block, "caller", None)
         if caller:
-            kwargs["caller"] = caller.model_dump() if hasattr(caller, "model_dump") else caller
+            kwargs["caller"] = _serialize_obj(caller)
 
         content = getattr(raw_block, "content", "")
         if isinstance(content, str):

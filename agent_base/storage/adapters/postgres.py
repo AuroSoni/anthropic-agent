@@ -54,10 +54,12 @@ def _parse_datetime(value: Any) -> str | None:
     return str(value)
 
 
-def _json_default(obj: Any) -> str:
-    """JSON serializer for datetime objects."""
+def _json_default(obj: Any) -> Any:
+    """JSON serializer for objects not handled by the default encoder."""
     if isinstance(obj, datetime):
         return obj.isoformat()
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        return dataclasses.asdict(obj)
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
