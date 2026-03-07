@@ -15,17 +15,13 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from anthropic_agent.core import AnthropicAgent
-from anthropic_agent.common_tools import (
+from agent_base.providers.anthropic import AnthropicAgent, AnthropicLLMConfig
+from agent_base.common_tools import (
     ReadFileTool, GlobFileSearchTool, GrepSearchTool,
     ListDirTool, ApplyPatchTool, CodeExecutionTool,
 )
-from anthropic_agent.cowork_style_tools import (
-    BashTool, create_read_tool, create_write_tool,
-    create_edit_tool, create_glob_tool, create_grep_tool,
-)
-from anthropic_agent.file_backends import S3Backend
-from anthropic_agent.tools import SAMPLE_TOOL_FUNCTIONS, tool, ToolResult
+from agent_base.tools import tool
+from agent_base.core.types import ToolResultContent, TextContent
 from storage import config_adapter, conversation_adapter, run_adapter
 
 logger = logging.getLogger(__name__)
@@ -45,24 +41,89 @@ MAX_TEXT_SIZE = 5 * 1024 * 1024      # 5 MB
 
 
 ########################################################
+# SAMPLE CALCULATOR TOOLS
+########################################################
+
+@tool
+def add(a: float, b: float) -> str:
+    """Add two numbers together and return the sum.
+
+    Args:
+        a: The first number to add
+        b: The second number to add
+
+    Returns:
+        String representation of the sum
+    """
+    return str(a + b)
+
+
+@tool
+def subtract(a: float, b: float) -> str:
+    """Subtract the second number from the first number.
+
+    Args:
+        a: The number to subtract from (minuend)
+        b: The number to subtract (subtrahend)
+
+    Returns:
+        String representation of the difference
+    """
+    return str(a - b)
+
+
+@tool
+def multiply(a: float, b: float) -> str:
+    """Multiply two numbers together and return the product.
+
+    Args:
+        a: The first number to multiply (multiplicand)
+        b: The second number to multiply (multiplier)
+
+    Returns:
+        String representation of the product
+    """
+    return str(a * b)
+
+
+@tool
+def divide(a: float, b: float) -> str:
+    """Divide the first number by the second number.
+
+    Args:
+        a: The dividend (number to be divided)
+        b: The divisor (number to divide by)
+
+    Returns:
+        String representation of the quotient, or error message for division by zero
+    """
+    if b == 0:
+        return "Error: Division by zero"
+    return str(a / b)
+
+
+SAMPLE_TOOL_FUNCTIONS = [add, subtract, multiply, divide]
+
+
+########################################################
 # FRONTEND TOOLS (executed by browser, schema only on server)
 ########################################################
 
 @tool(executor="frontend")
 def user_confirm(message: str) -> str:
     """Ask the user for yes/no confirmation before proceeding with an action.
-    
+
     Use this tool when you need explicit user approval before taking an action
     that could have significant consequences, such as:
     - Deleting or modifying data
     - Making purchases or transactions
     - Sending communications
     - Any irreversible operation
-    
+
     Args:
         message: The confirmation message to display to the user, explaining
                 what action requires their approval and any relevant details.
-    
+
     Returns:
         "yes" if the user confirms, "no" if the user declines
     """
@@ -71,60 +132,42 @@ def user_confirm(message: str) -> str:
 @tool
 def read_image_raw(image_path: str, description: str = "") -> str:
     """Read an image file and return it with a description.
-    
+
     Args:
         image_path: Path to the image file to read
         description: Optional description to include with the image
-        
+
     Returns:
         JSON content blocks with image and text
     """
-    import json
     import base64
     from pathlib import Path
-    
+
     path = Path(image_path)
-    
+
     if not path.exists():
         return f"Error: Image not found at {image_path}"
-    
+
     # Determine media type from extension
     ext = path.suffix.lower()
     media_types = {
         ".png": "image/png",
-        ".jpg": "image/jpeg", 
+        ".jpg": "image/jpeg",
         ".jpeg": "image/jpeg",
         ".gif": "image/gif",
         ".webp": "image/webp",
     }
     media_type = media_types.get(ext, "image/png")
-    
+
     # Read and encode image
     image_bytes = path.read_bytes()
     b64_data = base64.b64encode(image_bytes).decode("utf-8")
-    
-    # Build content blocks as dictionary structure
-    content_blocks = [
-        {
-            "type": "text",
-            "text": description if description else f"Image from {path.name}"
-        },
-        {
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": media_type,
-                "data": b64_data
-            }
-        }
-    ]
-    
-    # Return as JSON string (current tools return str)
-    return ToolResult.with_image(
-        image_data=image_bytes,
-        media_type=media_type,
-        text=description if description else f"Image from {path.name}"
-    )
+
+    label = description if description else f"Image from {path.name}"
+    return json.dumps([
+        {"type": "text", "text": label},
+        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64_data}},
+    ])
 
 # List of all frontend tools for easy registration
 FRONTEND_TOOL_FUNCTIONS = [user_confirm]
@@ -133,26 +176,29 @@ router = APIRouter(prefix="/agent", tags=["agent"])
 
 
 class AgentConfig(BaseModel):
-    """Configuration for an agent instance."""
+    """Configuration for an agent instance.
+
+    Fields map to AnthropicAgent constructor parameters.
+    Provider-specific LLM settings (thinking_tokens, max_tokens, server_tools,
+    skills, beta_headers) are bundled into AnthropicLLMConfig at construction time.
+    """
     model_config = ConfigDict(arbitrary_types_allowed=True)
-    
+
     system_prompt: str
     model: str
-    thinking_tokens: int
-    max_tokens: int
+    thinking_tokens: int = 0
+    max_tokens: int = 64000
     tools: list = []
     frontend_tools: list = []  # Frontend-executed tools (schema only on server)
     server_tools: list = []
     skills: list = []
     context_management: dict | None = None
     beta_headers: list[str] = []
-    file_backend: Any = None
     config_adapter: Any = None
     conversation_adapter: Any = None
     run_adapter: Any = None
     subagents: dict | None = None  # dict[str, AnthropicAgent] for subagent delegation
-    formatter: str = "json"
-    stream_meta_history_and_tool_results: bool = False  # Include tool results in stream output
+    stream_meta_history_and_tool_results: bool = False
 
 
 # Agent type literal for request validation
@@ -163,7 +209,6 @@ AgentType = Literal[
     "agent_all_json",
     "agent_skills",
     "agent_subagents",
-    "agent_cowork",
 ]
 
 
@@ -250,31 +295,49 @@ class AgentSessionListResponse(BaseModel):
 
 
 ########################################################
+# HELPER: Build AnthropicAgent from AgentConfig
+########################################################
+
+def _create_agent(cfg: AgentConfig, agent_uuid: str | None = None) -> AnthropicAgent:
+    """Construct an AnthropicAgent from an AgentConfig pydantic model."""
+    llm_config = AnthropicLLMConfig(
+        thinking_tokens=cfg.thinking_tokens or None,
+        max_tokens=cfg.max_tokens or None,
+        server_tools=cfg.server_tools or None,
+        skills=cfg.skills or None,
+        beta_headers=cfg.beta_headers or None,
+    )
+
+    return AnthropicAgent(
+        system_prompt=cfg.system_prompt,
+        model=cfg.model,
+        config=llm_config,
+        tools=cfg.tools or None,
+        frontend_tools=cfg.frontend_tools or None,
+        subagents=cfg.subagents or None,
+        stream_meta_history_and_tool_results=cfg.stream_meta_history_and_tool_results,
+        config_adapter=cfg.config_adapter,
+        conversation_adapter=cfg.conversation_adapter,
+        run_adapter=cfg.run_adapter,
+        agent_uuid=agent_uuid,
+    )
+
+
+########################################################
 # AGENT CONFIGURATIONS
 ########################################################
 
 # Shared config
 WORKSPACE_PATH = os.getenv("WORKSPACE_PATH", "./workspace")
-_s3 = S3Backend(bucket=os.getenv("S3_BUCKET"))
 
-# Common tools (sandboxed to WORKSPACE_PATH, .md/.mmd files)
+# Common tools (sandbox-based I/O — sandbox is attached by AnthropicAgent.initialize())
 COMMON_TOOL_FUNCTIONS = [
-    ReadFileTool(base_path=WORKSPACE_PATH).get_tool(),
-    GlobFileSearchTool(base_path=WORKSPACE_PATH).get_tool(),
-    GrepSearchTool(base_path=WORKSPACE_PATH).get_tool(),
-    ListDirTool(base_path=WORKSPACE_PATH).get_tool(),
-    ApplyPatchTool(base_path=WORKSPACE_PATH).get_tool(),
-    CodeExecutionTool(output_base_path=os.path.join(WORKSPACE_PATH, "code_outputs")).get_tool(),
-]
-
-# Cowork-style tools (unrestricted, absolute paths)
-COWORK_TOOL_FUNCTIONS = [
-    create_read_tool(),
-    create_write_tool(),
-    create_edit_tool(),
-    create_glob_tool(),
-    create_grep_tool(),
-    BashTool(base_path=WORKSPACE_PATH).get_tool(),
+    ReadFileTool().get_tool(),
+    GlobFileSearchTool().get_tool(),
+    GrepSearchTool().get_tool(),
+    ListDirTool().get_tool(),
+    ApplyPatchTool().get_tool(),
+    CodeExecutionTool().get_tool(),
 ]
 
 # --- 1. Plain chat (no tools) ---
@@ -283,11 +346,9 @@ agent_no_tools = AgentConfig(
     model="claude-sonnet-4-5",
     thinking_tokens=1024,
     max_tokens=64000,
-    file_backend=_s3,
     config_adapter=config_adapter,
     conversation_adapter=conversation_adapter,
     run_adapter=run_adapter,
-    formatter="json",
     stream_meta_history_and_tool_results=True,
 )
 
@@ -298,11 +359,9 @@ agent_client_tools = AgentConfig(
     thinking_tokens=1024,
     max_tokens=64000,
     tools=SAMPLE_TOOL_FUNCTIONS,
-    file_backend=_s3,
     config_adapter=config_adapter,
     conversation_adapter=conversation_adapter,
     run_adapter=run_adapter,
-    formatter="json",
     stream_meta_history_and_tool_results=True,
 )
 
@@ -316,11 +375,9 @@ any action that could have consequences, ask for user confirmation using the use
     max_tokens=64000,
     tools=SAMPLE_TOOL_FUNCTIONS + [read_image_raw],
     frontend_tools=FRONTEND_TOOL_FUNCTIONS,
-    file_backend=_s3,
     config_adapter=config_adapter,
     conversation_adapter=conversation_adapter,
     run_adapter=run_adapter,
-    formatter="json",
     stream_meta_history_and_tool_results=True,
 )
 
@@ -351,11 +408,9 @@ agent_all_json = AgentConfig(
         "files-api-2025-04-14",
         "context-management-2025-06-27",
     ],
-    file_backend=_s3,
     config_adapter=config_adapter,
     conversation_adapter=conversation_adapter,
     run_adapter=run_adapter,
-    formatter="json",
     stream_meta_history_and_tool_results=True,
 )
 
@@ -374,11 +429,13 @@ _researcher_agent = AnthropicAgent(
     system_prompt="You are a research specialist. Search the web for information and provide comprehensive answers.",
     description="Searches the web for information and provides summarised results",
     model="claude-sonnet-4-5",
-    server_tools=[
-        {"type": "web_search_20250305", "name": "web_search", "max_uses": 50},
-        {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 50},
-    ],
-    beta_headers=["web-fetch-2025-09-10"],
+    config=AnthropicLLMConfig(
+        server_tools=[
+            {"type": "web_search_20250305", "name": "web_search", "max_uses": 50},
+            {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 50},
+        ],
+        beta_headers=["web-fetch-2025-09-10"],
+    ),
     config_adapter=config_adapter,
     conversation_adapter=conversation_adapter,
     run_adapter=run_adapter,
@@ -398,34 +455,13 @@ agent_subagents = AgentConfig(
         "calculator": _calculator_agent,
         "researcher": _researcher_agent,
     },
-    file_backend=_s3,
     config_adapter=config_adapter,
     conversation_adapter=conversation_adapter,
     run_adapter=run_adapter,
-    formatter="json",
     stream_meta_history_and_tool_results=True,
 )
 
-# --- 6. Cowork-style coding agent (unrestricted file I/O + bash) ---
-agent_cowork = AgentConfig(
-    system_prompt=(
-        "You are a coding assistant with full access to the workspace. "
-        "Use your tools to explore, read, write, edit, and search files, "
-        "and execute bash commands to help the user with coding tasks."
-    ),
-    model="claude-sonnet-4-5",
-    thinking_tokens=1024,
-    max_tokens=64000,
-    tools=COWORK_TOOL_FUNCTIONS,
-    file_backend=_s3,
-    config_adapter=config_adapter,
-    conversation_adapter=conversation_adapter,
-    run_adapter=run_adapter,
-    formatter="json",
-    stream_meta_history_and_tool_results=True,
-)
-
-# --- 7. Anthropic Agent Skills (code execution + document generation) ---
+# --- 6. Anthropic Agent Skills (code execution + document generation) ---
 agent_skills = AgentConfig(
     system_prompt="You are a helpful assistant that can generate documents and run code using Anthropic Skills.",
     model="claude-sonnet-4-5",
@@ -445,11 +481,9 @@ agent_skills = AgentConfig(
         "skills-2025-10-02",
         "files-api-2025-04-14",
     ],
-    file_backend=_s3,
     config_adapter=config_adapter,
     conversation_adapter=conversation_adapter,
     run_adapter=run_adapter,
-    formatter="json",
     stream_meta_history_and_tool_results=True,
 )
 
@@ -461,7 +495,6 @@ AGENT_CONFIGS: dict[AgentType, AgentConfig] = {
     "agent_all_json": agent_all_json,
     "agent_skills": agent_skills,
     "agent_subagents": agent_subagents,
-    "agent_cowork": agent_cowork,
 }
 
 async def stream_agent_response(
@@ -470,38 +503,35 @@ async def stream_agent_response(
     agent_type: Optional[AgentType] = None,
 ) -> AsyncGenerator[str, None]:
     """Generate SSE-formatted stream of agent responses.
-    
+
     Args:
         user_prompt: The user's question or task (str, list, or dict)
         agent_uuid: Optional UUID to resume existing agent
         agent_type: Optional agent type to use for configuration
-        
+
     Yields:
         SSE-formatted strings containing raw agent output chunks
     """
     try:
         # Get config from registry (default to agent_all_json)
         config = AGENT_CONFIGS[agent_type or "agent_all_json"]
-        
+
         # Create the agent with config
-        agent = AnthropicAgent(
-            **config.model_dump(exclude_none=True),
-            agent_uuid=agent_uuid,
-        )
-        
+        agent = _create_agent(config, agent_uuid=agent_uuid)
+
         # Create queue for streaming
         queue: asyncio.Queue[str | None] = asyncio.Queue()
-        
+
         # Run the agent in background (this will populate the queue)
         async def run_agent_and_signal():
             try:
-                result = await agent.run(user_prompt, queue)
+                result = await agent.run_stream(user_prompt, queue)
                 return result
             finally:
                 await queue.put(None)  # Always signal completion
-        
+
         agent_task = asyncio.create_task(run_agent_and_signal())
-        
+
         # Yield raw chunks as they arrive from the queue
         try:
             while True:
@@ -513,22 +543,13 @@ async def stream_agent_response(
         except asyncio.CancelledError:
             agent_task.cancel()
             raise
-        
+
         # Wait for agent to complete (re-raises if agent.run() failed)
         await agent_task
-        
-        # Wait for background persistence tasks to complete
-        # This prevents "Event loop is closed" errors from asyncpg
-        try:
-            drain_result = await agent.drain_background_tasks(timeout=10.0)
-            if drain_result.get("timed_out", 0) > 0:
-                logger.warning(f"Some persistence tasks timed out: {drain_result}")
-        except Exception as e:
-            logger.warning(f"Error draining background tasks: {e}")
-        
+
         # Send final SSE marker to close stream
         yield "data: [DONE]\n\n"
-        
+
     except Exception as e:
         tb = traceback.format_exception(type(e), e, e.__traceback__)
         logger.error(f"Error in agent stream: {e}\n{''.join(tb)}")
@@ -544,13 +565,13 @@ async def stream_tool_results_response(
     request: ToolResultsRequest,
 ) -> AsyncGenerator[str, None]:
     """Generate SSE-formatted stream after frontend tools complete.
-    
+
     Re-hydrates the agent from the database using agent_uuid, submits
     the frontend tool results, and continues streaming the response.
-    
+
     Args:
         request: Tool results request containing agent_uuid and results
-        
+
     Yields:
         SSE-formatted strings containing agent output chunks
     """
@@ -559,28 +580,35 @@ async def stream_tool_results_response(
         # Use the specified agent_type config, defaulting to agent_frontend_tools
         agent_type = request.agent_type or "agent_frontend_tools"
         config = AGENT_CONFIGS.get(agent_type, AGENT_CONFIGS["agent_frontend_tools"])
-        
-        agent = AnthropicAgent(
-            **config.model_dump(exclude_none=True),
-            agent_uuid=request.agent_uuid,
-        )
-        
+
+        agent = _create_agent(config, agent_uuid=request.agent_uuid)
+
         # Create queue for streaming
         queue: asyncio.Queue[str | None] = asyncio.Queue()
-        
+
+        # Build relay result content blocks from frontend tool results
+        relay_blocks = []
+        for r in request.tool_results:
+            relay_blocks.append(ToolResultContent(
+                tool_name="",  # Name not required for results
+                tool_id=r.tool_use_id,
+                tool_result=[TextContent(text=r.content)],
+                is_error=r.is_error,
+            ))
+
         # Continue the agent with frontend tool results
         async def run_continuation():
             try:
-                result = await agent.continue_with_tool_results(
-                    [r.model_dump() for r in request.tool_results],
+                result = await agent.resume_with_relay_results(
+                    relay_results=relay_blocks,
                     queue=queue,
                 )
                 return result
             finally:
                 await queue.put(None)  # Always signal completion
-        
+
         agent_task = asyncio.create_task(run_continuation())
-        
+
         # Yield chunks as they arrive
         try:
             while True:
@@ -592,22 +620,13 @@ async def stream_tool_results_response(
         except asyncio.CancelledError:
             agent_task.cancel()
             raise
-        
+
         # Wait for agent to complete (re-raises if continuation failed)
         await agent_task
-        
-        # Wait for background persistence tasks to complete
-        # This prevents "Event loop is closed" errors from asyncpg
-        try:
-            drain_result = await agent.drain_background_tasks(timeout=10.0)
-            if drain_result.get("timed_out", 0) > 0:
-                logger.warning(f"Some persistence tasks timed out: {drain_result}")
-        except Exception as e:
-            logger.warning(f"Error draining background tasks: {e}")
-        
+
         # Send final SSE marker
         yield "data: [DONE]\n\n"
-        
+
     except Exception as e:
         tb = traceback.format_exception(type(e), e, e.__traceback__)
         logger.error(f"Error in tool results stream: {e}\n{''.join(tb)}")
@@ -724,19 +743,19 @@ async def build_content_blocks_from_files(
 @router.post("/run")
 async def run_agent(request: AgentRunRequest) -> StreamingResponse:
     """Run an agent with the given prompt and stream responses via SSE.
-    
+
     This endpoint creates a new agent (or resumes an existing one) and streams
     its responses in real-time using Server-Sent Events (SSE).
-    
+
     Only one of agent_type or agent_uuid can be provided. If neither is provided,
     defaults to agent_all_json.
-    
+
     Args:
         request: Agent run request containing user_prompt and optional agent_uuid/agent_type
-        
+
     Returns:
         StreamingResponse with text/event-stream content type
-        
+
     Example:
         ```
         POST /agent/run
@@ -826,17 +845,17 @@ async def run_agent_multipart(
 @router.post("/tool_results")
 async def submit_tool_results(request: ToolResultsRequest) -> StreamingResponse:
     """Resume agent execution after frontend tools have been executed.
-    
+
     This endpoint is called by the browser after it executes frontend tools
     (e.g., user_confirm). The agent state is re-hydrated from the database
     using the agent_uuid, and execution continues with the tool results.
-    
+
     Args:
         request: Tool results request containing agent_uuid and tool results
-        
+
     Returns:
         StreamingResponse with text/event-stream content type
-        
+
     Example:
         ```
         POST /agent/tool_results
@@ -866,22 +885,22 @@ async def upload_files(
     urls: list[str] = Form(default=[]),
 ) -> UploadResponse:
     """Upload files to Anthropic Files API.
-    
+
     Accepts files via form data (direct uploads or URLs). For URLs, the server
     downloads the file first and then uploads to Anthropic.
-    
+
     Args:
         files: List of files to upload directly
         urls: List of URLs to download and upload
-        
+
     Returns:
         UploadResponse containing metadata for all uploaded files
-        
+
     Example:
         ```
         POST /agent/upload
         Content-Type: multipart/form-data
-        
+
         files: <file1>, <file2>
         urls: https://example.com/image.png
         ```
@@ -891,21 +910,21 @@ async def upload_files(
             status_code=400,
             detail="At least one file or URL must be provided",
         )
-    
+
     client = anthropic.Anthropic()
     uploaded_files: list[FileMetadata] = []
-    
+
     # Upload direct files
     for upload_file in files:
         if upload_file.filename:
             try:
                 content = await upload_file.read()
                 mime_type = upload_file.content_type or "application/octet-stream"
-                
+
                 result = client.beta.files.upload(
                     file=(upload_file.filename, content, mime_type),
                 )
-                
+
                 uploaded_files.append(FileMetadata(
                     id=result.id,
                     filename=result.filename,
@@ -920,7 +939,7 @@ async def upload_files(
                     status_code=500,
                     detail=f"Failed to upload file {upload_file.filename}: {str(e)}",
                 )
-    
+
     # Download and upload from URLs
     async with httpx.AsyncClient() as http_client:
         for url in urls:
@@ -928,7 +947,7 @@ async def upload_files(
                 # Download file from URL
                 response = await http_client.get(url, follow_redirects=True)
                 response.raise_for_status()
-                
+
                 # Extract filename from URL or Content-Disposition header
                 content_disposition = response.headers.get("content-disposition")
                 if content_disposition and "filename=" in content_disposition:
@@ -936,19 +955,19 @@ async def upload_files(
                 else:
                     parsed_url = urlparse(url)
                     filename = os.path.basename(parsed_url.path) or "downloaded_file"
-                
+
                 # Determine MIME type
                 content_type = response.headers.get("content-type", "").split(";")[0]
                 if not content_type:
                     content_type, _ = mimetypes.guess_type(filename)
                     content_type = content_type or "application/octet-stream"
-                
+
                 content = response.content
-                
+
                 result = client.beta.files.upload(
                     file=(filename, content, content_type),
                 )
-                
+
                 uploaded_files.append(FileMetadata(
                     id=result.id,
                     filename=result.filename,
@@ -969,7 +988,7 @@ async def upload_files(
                     status_code=500,
                     detail=f"Failed to upload file from URL {url}: {str(e)}",
                 )
-    
+
     return UploadResponse(files=uploaded_files)
 
 
@@ -979,48 +998,44 @@ async def get_tool_image(
     image_id: str,
 ) -> StreamingResponse:
     """Fetch an image generated by a tool result.
-    
-    This endpoint serves images stored by the local file backend. When using
-    S3 backend, images are served directly via presigned URLs and this endpoint
-    is not needed.
-    
+
+    This endpoint serves images stored by the local media backend.
+
     Args:
         agent_uuid: The agent session UUID
         image_id: The image identifier (e.g., "img_abc123")
-        
+
     Returns:
         StreamingResponse with the image content
-        
+
     Raises:
         HTTPException 404: If image not found
-        HTTPException 500: If file backend not configured for local storage
     """
     from pathlib import Path
-    from anthropic_agent.file_backends import LocalFilesystemBackend
-    
+
     # Get file backend configuration
     # For now, use default local path - in production this should match agent config
     base_path = Path("./agent-files")
     agent_dir = base_path / agent_uuid
-    
+
     if not agent_dir.exists():
         raise HTTPException(
             status_code=404,
             detail=f"Agent directory not found: {agent_uuid}",
         )
-    
+
     # Find image file matching the image_id pattern
     # Files are stored as: {image_id}_{filename}.{ext}
     matching_files = list(agent_dir.glob(f"{image_id}_*"))
-    
+
     if not matching_files:
         raise HTTPException(
             status_code=404,
             detail=f"Image not found: {image_id}",
         )
-    
+
     image_path = matching_files[0]
-    
+
     # Determine media type from extension
     ext = image_path.suffix.lower()
     media_type_map = {
@@ -1031,7 +1046,7 @@ async def get_tool_image(
         ".webp": "image/webp",
     }
     media_type = media_type_map.get(ext, "application/octet-stream")
-    
+
     # Read and return image
     try:
         content = image_path.read_bytes()
@@ -1057,20 +1072,20 @@ async def list_sessions(
     offset: int = Query(default=0, ge=0, description="Number of sessions to skip"),
 ) -> AgentSessionListResponse:
     """List all agent sessions with metadata.
-    
+
     Returns sessions sorted by updated_at descending (newest first).
     Supports offset-based pagination.
-    
+
     Args:
         limit: Maximum number of sessions to return (max 100)
         offset: Number of sessions to skip
-        
+
     Returns:
         AgentSessionListResponse with list of sessions and total count
     """
     # Use shared adapter directly
     sessions, total = await config_adapter.list_sessions(limit=limit, offset=offset)
-    
+
     return AgentSessionListResponse(
         sessions=[
             AgentSessionItem(
@@ -1093,24 +1108,24 @@ async def get_conversations(
     limit: int = Query(default=20, le=100, description="Maximum conversations to return"),
 ) -> ConversationListResponse:
     """Get paginated conversation history for an agent (newest first).
-    
+
     Uses cursor-based pagination for efficient infinite scroll. On initial load,
     omit the `before` parameter to get the newest conversations. For subsequent
     pages, pass the smallest `sequence_number` from the previous response as `before`.
-    
+
     Args:
         agent_uuid: The agent's UUID
         before: Load conversations with sequence_number < this value (None = latest)
         limit: Maximum number of conversations to return (max 100)
-        
+
     Returns:
         ConversationListResponse with conversations and has_more flag
-        
+
     Example:
         ```
         # Initial load (newest conversations)
         GET /agent/{uuid}/conversations?limit=20
-        
+
         # Load older conversations (scroll up)
         GET /agent/{uuid}/conversations?before=31&limit=20
         ```
@@ -1121,7 +1136,7 @@ async def get_conversations(
         before=before,
         limit=limit,
     )
-    
+
     # Convert Conversation dataclasses to response models
     items = [
         ConversationItem(
@@ -1140,11 +1155,11 @@ async def get_conversations(
         )
         for conv in conversations
     ]
-    
+
     # Get session title from config adapter
     agent_config = await config_adapter.load(agent_uuid)
     session_title = agent_config.title if agent_config else None
-    
+
     return ConversationListResponse(
         conversations=items,
         has_more=has_more,

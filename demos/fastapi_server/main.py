@@ -11,12 +11,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 logger = logging.getLogger(__name__)
 
-# Try importing anthropic_agent from the workspace (installed via uv).
+# Try importing agent_base from the workspace (installed via uv).
 # If not installed, fall back to the local package by adding repo root to path.
 try:
-    import anthropic_agent  # noqa: F401
+    import agent_base  # noqa: F401
 except ImportError:
-    logger.info("Anthropic agent not found in workspace, falling back to local package.")
+    logger.info("agent_base not found in workspace, falling back to local package.")
     repo_root = Path(__file__).parent.parent.parent
     sys.path.insert(0, str(repo_root))
 
@@ -43,9 +43,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Anthropic Agent API",
-    description="Demo API for anthropic-agent package",
-    version="0.1.0",
+    title="Agent Base API",
+    description="Demo API for agent-base package",
+    version="0.5.0",
     lifespan=lifespan,
 )
 
