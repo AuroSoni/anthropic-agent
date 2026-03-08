@@ -43,7 +43,7 @@ class LocalSandbox(Sandbox):
 
         {base_dir}/{sandbox_id}/
         ├── workspace/          # default cwd for exec
-        ├── .imported/          # (created by caller, not by sandbox)
+        │   └── .imported/      # uploaded/imported files (visible to tools)
         ├── .exports/           # (created by caller)
         └── ...
 
@@ -130,7 +130,7 @@ class LocalSandbox(Sandbox):
 
     async def setup(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
-        for zone in (".imported", "workspace", ".exports"):
+        for zone in ("workspace", "workspace/.imported", ".exports"):
             (self.root / zone).mkdir(exist_ok=True)
         self._cwd = self.workspace
 
@@ -236,7 +236,7 @@ class LocalSandbox(Sandbox):
     async def import_file(
         self, filename: str, data: AsyncIterator[bytes]
     ) -> str:
-        sandbox_path = f".imported/{filename}"
+        sandbox_path = f"workspace/.imported/{filename}"
         await self.write_file_bytes(sandbox_path, data)
         return sandbox_path
 

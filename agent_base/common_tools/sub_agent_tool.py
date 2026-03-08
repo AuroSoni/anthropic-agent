@@ -190,6 +190,7 @@ Args:
             max_tool_result_tokens=template.max_tool_result_tokens,
             compactor=template.compactor,
             memory_store=template.memory_store,
+            sandbox=self._sandbox,  # share parent's sandbox
             agent_uuid=resume_uuid,  # None → new session, str → resume
             config_adapter=template.config_adapter,
             conversation_adapter=template.conversation_adapter,
