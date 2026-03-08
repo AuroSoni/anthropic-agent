@@ -770,9 +770,8 @@ class AnthropicAgent(Agent):
         results: list[MediaMetadata] = []
         for file_id in new_file_ids:
             try:
-                # Download from Anthropic Files API.
+                # Download from Anthropic Files API (streamed).
                 response = await self.provider.client.beta.files.download(file_id)
-                file_content: bytes = await response.read()
                 file_metadata_api = await self.provider.client.beta.files.retrieve_metadata(file_id)
 
                 filename = getattr(file_metadata_api, "filename", None) or f"file_{file_id}"
@@ -780,12 +779,8 @@ class AnthropicAgent(Agent):
                     mimetypes.guess_type(filename)[0] or "application/octet-stream"
                 )
 
-                # Wrap raw bytes as an async iterator for the media backend.
-                async def _byte_iter(data: bytes = file_content) -> Any:
-                    yield data
-
                 metadata = await self.media_backend.store(
-                    _byte_iter(), filename, mime_type, self.agent_config.agent_uuid
+                    response.iter_bytes(), filename, mime_type, self.agent_config.agent_uuid
                 )
                 metadata.extras["anthropic_file_id"] = file_id
                 results.append(metadata)
