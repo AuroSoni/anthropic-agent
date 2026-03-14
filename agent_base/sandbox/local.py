@@ -44,7 +44,9 @@ class LocalSandbox(Sandbox):
         {base_dir}/{sandbox_id}/
         ├── workspace/          # default cwd for exec
         │   └── .imported/      # uploaded/imported files (visible to tools)
-        ├── .exports/           # (created by caller)
+        ├── .exports/           # tool-produced user-facing artifacts
+        ├── .plans/             # plan artifacts persisted inside the sandbox
+        ├── .tool_results/      # stored tool result payloads
         └── ...
 
     All relative paths are resolved against the sandbox root
@@ -130,7 +132,13 @@ class LocalSandbox(Sandbox):
 
     async def setup(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
-        for zone in ("workspace", "workspace/.imported", ".exports"):
+        for zone in (
+            "workspace",
+            "workspace/.imported",
+            ".exports",
+            ".plans",
+            ".tool_results",
+        ):
             (self.root / zone).mkdir(exist_ok=True)
         self._cwd = self.workspace
 
