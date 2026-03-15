@@ -466,9 +466,10 @@ class AnthropicAgent(Agent):
         # Fire on_relay_result hook for each relay result before resuming.
         for block in relay_results:
             if isinstance(block, ToolResultBase):
+                tool_name = block.tool_name or self._get_relay_tool_name(block.tool_id, pending)
                 tool_input = self._get_relay_tool_input(block.tool_id, pending)
                 await self.on_relay_result(
-                    tool_name=block.tool_name,
+                    tool_name=tool_name,
                     tool_input=tool_input,
                     result=block,
                 )
@@ -731,6 +732,15 @@ class AnthropicAgent(Agent):
             result: The ``ToolResultContent`` block from the relay.
         """
         pass
+
+    def _get_relay_tool_name(
+        self, tool_id: str, pending: PendingToolRelay
+    ) -> str:
+        """Look up the original tool name for a relay tool call by tool_id."""
+        for call_info in (*pending.frontend_calls, *pending.confirmation_calls):
+            if call_info.tool_id == tool_id:
+                return call_info.name
+        return ""
 
     def _get_relay_tool_input(
         self, tool_id: str, pending: PendingToolRelay
