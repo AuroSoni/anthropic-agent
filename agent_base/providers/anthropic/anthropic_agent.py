@@ -463,6 +463,12 @@ class AnthropicAgent(Agent):
         if self.conversation:
             self.conversation.messages.append(combined_message)
 
+        # Resolve string formatter names to actual StreamFormatter instances
+        # before the on_relay_result loop so hooks can use queue/formatter.
+        if isinstance(stream_formatter, str):
+            from agent_base.streaming import get_formatter
+            stream_formatter = get_formatter(stream_formatter)
+
         # Fire on_relay_result hook for each relay result before resuming.
         for block in relay_results:
             if isinstance(block, ToolResultBase):
@@ -472,6 +478,8 @@ class AnthropicAgent(Agent):
                     tool_name=tool_name,
                     tool_input=tool_input,
                     result=block,
+                    queue=queue,
+                    stream_formatter=stream_formatter,
                 )
 
         # Clear pending relay.
@@ -479,9 +487,6 @@ class AnthropicAgent(Agent):
 
         # Emit meta_init for the resumed stream.
         if queue and stream_formatter:
-            if isinstance(stream_formatter, str):
-                from agent_base.streaming import get_formatter
-                stream_formatter = get_formatter(stream_formatter)
             await self._emit_meta_init(combined_message, queue, stream_formatter)
 
         # Resume the agent loop.
@@ -609,6 +614,11 @@ class AnthropicAgent(Agent):
                             tool_calls, self.max_parallel_tool_calls
                         )
 
+                        # Fire _on_tool_results hook for subclass side-effects.
+                        if queue:
+                            fmt = stream_formatter if stream_formatter is not None else get_formatter(DEFAULT_STREAM_FORMATTER)
+                            await self._on_tool_results(tool_results, queue, fmt)
+
                         # Stream client tool results to SSE queue.
                         if queue and self.stream_meta_history_and_tool_results:
                             fmt = stream_formatter if stream_formatter is not None else get_formatter(DEFAULT_STREAM_FORMATTER)
@@ -718,6 +728,8 @@ class AnthropicAgent(Agent):
         tool_name: str,
         tool_input: dict[str, Any],
         result: ContentBlock,
+        queue: asyncio.Queue | None = None,
+        stream_formatter: StreamFormatter | None = None,
     ) -> None:
         """Lifecycle hook fired after each frontend/confirmation tool result.
 
@@ -730,6 +742,27 @@ class AnthropicAgent(Agent):
             tool_name: Name of the tool that produced this result.
             tool_input: Original input dict from the tool call.
             result: The ``ToolResultContent`` block from the relay.
+            queue: SSE streaming queue (if streaming).
+            stream_formatter: Resolved stream formatter instance (if streaming).
+        """
+        pass
+
+    async def _on_tool_results(
+        self,
+        envelopes: list[ToolResultEnvelope],
+        queue: asyncio.Queue,
+        stream_formatter: StreamFormatter,
+    ) -> None:
+        """Hook called after tool execution in ``_resume_loop()``.
+
+        Override in subclasses to emit streaming events (e.g. mode changes,
+        todo updates) based on tool results. The default implementation is a
+        no-op.
+
+        Args:
+            envelopes: Tool result envelopes from the just-completed execution.
+            queue: SSE streaming queue.
+            stream_formatter: Resolved stream formatter instance.
         """
         pass
 
