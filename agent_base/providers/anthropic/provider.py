@@ -13,6 +13,7 @@ from typing import Any, TYPE_CHECKING
 
 import anthropic
 
+from agent_base.providers.anthropic.abort_types import StreamResult
 from agent_base.core.messages import Message, Usage
 from agent_base.core.provider import Provider
 from agent_base.core.types import ContentBlock, Role
@@ -380,7 +381,8 @@ class AnthropicProvider(Provider):
         stream_formatter: StreamFormatter,
         stream_tool_results: bool = True,
         agent_uuid: str = "",
-    ) -> Message:
+        cancellation_event: asyncio.Event | None = None,
+    ) -> StreamResult:
         """Streaming Anthropic API call with retry.
 
         1. Format tool schemas and message content blocks via the formatter.
@@ -390,8 +392,13 @@ class AnthropicProvider(Provider):
         4. Parse response content blocks via the formatter.
         5. Build the canonical ``Message`` (provider's responsibility).
 
+        Args:
+            cancellation_event: Optional event that, when set, signals the
+                stream to stop and return partial state.
+
         Returns:
-            Complete canonical ``Message`` after stream finishes.
+            StreamResult containing the canonical Message, completed block
+            indices, and whether the stream was cancelled.
         """
         formatted_tool_schemas = self.formatter.format_tool_schemas(tool_schemas)
 
@@ -407,7 +414,7 @@ class AnthropicProvider(Provider):
             wire_messages, system_prompt, model, llm_config, formatted_tool_schemas
         )
 
-        raw_message = await anthropic_stream_with_backoff(
+        stream_result = await anthropic_stream_with_backoff(
             client=self.client,
             request_params=request_params,
             queue=queue,
@@ -416,7 +423,17 @@ class AnthropicProvider(Provider):
             stream_formatter=stream_formatter,
             stream_tool_results=stream_tool_results,
             agent_uuid=agent_uuid,
+            cancellation_event=cancellation_event,
         )
 
-        content_blocks = self.formatter.parse_wire_to_blocks(raw_message.content)
-        return self._build_response_message(raw_message, content_blocks)
+        content_blocks = self.formatter.parse_wire_to_blocks(
+            stream_result.message.content
+        )
+        response_message = self._build_response_message(
+            stream_result.message, content_blocks
+        )
+        return StreamResult(
+            message=response_message,
+            completed_blocks=stream_result.completed_blocks,
+            was_cancelled=stream_result.was_cancelled,
+        )

@@ -252,6 +252,10 @@ class AgentConfig:
     last_run_at: str | None = None
     total_runs: int = 0
 
+    # --- Abort/steer state ---
+    # Persisted agent phase for AWAITING_RELAY cold-start abort.
+    agent_phase: str | None = None
+
     # --- User extension point ---
     extras: dict[str, Any] = field(default_factory=dict)
 

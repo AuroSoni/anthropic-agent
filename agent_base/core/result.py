@@ -86,6 +86,8 @@ class AgentResult:
     agent_logs: list[LogEntry] | None = None
     generated_files: list[MediaMetadata] | None = None
     cost: CostBreakdown | None = None
+    was_aborted: bool = False
+    abort_phase: str | None = None
 
 
 @dataclass

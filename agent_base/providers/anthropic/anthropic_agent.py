@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
+from agent_base.core.abort_types import AgentPhase
+from agent_base.providers.anthropic.abort_types import StreamResult
 from agent_base.core.agent_base import Agent
 from agent_base.core.config import AgentConfig, Conversation, CostBreakdown, LLMConfig, PendingToolRelay
 from agent_base.core.messages import Message, Usage
@@ -200,6 +202,11 @@ class AnthropicAgent(Agent):
 
         # Composition
         self.provider = AnthropicProvider()
+
+        # Abort/steer state — cooperative cancellation
+        self._phase: AgentPhase = AgentPhase.IDLE
+        self._cancellation_event: asyncio.Event | None = None
+        self._abort_completion: asyncio.Event | None = None
 
         ####################################################################
         # The agent's persistable state. This is the state that is saved to the database.
@@ -393,10 +400,14 @@ class AnthropicAgent(Agent):
         self,
         prompt: str | Message,
         queue: asyncio.Queue,
-        stream_formatter: str | StreamFormatter = DEFAULT_STREAM_FORMATTER
+        stream_formatter: str | StreamFormatter = DEFAULT_STREAM_FORMATTER,
+        cancellation_event: asyncio.Event | None = None,
     ) -> AgentResult:
         if not self._initialized:
             await self.initialize()
+
+        # Store the cancellation event (injected from caller or create a new one).
+        self._cancellation_event = cancellation_event or asyncio.Event()
 
         if isinstance(prompt, str):
             prompt = Message.user(prompt)
@@ -499,6 +510,11 @@ class AnthropicAgent(Agent):
         if isinstance(stream_formatter, str):
             stream_formatter = get_formatter(stream_formatter)
 
+        # Initialize cancellation primitives.
+        if self._cancellation_event is None:
+            self._cancellation_event = asyncio.Event()
+        self._abort_completion = asyncio.Event()
+
         # Inject parent's queue/formatter into SubAgentTool for SSE forwarding.
         self._inject_subagent_context(queue, stream_formatter)
 
@@ -512,8 +528,11 @@ class AnthropicAgent(Agent):
                 if did_compact:
                     self.agent_config.context_messages = compacted_messages
 
+                # ---- Streaming phase ----
+                self._phase = AgentPhase.STREAMING
+
                 if queue:
-                    response_message: Message = await self.provider.generate_stream(
+                    stream_result: StreamResult = await self.provider.generate_stream(
                         system_prompt=self.agent_config.system_prompt,
                         messages=self.agent_config.context_messages,
                         tool_schemas=self.agent_config.tool_schemas,
@@ -525,7 +544,16 @@ class AnthropicAgent(Agent):
                         stream_formatter=stream_formatter if stream_formatter is not None else DEFAULT_STREAM_FORMATTER,
                         stream_tool_results=self.stream_meta_history_and_tool_results,
                         agent_uuid=self.agent_config.agent_uuid,
+                        cancellation_event=self._cancellation_event,
                     )
+
+                    # Handle stream cancellation (Scenario A)
+                    if stream_result.was_cancelled:
+                        return await self._handle_stream_abort(
+                            stream_result, queue, stream_formatter,
+                        )
+
+                    response_message: Message = stream_result.message
                 else:
                     response_message: Message = await self.provider.generate(
                         system_prompt=self.agent_config.system_prompt,
@@ -566,7 +594,8 @@ class AnthropicAgent(Agent):
                         backend_results = []
                         if classification.backend_calls:
                             backend_results = await self.tool_registry.execute_tools(
-                                classification.backend_calls, self.max_parallel_tool_calls
+                                classification.backend_calls, self.max_parallel_tool_calls,
+                                cancellation_event=self._cancellation_event,
                             )
 
                         # Stream backend tool results in relay path.
@@ -580,6 +609,9 @@ class AnthropicAgent(Agent):
                             completed_result_messages.append(
                                 self._build_tool_result_message(backend_results)
                             )
+
+                        # ---- Awaiting relay phase ----
+                        self._phase = AgentPhase.AWAITING_RELAY
 
                         # Create pending relay state.
                         self.agent_config.pending_relay = PendingToolRelay(
@@ -610,8 +642,12 @@ class AnthropicAgent(Agent):
                         return self._build_agent_result(response_message, "relay")
 
                     else:
+                        # ---- Tool execution phase ----
+                        self._phase = AgentPhase.EXECUTING_TOOLS
+
                         tool_results = await self.tool_registry.execute_tools(
-                            tool_calls, self.max_parallel_tool_calls
+                            tool_calls, self.max_parallel_tool_calls,
+                            cancellation_event=self._cancellation_event,
                         )
 
                         # Fire _on_tool_results hook for subclass side-effects.
@@ -630,6 +666,13 @@ class AnthropicAgent(Agent):
                         self.agent_config.conversation_history.append(tool_result_message)
                         if self.conversation:
                             self.conversation.messages.append(tool_result_message)
+
+                        # Check if we were cancelled during tool execution (Scenario B)
+                        if self._cancellation_event.is_set():
+                            self._phase = AgentPhase.IDLE
+                            self._abort_completion.set()
+                            await self._persist_state()
+                            return self._build_aborted_result()
 
                 elif stop_reason == "end_turn":
 
@@ -650,8 +693,212 @@ class AnthropicAgent(Agent):
             last_message = response_message if 'response_message' in dir() else Message.assistant("Max steps reached.")
             return await self._finalize_run(last_message, "max_steps", queue, stream_formatter)
         finally:
+            self._phase = AgentPhase.IDLE
             # Always clear subagent context to avoid stale references.
             self._inject_subagent_context(None, None)
+
+    # ─── Abort / Steer ─────────────────────────────────────────────────
+
+    async def abort(self) -> AgentResult:
+        """Cancel the current agent turn and produce a valid message chain.
+
+        Safe to call from any context (another task, a signal handler, an
+        HTTP endpoint via the AbortSteerRegistry). The agent loop detects
+        the cancellation cooperatively and cleans up.
+
+        Returns:
+            AgentResult with stop_reason="aborted".
+        """
+        if self._cancellation_event is None:
+            self._cancellation_event = asyncio.Event()
+
+        # Signal cancellation
+        self._cancellation_event.set()
+
+        phase = self._phase
+
+        if phase == AgentPhase.IDLE:
+            return self._build_aborted_result()
+
+        if phase in (AgentPhase.STREAMING, AgentPhase.EXECUTING_TOOLS):
+            # The main loop handles cleanup. Wait for it to finish.
+            if self._abort_completion:
+                await self._abort_completion.wait()
+
+        elif phase == AgentPhase.AWAITING_RELAY:
+            # Agent is paused (not running). Fix up the chain directly.
+            await self._abort_awaiting_relay()
+
+        return self._build_aborted_result()
+
+    async def steer(
+        self,
+        new_instruction: str,
+        queue: asyncio.Queue | None = None,
+        stream_formatter: str | StreamFormatter | None = DEFAULT_STREAM_FORMATTER,
+    ) -> AgentResult:
+        """Abort the current turn and redirect with a new instruction.
+
+        This is the "steer" operation: stop what you're doing, here's
+        what I want instead.
+
+        Args:
+            new_instruction: The user's new direction.
+            queue: SSE queue for streaming output.
+            stream_formatter: Output formatter.
+
+        Returns:
+            AgentResult from the redirected run.
+        """
+        # Step 1: Abort cleanly (produces valid chain)
+        await self.abort()
+
+        # Step 2: Build a user message with the new instruction
+        steer_message = Message.user(new_instruction)
+        self.agent_config.context_messages.append(steer_message)
+        self.agent_config.conversation_history.append(steer_message)
+        if self.conversation:
+            self.conversation.messages.append(steer_message)
+
+        # Step 3: Reset cancellation for the new run
+        self._cancellation_event = asyncio.Event()
+        self._abort_completion = asyncio.Event()
+
+        # Step 4: Resolve formatter
+        if isinstance(stream_formatter, str):
+            from agent_base.streaming import get_formatter
+            stream_formatter = get_formatter(stream_formatter)
+
+        # Step 5: Resume the agent loop
+        return await self._resume_loop(queue, stream_formatter)
+
+    async def _handle_stream_abort(
+        self,
+        stream_result: StreamResult,
+        queue: asyncio.Queue | None,
+        stream_formatter: StreamFormatter | None,
+    ) -> AgentResult:
+        """Handle abort during streaming (Scenario A).
+
+        Sanitizes the partial assistant message, synthesizes tool_result
+        blocks for orphaned tool_use blocks, and produces a valid chain.
+        """
+        from agent_base.providers.anthropic.message_sanitizer import (
+            sanitize_partial_assistant_message,
+            synthesize_abort_tool_results,
+        )
+
+        raw_blocks = stream_result.message.content
+        clean_blocks, orphaned_ids = sanitize_partial_assistant_message(
+            raw_blocks, stream_result.completed_blocks,
+        )
+
+        if clean_blocks:
+            sanitized_msg = Message.assistant(clean_blocks)
+            sanitized_msg.usage = stream_result.message.usage
+            sanitized_msg.stop_reason = stream_result.message.stop_reason
+            sanitized_msg.provider = stream_result.message.provider
+            sanitized_msg.model = stream_result.message.model
+
+            self.agent_config.context_messages.append(sanitized_msg)
+            self.agent_config.conversation_history.append(sanitized_msg)
+            if self.conversation:
+                self.conversation.messages.append(sanitized_msg)
+
+            if orphaned_ids:
+                abort_results = synthesize_abort_tool_results(orphaned_ids)
+                result_msg = Message.user(abort_results)  # type: ignore[arg-type]
+                self.agent_config.context_messages.append(result_msg)
+                self.agent_config.conversation_history.append(result_msg)
+                if self.conversation:
+                    self.conversation.messages.append(result_msg)
+
+        # Emit aborted MetaDelta to the stream queue
+        if queue and stream_formatter:
+            delta = MetaDelta(
+                agent_uuid=self.agent_config.agent_uuid,
+                type="aborted",
+                payload={"phase": "streaming"},
+                is_final=True,
+            )
+            await stream_formatter.format_delta(delta, queue)
+
+        self._phase = AgentPhase.IDLE
+        if self._abort_completion:
+            self._abort_completion.set()
+
+        await self._persist_state()
+        return self._build_aborted_result()
+
+    async def _abort_awaiting_relay(self) -> None:
+        """Handle abort during relay wait (Scenario C).
+
+        Synthesizes tool_result blocks for pending frontend/confirmation
+        calls, combines with existing backend results, and appends to the
+        chain. Clears pending_relay state.
+        """
+        from agent_base.providers.anthropic.message_sanitizer import synthesize_abort_tool_results
+
+        relay = self.agent_config.pending_relay
+        if relay is None:
+            return
+
+        # Collect IDs of pending frontend/confirmation tools
+        pending_ids = [
+            tc.tool_id
+            for tc in (*relay.frontend_calls, *relay.confirmation_calls)
+        ]
+
+        # Synthesize abort results for pending tools
+        synthetic_results = synthesize_abort_tool_results(pending_ids)
+
+        # Combine existing backend results with synthetic abort results
+        all_result_blocks: list[ContentBlock] = []
+        for completed_msg in relay.completed_results:
+            all_result_blocks.extend(completed_msg.content)
+        all_result_blocks.extend(synthetic_results)
+
+        # Append combined result message to the chain
+        combined_message = Message.user(all_result_blocks)  # type: ignore[arg-type]
+        self.agent_config.context_messages.append(combined_message)
+        self.agent_config.conversation_history.append(combined_message)
+        if self.conversation:
+            self.conversation.messages.append(combined_message)
+
+        # Clear pending relay state
+        self.agent_config.pending_relay = None
+        self._phase = AgentPhase.IDLE
+
+        await self._persist_state()
+
+    def _build_aborted_result(self) -> AgentResult:
+        """Build an AgentResult for an aborted run."""
+        # Use the last assistant message if available, else a placeholder.
+        last_msg = None
+        for msg in reversed(self.agent_config.context_messages):
+            if msg.role.value == "assistant":
+                last_msg = msg
+                break
+
+        if last_msg is None:
+            last_msg = Message.assistant("Agent run was aborted.")
+
+        final_text = self._extract_text(last_msg)
+
+        return AgentResult(
+            final_message=last_msg,
+            final_answer=final_text,
+            conversation_history=list(self.agent_config.conversation_history),
+            stop_reason="aborted",
+            model=self.agent_config.model,
+            provider="anthropic",
+            usage=last_msg.usage or Usage(),
+            cumulative_usage=self._cumulative_usage,
+            total_steps=self.agent_config.current_step,
+            agent_logs=list(self._run_logs) if self._run_logs else None,
+            was_aborted=True,
+            abort_phase=self._phase.value if self._phase != AgentPhase.IDLE else None,
+        )
 
     # ─── Private Helpers ──────────────────────────────────────────────
 

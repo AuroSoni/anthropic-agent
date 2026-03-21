@@ -198,19 +198,25 @@ class ToolRegistry:
         self,
         tool_calls: list[ToolCallInfo],
         max_parallel: int = 5,
+        cancellation_event: asyncio.Event | None = None,
     ) -> list[ToolResultEnvelope]:
-        """Execute multiple tool calls with bounded parallelism.
+        """Execute multiple tool calls with bounded parallelism and cancellation.
 
         Results are returned in the same order as ``tool_calls`` regardless
-        of execution order.
+        of execution order. If ``cancellation_event`` is set during execution,
+        in-flight tasks are cancelled and synthetic error results are generated
+        for cancelled tools.
 
         Args:
             tool_calls: List of tool calls to execute.
             max_parallel: Maximum number of concurrent tool executions.
+            cancellation_event: Optional event that, when set, signals
+                cancellation of remaining in-flight tools.
 
         Returns:
             List of ``ToolResultEnvelope`` objects, one per tool call,
-            in the same order as the input.
+            in the same order as the input. Cancelled tools get error
+            envelopes with ``is_error=True``.
         """
         if not tool_calls:
             return []
@@ -218,24 +224,87 @@ class ToolRegistry:
         # Fast path: single call, no concurrency overhead
         if len(tool_calls) == 1:
             tc = tool_calls[0]
+            if cancellation_event and cancellation_event.is_set():
+                return [ToolResultEnvelope.error(
+                    tc.name, tc.tool_id, "Tool execution was cancelled by user.",
+                )]
             result = await self.execute(tc.name, tc.tool_id, tc.input)
             return [result]
 
-        # Parallel path
+        # Parallel path with cancellation support
         semaphore = asyncio.Semaphore(max_parallel)
-        results: list[ToolResultEnvelope | None] = [None] * len(tool_calls)
+        results: dict[str, ToolResultEnvelope] = {}  # tool_id → result
 
-        async def _run_one(index: int, tc: ToolCallInfo) -> None:
+        async def _run_one(tc: ToolCallInfo) -> tuple[str, ToolResultEnvelope]:
             async with semaphore:
-                results[index] = await self.execute(tc.name, tc.tool_id, tc.input)
+                envelope = await self.execute(tc.name, tc.tool_id, tc.input)
+                return tc.tool_id, envelope
 
-        tasks = [
-            asyncio.create_task(_run_one(i, tc))
-            for i, tc in enumerate(tool_calls)
+        # Create tasks and track tool_id for each
+        tasks: dict[asyncio.Task[tuple[str, ToolResultEnvelope]], str] = {}
+        for tc in tool_calls:
+            task = asyncio.create_task(_run_one(tc))
+            tasks[task] = tc.tool_id
+
+        pending: set[asyncio.Task[Any]] = set(tasks.keys())
+
+        # Create cancellation sentinel if event provided
+        cancel_task: asyncio.Task[Any] | None = None
+        if cancellation_event:
+            cancel_task = asyncio.create_task(cancellation_event.wait())
+            pending.add(cancel_task)
+
+        try:
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                for task in done:
+                    if task is cancel_task:
+                        # Cancellation signalled — cancel remaining tool tasks
+                        for p in pending:
+                            p.cancel()
+                        # Wait for cancelled tasks to finish
+                        if pending:
+                            await asyncio.wait(pending)
+                        # Synthesize error results for any tools without results
+                        for t, tool_id in tasks.items():
+                            if tool_id not in results:
+                                results[tool_id] = ToolResultEnvelope.error(
+                                    tool_id, tool_id,
+                                    "Tool execution was cancelled by user.",
+                                )
+                        pending = set()
+                        break
+                    elif task in tasks:
+                        # Normal tool completion
+                        try:
+                            tool_id, envelope = task.result()
+                            results[tool_id] = envelope
+                        except Exception:
+                            tool_id = tasks[task]
+                            results[tool_id] = ToolResultEnvelope.error(
+                                tool_id, tool_id, "Tool execution failed.",
+                            )
+        finally:
+            # Clean up cancel_task if it wasn't triggered
+            if cancel_task and not cancel_task.done():
+                cancel_task.cancel()
+                try:
+                    await cancel_task
+                except asyncio.CancelledError:
+                    pass
+
+        # Return in original order
+        return [
+            results.get(
+                tc.tool_id,
+                ToolResultEnvelope.error(tc.name, tc.tool_id, "Tool result missing."),
+            )
+            for tc in tool_calls
         ]
-        await asyncio.gather(*tasks)
-
-        return results  # type: ignore[return-value]
 
     # ─── Relay Classification ──────────────────────────────────────
 
