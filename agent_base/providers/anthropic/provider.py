@@ -322,6 +322,39 @@ class AnthropicProvider(Provider):
             usage_kwargs=usage_kwargs,
         )
 
+    # -- Defensive sanitization --------------------------------------------
+
+    @staticmethod
+    def _defensive_sanitize(messages: list[Message]) -> list[Message]:
+        """Run chain-validity checks before sending to the API.
+
+        This is a safety net — if the message chain is already valid (the
+        normal case), this is a no-op.  If it detects and repairs any
+        violations, it logs a warning so we can track down the root cause.
+        """
+        from agent_base.providers.anthropic.message_sanitizer import (
+            ensure_chain_validity,
+        )
+
+        sanitized = ensure_chain_validity(messages)
+
+        if len(sanitized) != len(messages):
+            logger.warning(
+                "defensive_sanitize_repaired_chain",
+                original_count=len(messages),
+                sanitized_count=len(sanitized),
+            )
+        else:
+            for orig, fixed in zip(messages, sanitized):
+                if orig is not fixed:
+                    logger.warning(
+                        "defensive_sanitize_repaired_message",
+                        role=orig.role.value,
+                    )
+                    break
+
+        return sanitized
+
     # -- Public API ---------------------------------------------------------
 
     async def generate(
@@ -346,6 +379,7 @@ class AnthropicProvider(Provider):
         Returns:
             Canonical ``Message`` with content, usage, stop_reason.
         """
+        messages = self._defensive_sanitize(messages)
         formatted_tool_schemas = self.formatter.format_tool_schemas(tool_schemas)
 
         wire_messages = [
@@ -400,6 +434,7 @@ class AnthropicProvider(Provider):
             StreamResult containing the canonical Message, completed block
             indices, and whether the stream was cancelled.
         """
+        messages = self._defensive_sanitize(messages)
         formatted_tool_schemas = self.formatter.format_tool_schemas(tool_schemas)
 
         wire_messages = [
