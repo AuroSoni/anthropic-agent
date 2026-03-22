@@ -370,9 +370,12 @@ class AnthropicAgent(Agent):
         self._cumulative_usage = Usage()
         self._cumulative_cost = CostBreakdown()
 
-    def _reset_cancellation_state(self) -> None:
+    def _reset_cancellation_state(
+        self,
+        cancellation_event: asyncio.Event | None = None,
+    ) -> None:
         """Start a fresh cooperative-cancellation scope for a new turn."""
-        self._cancellation_event = asyncio.Event()
+        self._cancellation_event = cancellation_event or asyncio.Event()
         self._abort_completion = asyncio.Event()
 
     async def run(self, prompt: str | Message) -> AgentResult:
@@ -448,6 +451,7 @@ class AnthropicAgent(Agent):
         relay_results: list[ContentBlock],
         queue: asyncio.Queue | None = None,
         stream_formatter: str | StreamFormatter | None = DEFAULT_STREAM_FORMATTER,
+        cancellation_event: asyncio.Event | None = None,
     ) -> AgentResult:
 
         if not self._initialized:
@@ -457,7 +461,7 @@ class AnthropicAgent(Agent):
         if pending is None:
             raise RuntimeError("No pending relay to resume. Call run() first.")
 
-        self._reset_cancellation_state()
+        self._reset_cancellation_state(cancellation_event)
 
         # Initialize per-run tracking state for the resumed run.
         self._run_id = pending.run_id or str(uuid.uuid4())
@@ -745,6 +749,7 @@ class AnthropicAgent(Agent):
         new_instruction: str,
         queue: asyncio.Queue | None = None,
         stream_formatter: str | StreamFormatter | None = DEFAULT_STREAM_FORMATTER,
+        cancellation_event: asyncio.Event | None = None,
     ) -> AgentResult:
         """Abort the current turn and redirect with a new instruction.
 
@@ -770,7 +775,7 @@ class AnthropicAgent(Agent):
             self.conversation.messages.append(steer_message)
 
         # Step 3: Reset cancellation for the new run
-        self._reset_cancellation_state()
+        self._reset_cancellation_state(cancellation_event)
 
         # Step 4: Resolve formatter
         if isinstance(stream_formatter, str):
