@@ -33,6 +33,7 @@ from ...core.config import (
 from ...core.messages import Message, Usage
 from ...core.result import LogEntry
 from ...media_backend.media_types import MediaMetadata
+from ...providers.anthropic.compaction import CompactionConfig
 from ...sandbox import deserialize_sandbox_config
 from ...tools.tool_types import ToolSchema
 from ...tools.registry import ToolCallInfo
@@ -149,7 +150,11 @@ def _config_to_row_values(config: AgentConfig) -> tuple:
         config.tool_names,
         _to_jsonb(config.llm_config.to_dict()),
         config.formatter,
-        config.compactor_type,
+        _to_jsonb(
+            config.compaction_config.to_dict()
+            if config.compaction_config is not None
+            else None
+        ),
         config.memory_store_type,
         _to_jsonb(
             config.sandbox_config.to_dict()
@@ -178,6 +183,7 @@ def _row_to_config(row: asyncpg.Record) -> AgentConfig:
     raw_history = _from_jsonb(row["conversation_history"]) or []
     raw_tools = _from_jsonb(row["tool_schemas"]) or []
     raw_llm = _from_jsonb(row["llm_config"]) or {}
+    raw_compaction_config = _from_jsonb(row["compaction_config"])
     raw_sandbox_config = _from_jsonb(row["sandbox_config"])
     raw_media = _from_jsonb(row["media_registry"]) or {}
     raw_relay = _from_jsonb(row["pending_relay"])
@@ -196,7 +202,11 @@ def _row_to_config(row: asyncpg.Record) -> AgentConfig:
         tool_names=list(row["tool_names"]) if row["tool_names"] else [],
         llm_config=LLMConfig.from_dict(raw_llm),
         formatter=row["formatter"],
-        compactor_type=row["compactor_type"],
+        compaction_config=(
+            CompactionConfig.from_dict(raw_compaction_config)
+            if raw_compaction_config
+            else None
+        ),
         memory_store_type=row["memory_store_type"],
         sandbox_config=deserialize_sandbox_config(raw_sandbox_config),
         media_registry={k: MediaMetadata(**v) for k, v in raw_media.items()},
@@ -308,7 +318,7 @@ class PostgresAgentConfigAdapter(AgentConfigAdapter):
                 agent_uuid, description, provider, model, max_steps,
                 system_prompt, context_messages, conversation_history,
                 tool_schemas, tool_names, llm_config, formatter,
-                compactor_type, memory_store_type, sandbox_config,
+                compaction_config, memory_store_type, sandbox_config,
                 media_registry, last_known_input_tokens,
                 last_known_output_tokens, pending_relay, current_step,
                 parent_agent_uuid, subagent_schemas, title, created_at,
@@ -330,7 +340,7 @@ class PostgresAgentConfigAdapter(AgentConfigAdapter):
                 tool_names = EXCLUDED.tool_names,
                 llm_config = EXCLUDED.llm_config,
                 formatter = EXCLUDED.formatter,
-                compactor_type = EXCLUDED.compactor_type,
+                compaction_config = EXCLUDED.compaction_config,
                 memory_store_type = EXCLUDED.memory_store_type,
                 sandbox_config = EXCLUDED.sandbox_config,
                 media_registry = EXCLUDED.media_registry,
@@ -367,7 +377,7 @@ class PostgresAgentConfigAdapter(AgentConfigAdapter):
                 agent_uuid, description, provider, model, max_steps,
                 system_prompt, context_messages, conversation_history,
                 tool_schemas, tool_names, llm_config, formatter,
-                compactor_type, memory_store_type, sandbox_config,
+                compaction_config, memory_store_type, sandbox_config,
                 media_registry, last_known_input_tokens,
                 last_known_output_tokens, pending_relay, current_step,
                 parent_agent_uuid, subagent_schemas, title, created_at,

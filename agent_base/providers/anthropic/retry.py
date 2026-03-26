@@ -427,6 +427,34 @@ def retry_with_backoff(
             for attempt in range(max_retries):
                 try:
                     return await func(*args, **kwargs)
+                except anthropic.APIStatusError as e:
+                    if e.status_code < 500:
+                        raise
+                    last_exc = e
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)
+                        logger.warning(
+                            "retry",
+                            func=func.__name__,
+                            attempt=attempt + 1,
+                            delay=f"{delay:.2f}s",
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.error(
+                            "retries_exhausted",
+                            func=func.__name__,
+                            max_retries=max_retries,
+                        )
+                        raise
+                except (
+                    anthropic.BadRequestError,
+                    anthropic.AuthenticationError,
+                    anthropic.PermissionDeniedError,
+                    anthropic.NotFoundError,
+                    anthropic.UnprocessableEntityError,
+                ):
+                    raise
                 except Exception as e:
                     last_exc = e
                     if attempt < max_retries - 1:

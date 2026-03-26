@@ -167,7 +167,7 @@ Each provider implements its own `MessageFormatter`. This is where provider-spec
 - State: `messages` (compacted context), `conversation_history` (unabridged per-run), `current_step`
 - Tools: `tool_schemas`, `tool_names`, `server_tools`, `subagent_schemas`
 - Provider config: `llm_config: dict[str, Any]` (provider-specific params serialized)
-- Components: `formatter`, `compactor_type`, `memory_store_type`
+- Components: `formatter`, `compaction_config`, `memory_store_type`
 - Media: `file_registry` (to be migrated to media_backend reference)
 - Frontend relay: `pending_frontend_tools`, `pending_backend_results`, `awaiting_frontend_tools`
 - Hierarchy: `parent_agent_uuid`

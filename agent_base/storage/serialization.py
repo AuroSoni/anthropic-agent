@@ -22,6 +22,7 @@ from agent_base.core.config import (
 from agent_base.core.messages import Message, Usage
 from agent_base.core.result import LogEntry
 from agent_base.media_backend.media_types import MediaMetadata
+from agent_base.providers.anthropic.compaction import CompactionConfig
 from agent_base.sandbox import deserialize_sandbox_config
 from agent_base.tools.registry import ToolCallInfo
 from agent_base.tools.tool_types import ToolSchema
@@ -52,7 +53,11 @@ def serialize_config(config: AgentConfig) -> dict[str, Any]:
         "llm_config": config.llm_config.to_dict(),
         # Components
         "formatter": config.formatter,
-        "compactor_type": config.compactor_type,
+        "compaction_config": (
+            config.compaction_config.to_dict()
+            if config.compaction_config is not None
+            else None
+        ),
         "memory_store_type": config.memory_store_type,
         "sandbox_config": (
             config.sandbox_config.to_dict()
@@ -123,7 +128,11 @@ def deserialize_config(
         llm_config=llm_config_class.from_dict(data.get("llm_config", {})),
         # Components
         formatter=data.get("formatter"),
-        compactor_type=data.get("compactor_type"),
+        compaction_config=(
+            CompactionConfig.from_dict(data.get("compaction_config"))
+            if data.get("compaction_config")
+            else None
+        ),
         memory_store_type=data.get("memory_store_type"),
         sandbox_config=deserialize_sandbox_config(data.get("sandbox_config")),
         # Media

@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
+import anthropic
+
 from agent_base.core.abort_types import AgentPhase
 from agent_base.providers.anthropic.abort_types import StreamResult
 from agent_base.core.agent_base import Agent
@@ -30,6 +32,7 @@ from agent_base.tools.registry import ToolCallInfo, ToolRegistry
 from agent_base.streaming.types import MetaDelta
 from agent_base.tools.tool_types import ToolResultEnvelope
 from agent_base.logging import get_logger
+from .compaction import CompactionConfig, CompactionController
 from .formatters import AnthropicMessageFormatter
 
 logger = get_logger(__name__)
@@ -106,6 +109,7 @@ class AnthropicAgent(Agent):
         model: Optional[str] = None,
         messages: list[Message] | None = None,
         config: AnthropicLLMConfig = AnthropicLLMConfig(),
+        compaction_config: CompactionConfig | None = None,
         # Agent Orchestration Configurations.
         description: Optional[str] = None,
         max_steps: Optional[int] = DEFAULT_MAX_STEPS,    # None means no limit.
@@ -194,6 +198,7 @@ class AnthropicAgent(Agent):
 
         self._current_step = 0
         self._awaiting_tool_results = False
+        self._compaction_controller: CompactionController | None = None
 
         # Composition
         self.provider = AnthropicProvider()
@@ -211,6 +216,7 @@ class AnthropicAgent(Agent):
         self.model = model
         self.messages = messages
         self.config = config
+        self._compaction_config = compaction_config
         self.description = description
         self.max_steps = max_steps if max_steps is not None else float('inf')
         self._agent_uuid = agent_uuid
@@ -279,6 +285,7 @@ class AnthropicAgent(Agent):
 
             self.agent_config = AgentConfig(agent_uuid=self._agent_uuid)
             self.conversation = None  # Created per-run in initialize_run()
+            self._configure_compaction_controller()
 
             await self._initialize_sandbox(self._agent_uuid)
 
@@ -296,6 +303,7 @@ class AnthropicAgent(Agent):
                     loaded_config.llm_config.to_dict()
                 )
             self.agent_config = loaded_config
+            self._configure_compaction_controller()
 
             logger.debug(
                 "loaded_agent_config",
@@ -353,11 +361,15 @@ class AnthropicAgent(Agent):
         self.agent_config.max_steps = int(self.max_steps) if self.max_steps != float('inf') else 0
         self.agent_config.last_run_at = now
         self.agent_config.total_runs += 1
+        if self._compaction_config is not None:
+            self.agent_config.compaction_config = self._compaction_config
 
         # Set tool schemas from registry.
         if self.tool_registry:
             self.agent_config.tool_schemas = self.tool_registry.get_schemas()
             self.agent_config.tool_names = [s.name for s in self.agent_config.tool_schemas]
+
+        self._configure_compaction_controller()
 
         # Initialize per-run tracking.
         self._run_id = run_id
@@ -372,6 +384,36 @@ class AnthropicAgent(Agent):
         """Start a fresh cooperative-cancellation scope for a new turn."""
         self._cancellation_event = cancellation_event or asyncio.Event()
         self._abort_completion = asyncio.Event()
+
+    def _configure_compaction_controller(self) -> None:
+        """Compose or clear the inline compaction controller from config state."""
+        if self.agent_config is None:
+            self._compaction_controller = None
+            return
+
+        resolved_config = self._compaction_config
+        if resolved_config is not None:
+            self.agent_config.compaction_config = resolved_config
+        else:
+            resolved_config = self.agent_config.compaction_config
+
+        if resolved_config is None:
+            self._compaction_controller = None
+            return
+
+        self._compaction_controller = CompactionController(
+            config=resolved_config,
+            provider=self.provider,
+            token_estimator=self.provider.token_estimator,
+            max_retries=self.max_retries,
+            base_delay=self.base_delay,
+        )
+
+    def _replace_context_messages(self, messages: list[Message]) -> None:
+        """Replace compacted context and clear token baselines."""
+        self.agent_config.context_messages = messages
+        self.agent_config.last_known_input_tokens = 0
+        self.agent_config.last_known_output_tokens = 0
 
     async def run(self, prompt: str | Message) -> AgentResult:
         if not self._initialized:
@@ -528,44 +570,82 @@ class AnthropicAgent(Agent):
 
         try:
             while self.agent_config.current_step < self.max_steps:
-
-                # ---- Streaming phase ----
                 self._phase = AgentPhase.STREAMING
 
-                if queue:
-                    stream_result: StreamResult = await self.provider.generate_stream(
-                        system_prompt=self.agent_config.system_prompt,
-                        messages=self.agent_config.context_messages,
-                        tool_schemas=self.agent_config.tool_schemas,
-                        llm_config=self.agent_config.llm_config,
-                        model=self.agent_config.model,
-                        max_retries=self.max_retries,
-                        base_delay=self.base_delay,
-                        queue=queue,
-                        stream_formatter=stream_formatter if stream_formatter is not None else DEFAULT_STREAM_FORMATTER,
-                        stream_tool_results=self.stream_meta_history_and_tool_results,
-                        agent_uuid=self.agent_config.agent_uuid,
-                        cancellation_event=self._cancellation_event,
+                # --- Proactive compaction check ---
+                if (
+                    self._compaction_controller is not None
+                    and self._compaction_controller.should_compact(
+                        self.agent_config.context_messages,
+                        self.estimate_current_context_tokens(),
                     )
+                ):
+                    compacted_messages = await self._compaction_controller.compact(
+                        context_messages=self.agent_config.context_messages,
+                        model=self.agent_config.model,
+                        agent_uuid=self.agent_config.agent_uuid,
+                        queue=queue,
+                        stream_formatter=stream_formatter,
+                        reason="threshold",
+                    )
+                    if compacted_messages != self.agent_config.context_messages:
+                        self._replace_context_messages(compacted_messages)
 
-                    # Handle stream cancellation (Scenario A)
-                    if stream_result.was_cancelled:
-                        return await self._handle_stream_abort(
-                            stream_result, queue, stream_formatter,
+                try:
+                    if queue:
+                        stream_result: StreamResult = await self.provider.generate_stream(
+                            system_prompt=self.agent_config.system_prompt,
+                            messages=self.agent_config.context_messages,
+                            tool_schemas=self.agent_config.tool_schemas,
+                            llm_config=self.agent_config.llm_config,
+                            model=self.agent_config.model,
+                            max_retries=self.max_retries,
+                            base_delay=self.base_delay,
+                            queue=queue,
+                            stream_formatter=stream_formatter if stream_formatter is not None else get_formatter(DEFAULT_STREAM_FORMATTER),
+                            stream_tool_results=self.stream_meta_history_and_tool_results,
+                            agent_uuid=self.agent_config.agent_uuid,
+                            cancellation_event=self._cancellation_event,
                         )
 
-                    response_message: Message = stream_result.message
-                else:
-                    response_message: Message = await self.provider.generate(
-                        system_prompt=self.agent_config.system_prompt,
-                        messages=self.agent_config.context_messages,
-                        tool_schemas=self.agent_config.tool_schemas,
-                        llm_config=self.agent_config.llm_config,
-                        model=self.agent_config.model,
-                        max_retries=self.max_retries,
-                        base_delay=self.base_delay,
-                        agent_uuid=self.agent_config.agent_uuid,
+                        # Handle stream cancellation (Scenario A)
+                        if stream_result.was_cancelled:
+                            return await self._handle_stream_abort(
+                                stream_result, queue, stream_formatter,
+                            )
+
+                        response_message: Message = stream_result.message
+                    else:
+                        response_message = await self.provider.generate(
+                            system_prompt=self.agent_config.system_prompt,
+                            messages=self.agent_config.context_messages,
+                            tool_schemas=self.agent_config.tool_schemas,
+                            llm_config=self.agent_config.llm_config,
+                            model=self.agent_config.model,
+                            max_retries=self.max_retries,
+                            base_delay=self.base_delay,
+                            agent_uuid=self.agent_config.agent_uuid,
+                        )
+                except (anthropic.BadRequestError, anthropic.APIStatusError) as e:
+                    is_413 = (
+                        isinstance(e, anthropic.APIStatusError) and e.status_code == 413
+                    ) or (
+                        isinstance(e, anthropic.BadRequestError)
+                        and "request_too_large" in str(e)
                     )
+                    if is_413 and self._compaction_controller is not None:
+                        compacted_messages = await self._compaction_controller.compact(
+                            context_messages=self.agent_config.context_messages,
+                            model=self.agent_config.model,
+                            agent_uuid=self.agent_config.agent_uuid,
+                            queue=queue,
+                            stream_formatter=stream_formatter,
+                            reason="request_too_large",
+                        )
+                        if compacted_messages != self.agent_config.context_messages:
+                            self._replace_context_messages(compacted_messages)
+                            continue
+                    raise
 
                 self.agent_config.current_step += 1
                 self._accumulate_usage(response_message.usage)
@@ -576,6 +656,26 @@ class AnthropicAgent(Agent):
                     self.conversation.messages.append(response_message)
 
                 stop_reason = response_message.stop_reason
+
+                if stop_reason == "model_context_window_exceeded":
+                    if self._compaction_controller is not None:
+                        compacted_messages = await self._compaction_controller.compact(
+                            context_messages=self.agent_config.context_messages,
+                            model=self.agent_config.model,
+                            agent_uuid=self.agent_config.agent_uuid,
+                            queue=queue,
+                            stream_formatter=stream_formatter,
+                            reason="context_window_exceeded",
+                        )
+                        if compacted_messages != self.agent_config.context_messages:
+                            self._replace_context_messages(compacted_messages)
+                            continue
+                    return await self._finalize_run(
+                        response_message,
+                        "context_window_exceeded",
+                        queue,
+                        stream_formatter,
+                    )
 
                 # Handle pause_turn from Skills (long-running operations)
                 if stop_reason == "pause_turn":
