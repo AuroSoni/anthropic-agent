@@ -16,7 +16,6 @@ from agent_base.core.config import AgentConfig, Conversation, CostBreakdown, LLM
 from agent_base.core.messages import Message, Usage
 from agent_base.core.result import AgentResult, LogEntry
 from agent_base.core.types import ContentBlock, ServerToolResultContent, TextContent, ToolResultBase, ToolUseBase, ToolResultContent
-from agent_base.compaction.strategies import NoOpCompactor
 from agent_base.memory.stores import NoOpMemoryStore
 from agent_base.sandbox import sandbox_from_config
 from agent_base.sandbox.local import LocalSandbox
@@ -37,7 +36,6 @@ logger = get_logger(__name__)
 from .provider import AnthropicProvider
 
 if TYPE_CHECKING:
-    from agent_base.compaction.base import Compactor
     from agent_base.media_backend.media_types import MediaBackend
     from agent_base.memory.base import MemoryStore
     from agent_base.sandbox.sandbox_types import Sandbox
@@ -119,7 +117,6 @@ class AnthropicAgent(Agent):
         base_delay: float = DEFAULT_BASE_DELAY,
         max_parallel_tool_calls: int = MAX_PARALLEL_TOOL_CALLS,
         max_tool_result_tokens: int = DEFAULT_MAX_TOOL_RESULT_TOKENS,
-        compactor: Compactor | None = None,
         memory_store: MemoryStore | None = None,
         sandbox: Sandbox | None = None,
         sandbox_factory: Callable[[str], Sandbox] | None = None,
@@ -150,8 +147,6 @@ class AnthropicAgent(Agent):
         # Media backend.
         self.media_backend = media_backend or LocalMediaBackend()
 
-        # Compactor and memory store.
-        self.compactor = compactor or NoOpCompactor()
         self.memory_store = memory_store or NoOpMemoryStore()
 
         # Sandbox configuration — created lazily in initialize() when UUID is known.
@@ -533,13 +528,6 @@ class AnthropicAgent(Agent):
 
         try:
             while self.agent_config.current_step < self.max_steps:
-
-                did_compact, compacted_messages = await self.compactor.apply_compaction(
-                    self.agent_config
-                )
-
-                if did_compact:
-                    self.agent_config.context_messages = compacted_messages
 
                 # ---- Streaming phase ----
                 self._phase = AgentPhase.STREAMING

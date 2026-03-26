@@ -188,7 +188,6 @@ Args:
             base_delay=template.base_delay,
             max_parallel_tool_calls=template.max_parallel_tool_calls,
             max_tool_result_tokens=template.max_tool_result_tokens,
-            compactor=template.compactor,
             memory_store=template.memory_store,
             sandbox=self._sandbox,  # share parent's sandbox
             sandbox_factory=getattr(template, "_sandbox_factory", None),

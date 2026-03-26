@@ -5,11 +5,8 @@ at run boundaries only: ``retrieve()`` at the start of a run to inject
 relevant prior knowledge, and ``update()`` at the end to extract and
 persist new learnings for future runs.
 
-Memory stores never participate in context compaction. Compaction (shrinking
-the live message list to fit the model's token budget) is handled entirely
-by the ``Compactor`` in ``agent_base.compaction``. The two systems are
-independent: a compactor manages *within-session* context size, while a
-memory store manages *across-session* knowledge.
+Memory stores are independent of context compaction and manage
+*across-session* knowledge only.
 """
 from __future__ import annotations
 
