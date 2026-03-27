@@ -22,7 +22,6 @@ from agent_base.core.config import (
 from agent_base.core.messages import Message, Usage
 from agent_base.core.result import LogEntry
 from agent_base.media_backend.media_types import MediaMetadata
-from agent_base.providers.anthropic.compaction import CompactionConfig
 from agent_base.sandbox import deserialize_sandbox_config
 from agent_base.tools.registry import ToolCallInfo
 from agent_base.tools.tool_types import ToolSchema
@@ -104,6 +103,8 @@ def deserialize_config(
             The caller (agent layer) knows the provider and passes the
             correct subclass. Defaults to base LLMConfig.
     """
+    from agent_base.providers.anthropic.compaction import CompactionConfig
+
     return AgentConfig(
         # Identity
         agent_uuid=data["agent_uuid"],
