@@ -11,7 +11,7 @@ from typing import Any, Callable, Optional, TYPE_CHECKING
 
 import anthropic
 
-from agent_base.core.abort_types import AgentPhase
+from agent_base.core.abort_types import AgentPhase, STREAM_ABORT_TEXT
 from agent_base.providers.anthropic.abort_types import StreamResult
 from agent_base.core.agent_base import Agent
 from agent_base.core.config import AgentConfig, Conversation, CostBreakdown, LLMConfig, PendingToolRelay
@@ -885,34 +885,14 @@ class AnthropicAgent(Agent):
         blocks for orphaned tool_use blocks, and produces a valid chain.
         """
         from agent_base.providers.anthropic.message_sanitizer import (
-            sanitize_partial_assistant_message,
-            synthesize_abort_tool_results,
+            plan_stream_abort,
         )
 
-        raw_blocks = stream_result.message.content
-        clean_blocks, orphaned_ids = sanitize_partial_assistant_message(
-            raw_blocks, stream_result.completed_blocks,
+        patch = plan_stream_abort(
+            partial_message=stream_result.message,
+            completed_block_indices=stream_result.completed_blocks,
         )
-
-        if clean_blocks:
-            sanitized_msg = Message.assistant(clean_blocks)
-            sanitized_msg.usage = stream_result.message.usage
-            sanitized_msg.stop_reason = stream_result.message.stop_reason
-            sanitized_msg.provider = stream_result.message.provider
-            sanitized_msg.model = stream_result.message.model
-
-            self.agent_config.context_messages.append(sanitized_msg)
-            self.agent_config.conversation_history.append(sanitized_msg)
-            if self.conversation:
-                self.conversation.messages.append(sanitized_msg)
-
-            if orphaned_ids:
-                abort_results = synthesize_abort_tool_results(orphaned_ids)
-                result_msg = Message.user(abort_results)  # type: ignore[arg-type]
-                self.agent_config.context_messages.append(result_msg)
-                self.agent_config.conversation_history.append(result_msg)
-                if self.conversation:
-                    self.conversation.messages.append(result_msg)
+        self._append_messages_to_histories(patch.append_messages)
 
         # Emit aborted MetaDelta to the stream queue
         if queue and stream_formatter:
@@ -938,33 +918,24 @@ class AnthropicAgent(Agent):
         calls, combines with existing backend results, and appends to the
         chain. Clears pending_relay state.
         """
-        from agent_base.providers.anthropic.message_sanitizer import synthesize_abort_tool_results
+        from agent_base.providers.anthropic.message_sanitizer import plan_relay_abort
+        from agent_base.providers.anthropic.message_sanitizer import AbortToolCall
 
         relay = self.agent_config.pending_relay
         if relay is None:
             return
 
         # Collect IDs of pending frontend/confirmation tools
-        pending_ids = [
-            tc.tool_id
+        pending_tool_uses = [
+            AbortToolCall(tool_id=tc.tool_id, tool_name=tc.name)
             for tc in (*relay.frontend_calls, *relay.confirmation_calls)
         ]
 
-        # Synthesize abort results for pending tools
-        synthetic_results = synthesize_abort_tool_results(pending_ids)
-
-        # Combine existing backend results with synthetic abort results
-        all_result_blocks: list[ContentBlock] = []
-        for completed_msg in relay.completed_results:
-            all_result_blocks.extend(completed_msg.content)
-        all_result_blocks.extend(synthetic_results)
-
-        # Append combined result message to the chain
-        combined_message = Message.user(all_result_blocks)  # type: ignore[arg-type]
-        self.agent_config.context_messages.append(combined_message)
-        self.agent_config.conversation_history.append(combined_message)
-        if self.conversation:
-            self.conversation.messages.append(combined_message)
+        patch = plan_relay_abort(
+            completed_result_messages=relay.completed_results,
+            pending_tool_uses=pending_tool_uses,
+        )
+        self._append_messages_to_histories(patch.append_messages)
 
         # Clear pending relay state
         self.agent_config.pending_relay = None
@@ -974,7 +945,8 @@ class AnthropicAgent(Agent):
 
     def _build_aborted_result(self) -> AgentResult:
         """Build an AgentResult for an aborted run."""
-        # Use the last assistant message if available, else a placeholder.
+        # Prefer the last persisted assistant message; if the abort only
+        # produced tool_result markers, fall back to a synthetic assistant note.
         last_msg = None
         for msg in reversed(self.agent_config.context_messages):
             if msg.role.value == "assistant":
@@ -982,7 +954,7 @@ class AnthropicAgent(Agent):
                 break
 
         if last_msg is None:
-            last_msg = Message.assistant("Agent run was aborted.")
+            last_msg = Message.assistant(STREAM_ABORT_TEXT)
 
         final_text = self._extract_text(last_msg)
 
@@ -1002,6 +974,14 @@ class AnthropicAgent(Agent):
         )
 
     # ─── Private Helpers ──────────────────────────────────────────────
+
+    def _append_messages_to_histories(self, messages: list[Message]) -> None:
+        """Append persisted messages to all conversation history views."""
+        for message in messages:
+            self.agent_config.context_messages.append(message)
+            self.agent_config.conversation_history.append(message)
+            if self.conversation:
+                self.conversation.messages.append(message)
 
     def _inject_agent_uuid_to_tools(self) -> None:
         """Inject agent UUID into tools that need it.
