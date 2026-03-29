@@ -228,6 +228,7 @@ class AnthropicAgent(Agent):
         # Per-run tracking state (initialized in initialize_run).
         self._run_id: str = ""
         self._run_logs: list[LogEntry] = []
+        self._run_cumulative_usage: Usage = Usage()
         self._cumulative_usage: Usage = Usage()
 
         # These are set during initialize().
@@ -308,6 +309,9 @@ class AnthropicAgent(Agent):
                     loaded_config.llm_config.to_dict()
                 )
             self.agent_config = loaded_config
+            raw_session_usage = self.agent_config.extras.get("session_cumulative_usage")
+            if isinstance(raw_session_usage, dict):
+                self._cumulative_usage = Usage.from_dict(raw_session_usage)
             self._configure_compaction_controller()
 
             logger.debug(
@@ -380,7 +384,7 @@ class AnthropicAgent(Agent):
         # Initialize per-run tracking.
         self._run_id = run_id
         self._run_logs = []
-        self._cumulative_usage = Usage()
+        self._run_cumulative_usage = Usage()
         self._cumulative_cost = CostBreakdown()
 
     def _reset_cancellation_state(
@@ -563,7 +567,7 @@ class AnthropicAgent(Agent):
         # Initialize per-run tracking state for the resumed run.
         self._run_id = pending.run_id or str(uuid.uuid4())
         self._run_logs = []
-        self._cumulative_usage = Usage()
+        self._run_cumulative_usage = Usage()
         self._cumulative_cost = CostBreakdown()
 
         # Build a tool result message combining:
@@ -639,12 +643,17 @@ class AnthropicAgent(Agent):
                 self._phase = AgentPhase.STREAMING
 
                 # --- Proactive compaction check ---
-                if (
+                estimated_tokens = self.estimate_current_context_tokens()
+                should_compact = (
                     self._compaction_controller is not None
                     and self._compaction_controller.should_compact(
                         self.agent_config.context_messages,
-                        self.estimate_current_context_tokens(),
+                        estimated_tokens,
                     )
+                )
+                if (
+                    self._compaction_controller is not None
+                    and should_compact
                 ):
                     compacted_messages = await self._compaction_controller.compact(
                         context_messages=self.agent_config.context_messages,
@@ -1289,32 +1298,62 @@ class AnthropicAgent(Agent):
             delta_tokens = self.provider.token_estimator.estimate_messages(
                 delta_messages
             )
-            return last_input_tokens + last_output_tokens + delta_tokens
+            estimate = last_input_tokens + last_output_tokens + delta_tokens
+            return estimate
 
-        return self.provider.token_estimator.estimate_messages(
+        estimate = self.provider.token_estimator.estimate_messages(
             self.agent_config.context_messages
+        )
+        return estimate
+
+    @staticmethod
+    def _context_input_tokens(step_usage: Usage) -> int:
+        """Return provider-reported input-context tokens including cached portions."""
+        return (
+            step_usage.input_tokens
+            + (step_usage.cache_write_tokens or 0)
+            + (step_usage.cache_read_tokens or 0)
         )
 
     def _accumulate_usage(self, step_usage: Usage | None) -> None:
         """Add step usage to cumulative tracking and compute per-step cost."""
         if step_usage is None:
             return
-        self.agent_config.last_known_input_tokens = step_usage.input_tokens
+        effective_input_tokens = self._context_input_tokens(step_usage)
+        self.agent_config.last_known_input_tokens = effective_input_tokens
         self.agent_config.last_known_output_tokens = step_usage.output_tokens
+        self._run_cumulative_usage.input_tokens += step_usage.input_tokens
+        self._run_cumulative_usage.output_tokens += step_usage.output_tokens
         self._cumulative_usage.input_tokens += step_usage.input_tokens
         self._cumulative_usage.output_tokens += step_usage.output_tokens
         if step_usage.cache_write_tokens:
+            self._run_cumulative_usage.cache_write_tokens = (
+                (self._run_cumulative_usage.cache_write_tokens or 0)
+                + step_usage.cache_write_tokens
+            )
+        if step_usage.cache_write_tokens:
             self._cumulative_usage.cache_write_tokens = (
                 (self._cumulative_usage.cache_write_tokens or 0) + step_usage.cache_write_tokens
+            )
+        if step_usage.cache_read_tokens:
+            self._run_cumulative_usage.cache_read_tokens = (
+                (self._run_cumulative_usage.cache_read_tokens or 0)
+                + step_usage.cache_read_tokens
             )
         if step_usage.cache_read_tokens:
             self._cumulative_usage.cache_read_tokens = (
                 (self._cumulative_usage.cache_read_tokens or 0) + step_usage.cache_read_tokens
             )
         if step_usage.thinking_tokens:
+            self._run_cumulative_usage.thinking_tokens = (
+                (self._run_cumulative_usage.thinking_tokens or 0)
+                + step_usage.thinking_tokens
+            )
+        if step_usage.thinking_tokens:
             self._cumulative_usage.thinking_tokens = (
                 (self._cumulative_usage.thinking_tokens or 0) + step_usage.thinking_tokens
             )
+        self.agent_config.extras["session_cumulative_usage"] = self._cumulative_usage.to_dict()
 
         from agent_base.pricing import calculate_step_cost
         step_cost = calculate_step_cost(step_usage, self.agent_config.model)
@@ -1464,7 +1503,7 @@ class AnthropicAgent(Agent):
             self.conversation.final_response = response_message
             self.conversation.stop_reason = stop_reason
             self.conversation.total_steps = self.agent_config.current_step
-            self.conversation.usage = self._cumulative_usage
+            self.conversation.usage = self._run_cumulative_usage
             self.conversation.generated_files = generated_files
             self.conversation.cost = cost
             self.conversation.completed_at = now
