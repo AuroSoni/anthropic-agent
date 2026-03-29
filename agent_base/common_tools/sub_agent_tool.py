@@ -177,6 +177,9 @@ Args:
             description=template.description,
             model=template.model,
             config=copy.copy(template.config),
+            externalization_config=copy.copy(
+                getattr(template, "_externalization_config", None)
+            ),
             max_steps=int(template.max_steps) if template.max_steps != float('inf') else None,
             tools=template._constructor_tools,
             subagents=(

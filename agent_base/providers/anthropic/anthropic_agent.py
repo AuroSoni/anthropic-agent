@@ -33,6 +33,7 @@ from agent_base.streaming.types import MetaDelta
 from agent_base.tools.tool_types import ToolResultEnvelope
 from agent_base.logging import get_logger
 from .compaction import CompactionConfig, CompactionController
+from .context_externalizer import ContextExternalizer, ExternalizationConfig
 from .formatters import AnthropicMessageFormatter
 
 logger = get_logger(__name__)
@@ -110,6 +111,7 @@ class AnthropicAgent(Agent):
         messages: list[Message] | None = None,
         config: AnthropicLLMConfig = AnthropicLLMConfig(),
         compaction_config: CompactionConfig | None = None,
+        externalization_config: ExternalizationConfig | None = None,
         # Agent Orchestration Configurations.
         description: Optional[str] = None,
         max_steps: Optional[int] = DEFAULT_MAX_STEPS,    # None means no limit.
@@ -199,6 +201,7 @@ class AnthropicAgent(Agent):
         self._current_step = 0
         self._awaiting_tool_results = False
         self._compaction_controller: CompactionController | None = None
+        self._context_externalizer: ContextExternalizer | None = None
 
         # Composition
         self.provider = AnthropicProvider()
@@ -217,6 +220,7 @@ class AnthropicAgent(Agent):
         self.messages = messages
         self.config = config
         self._compaction_config = compaction_config
+        self._externalization_config = externalization_config
         self.description = description
         self.max_steps = max_steps if max_steps is not None else float('inf')
         self._agent_uuid = agent_uuid
@@ -273,6 +277,7 @@ class AnthropicAgent(Agent):
         self.tool_registry.attach_sandbox(sandbox)
         self.media_backend.attach_sandbox(sandbox)
         self._inject_agent_uuid_to_tools()
+        self._configure_context_externalizer()
 
 
     async def initialize(self) -> tuple[AgentConfig, Conversation | None]:
@@ -370,6 +375,7 @@ class AnthropicAgent(Agent):
             self.agent_config.tool_names = [s.name for s in self.agent_config.tool_schemas]
 
         self._configure_compaction_controller()
+        self._configure_context_externalizer()
 
         # Initialize per-run tracking.
         self._run_id = run_id
@@ -409,11 +415,61 @@ class AnthropicAgent(Agent):
             base_delay=self.base_delay,
         )
 
+    def _build_default_externalization_config(self) -> ExternalizationConfig:
+        """Return the default context-externalization policy for this agent."""
+        return ExternalizationConfig(
+            max_tool_result_tokens=self.max_tool_result_tokens,
+            max_combined_tool_result_tokens=(
+                self.max_tool_result_tokens * max(self.max_parallel_tool_calls, 1)
+            ),
+        )
+
+    def _resolve_externalization_config(self) -> ExternalizationConfig:
+        """Resolve the effective externalization config from constructor or saved state."""
+        resolved_config = self._externalization_config
+        if resolved_config is None and self.agent_config is not None:
+            raw_config = self.agent_config.extras.get("externalization_config")
+            if isinstance(raw_config, dict):
+                resolved_config = ExternalizationConfig.from_dict(raw_config)
+
+        if resolved_config is None:
+            resolved_config = self._build_default_externalization_config()
+
+        self._externalization_config = resolved_config
+        if self.agent_config is not None:
+            self.agent_config.extras["externalization_config"] = resolved_config.to_dict()
+        return resolved_config
+
+    def _configure_context_externalizer(self) -> None:
+        """Compose or clear the file-backed context externalizer from config state."""
+        if self.agent_config is None or self._sandbox is None:
+            self._context_externalizer = None
+            return
+
+        resolved_config = self._resolve_externalization_config()
+        self._context_externalizer = ContextExternalizer(
+            config=resolved_config,
+            sandbox=self._sandbox,
+            token_estimator=self.provider.token_estimator,
+        )
+
     def _replace_context_messages(self, messages: list[Message]) -> None:
         """Replace compacted context and clear token baselines."""
         self.agent_config.context_messages = messages
         self.agent_config.last_known_input_tokens = 0
         self.agent_config.last_known_output_tokens = 0
+
+    def _append_message_variants(
+        self,
+        context_message: Message,
+        history_message: Message | None = None,
+    ) -> None:
+        """Append distinct context and history variants for the same logical message."""
+        history_variant = history_message if history_message is not None else context_message
+        self.agent_config.context_messages.append(context_message)
+        self.agent_config.conversation_history.append(history_variant)
+        if self.conversation:
+            self.conversation.messages.append(history_variant)
 
     async def run(self, prompt: str | Message) -> AgentResult:
         if not self._initialized:
@@ -426,8 +482,6 @@ class AnthropicAgent(Agent):
 
         self.initialize_run(prompt)
 
-        self.conversation.messages.append(prompt)
-
         if self.memory_store:
             memories = await self.memory_store.retrieve(
                 user_message=prompt,
@@ -436,8 +490,12 @@ class AnthropicAgent(Agent):
             if memories:
                 prompt.content.extend(memories)
 
-        self.agent_config.context_messages.append(prompt)
-        self.agent_config.conversation_history.append(prompt)
+        if self._context_externalizer is not None:
+            context_prompt = await self._context_externalizer.externalize_prompt(prompt)
+        else:
+            context_prompt = prompt
+
+        self._append_message_variants(context_prompt, prompt)
 
         # Agent Loop
         return await self._resume_loop()
@@ -461,8 +519,6 @@ class AnthropicAgent(Agent):
 
         self.initialize_run(prompt)
 
-        self.conversation.messages.append(prompt)
-
         if self.memory_store:
             memories = await self.memory_store.retrieve(
                 user_message=prompt,
@@ -471,8 +527,12 @@ class AnthropicAgent(Agent):
             if memories:
                 prompt.content.extend(memories)
 
-        self.agent_config.context_messages.append(prompt)
-        self.agent_config.conversation_history.append(prompt)
+        if self._context_externalizer is not None:
+            context_prompt = await self._context_externalizer.externalize_prompt(prompt)
+        else:
+            context_prompt = prompt
+
+        self._append_message_variants(context_prompt, prompt)
 
         # Resolve formatter and emit meta_init before the loop.
         if isinstance(stream_formatter, str):
@@ -517,12 +577,18 @@ class AnthropicAgent(Agent):
         if isinstance(relay_results, list):
             all_result_blocks.extend(relay_results)
 
-        combined_message = Message.user(all_result_blocks)
+        if self._context_externalizer is not None:
+            combined_message, context_message = (
+                await self._context_externalizer.externalize_relay_results(
+                    pending.completed_results,
+                    relay_results,
+                )
+            )
+        else:
+            combined_message = Message.user(all_result_blocks)
+            context_message = combined_message
 
-        self.agent_config.context_messages.append(combined_message)
-        self.agent_config.conversation_history.append(combined_message)
-        if self.conversation:
-            self.conversation.messages.append(combined_message)
+        self._append_message_variants(context_message, combined_message)
 
         # Resolve string formatter names to actual StreamFormatter instances
         # before the on_relay_result loop so hooks can use queue/formatter.
@@ -761,12 +827,20 @@ class AnthropicAgent(Agent):
                             fmt = stream_formatter if stream_formatter is not None else get_formatter(DEFAULT_STREAM_FORMATTER)
                             await self._stream_tool_results(tool_results, queue, fmt)
 
-                        tool_result_message = self._build_tool_result_message(tool_results)
+                        if self._context_externalizer is not None:
+                            tool_result_message, context_tool_result_message = (
+                                await self._context_externalizer.externalize_tool_results(
+                                    tool_results
+                                )
+                            )
+                        else:
+                            tool_result_message = self._build_tool_result_message(tool_results)
+                            context_tool_result_message = tool_result_message
 
-                        self.agent_config.context_messages.append(tool_result_message)
-                        self.agent_config.conversation_history.append(tool_result_message)
-                        if self.conversation:
-                            self.conversation.messages.append(tool_result_message)
+                        self._append_message_variants(
+                            context_tool_result_message,
+                            tool_result_message,
+                        )
 
                         # Check if we were cancelled during tool execution (Scenario B)
                         if self._cancellation_event.is_set():

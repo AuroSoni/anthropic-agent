@@ -137,6 +137,7 @@ class LocalSandbox(Sandbox):
             "workspace/.imported",
             ".exports",
             ".plans",
+            ".context",
             ".tool_results",
         ):
             (self.root / zone).mkdir(exist_ok=True)
