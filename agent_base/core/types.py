@@ -288,15 +288,15 @@ class ToolResultBase(ContentBlock):
     """Shared base for all tool result blocks."""
     tool_name: str = ""
     tool_id: str = ""
-    tool_result: Union[str, List[ContentBlock]] = ""
+    tool_result: Union[str, Dict[str, Any], List[Any]] = ""
     is_error: bool = False
 
     def __post_init__(self) -> None:
         if not self.tool_id:
             raise ValueError(f"{type(self).__name__} requires a non-empty tool_id for correlation")
 
-    def _serialize_tool_result(self) -> Union[str, List[Dict[str, Any]]]:
-        if isinstance(self.tool_result, str):
+    def _serialize_tool_result(self) -> Union[str, Dict[str, Any], List[Any]]:
+        if isinstance(self.tool_result, (str, dict)):
             return self.tool_result
         result = []
         for item in self.tool_result:

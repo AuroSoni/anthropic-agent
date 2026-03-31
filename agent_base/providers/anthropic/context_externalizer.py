@@ -10,7 +10,13 @@ from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
 from agent_base.core.messages import Message
-from agent_base.core.types import ContentBlock, TextContent, ToolResultBase, ToolResultContent
+from agent_base.core.types import (
+    ContentBlock,
+    ServerToolResultContent,
+    TextContent,
+    ToolResultBase,
+    ToolResultContent,
+)
 from agent_base.tools.tool_types import ToolResultEnvelope
 
 if TYPE_CHECKING:
@@ -136,6 +142,12 @@ class ContextExternalizer:
             if not isinstance(block, ToolResultBase):
                 continue
 
+            # Server tool results must retain their structured payload so they
+            # can be replayed back to Anthropic without turning into placeholder
+            # text that violates the provider schema.
+            if isinstance(block, ServerToolResultContent):
+                continue
+
             original_block = copy.deepcopy(block)
             original_blocks[index] = original_block
             block_tokens = self._estimate_tool_result_block_tokens(original_block)
@@ -186,21 +198,41 @@ class ContextExternalizer:
         """Render a tool-result payload into text suitable for a `.context/` file."""
         if isinstance(block.tool_result, str):
             return block.tool_result
+        if isinstance(block.tool_result, dict):
+            return json.dumps(
+                _strip_binary_data(block.tool_result),
+                ensure_ascii=False,
+                indent=2,
+            )
         return self._render_content_blocks(block.tool_result)
 
     def _render_content_blocks(self, blocks: list[ContentBlock]) -> str:
         """Render canonical content blocks into a readable text payload."""
         rendered_parts: list[str] = []
         for block in blocks:
+            if isinstance(block, str):
+                rendered_parts.append(block)
+                continue
             if isinstance(block, TextContent):
                 rendered_parts.append(block.text)
                 continue
             if isinstance(block, ToolResultBase):
                 rendered_parts.append(self._render_tool_result_payload(block))
                 continue
+            if isinstance(block, dict):
+                rendered_parts.append(
+                    json.dumps(
+                        _strip_binary_data(block),
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+                continue
             rendered_parts.append(
                 json.dumps(
-                    _strip_binary_data(block.to_dict()),
+                    _strip_binary_data(
+                        block.to_dict() if hasattr(block, "to_dict") else block
+                    ),
                     ensure_ascii=False,
                     indent=2,
                 )

@@ -17,7 +17,16 @@ from agent_base.core.agent_base import Agent
 from agent_base.core.config import AgentConfig, Conversation, CostBreakdown, LLMConfig, PendingToolRelay
 from agent_base.core.messages import Message, Usage
 from agent_base.core.result import AgentResult, LogEntry
-from agent_base.core.types import ContentBlock, Role, ServerToolResultContent, TextContent, ToolResultBase, ToolUseBase, ToolResultContent
+from agent_base.core.types import (
+    ContentBlock,
+    Role,
+    ServerToolResultContent,
+    TextContent,
+    ToolResultBase,
+    ToolResultContent,
+    ToolUseBase,
+    ToolUseContent,
+)
 from agent_base.memory.stores import NoOpMemoryStore
 from agent_base.sandbox import sandbox_from_config
 from agent_base.sandbox.local import LocalSandbox
@@ -133,6 +142,7 @@ class AnthropicAgent(Agent):
         conversation_adapter: ConversationAdapter | None = None,
         run_adapter: AgentRunAdapter | None = None,
         media_backend: MediaBackend | None = None,
+        fallback_api_keys: list[str] | None = None,
         ):
 
         ####################################################################
@@ -204,7 +214,7 @@ class AnthropicAgent(Agent):
         self._context_externalizer: ContextExternalizer | None = None
 
         # Composition
-        self.provider = AnthropicProvider()
+        self.provider = AnthropicProvider(fallback_api_keys=fallback_api_keys)
 
         # Abort/steer state — cooperative cancellation
         self._phase: AgentPhase = AgentPhase.IDLE
@@ -1217,10 +1227,16 @@ class AnthropicAgent(Agent):
                     set_ctx(queue, formatter)
 
     def _extract_tool_calls(self, message: Message) -> list[ToolCallInfo]:
-        """Extract ToolCallInfo objects from an assistant message's tool-use blocks."""
+        """Extract local client tool calls from an assistant message.
+
+        Server tools such as ``web_search`` / ``web_fetch`` are executed by the
+        Anthropic API and surface as ``ServerToolUseContent``.  Routing them
+        through the local tool registry creates invalid client-side
+        ``tool_result`` blocks for ``srvtoolu_*`` ids.
+        """
         tool_calls = []
         for block in message.content:
-            if isinstance(block, ToolUseBase):
+            if isinstance(block, ToolUseContent):
                 tool_calls.append(ToolCallInfo(
                     name=block.tool_name,
                     tool_id=block.tool_id,

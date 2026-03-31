@@ -23,8 +23,8 @@ from agent_base.core.types import (
     ContentBlockType,
     Role,
     ToolResultContent,
-    ToolUseBase,
     ToolResultBase,
+    ToolUseContent,
     TextContent,
 )
 
@@ -57,8 +57,8 @@ def sanitize_partial_assistant_message(
     Returns:
         (clean_blocks, orphaned_tool_use_ids)
         clean_blocks: Only blocks that fully completed streaming.
-        orphaned_tool_use_ids: IDs of completed tool_use blocks whose
-            tools never ran (need synthetic tool_result blocks).
+        orphaned_tool_use_ids: IDs of completed client-side tool_use blocks
+            whose tools never ran (need synthetic tool_result blocks).
     """
     clean_blocks: list[ContentBlock] = []
     orphaned_tool_uses: list[AbortToolCall] = []
@@ -69,7 +69,7 @@ def sanitize_partial_assistant_message(
 
         clean_blocks.append(block)
 
-        if isinstance(block, ToolUseBase):
+        if isinstance(block, ToolUseContent):
             orphaned_tool_uses.append(
                 AbortToolCall(tool_id=block.tool_id, tool_name=block.tool_name),
             )
@@ -193,11 +193,12 @@ def ensure_chain_validity(messages: list[Message]) -> list[Message]:
             continue
 
         if msg.role.value == "assistant":
-            # Collect tool_use IDs from this assistant message
+            # Collect only client-side tool_use IDs from this assistant message.
+            # Server/MCP tools do not use the user-side `tool_result` contract.
             tool_uses = [
                 AbortToolCall(tool_id=block.tool_id, tool_name=block.tool_name)
                 for block in msg.content
-                if isinstance(block, ToolUseBase)
+                if isinstance(block, ToolUseContent)
             ]
 
             if tool_uses:
