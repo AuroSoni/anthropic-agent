@@ -1532,6 +1532,26 @@ class AnthropicAgent(Agent):
         # Persist state.
         await self._persist_state()
 
+        # Auto-generate title on first run if not already set.
+        if (
+            self.agent_config.title is None
+            and self.conversation
+            and self.conversation.user_message
+        ):
+            title = self._derive_title(self.conversation.user_message)
+            if title:
+                self.agent_config.title = title
+                try:
+                    await self.config_adapter.update_title(
+                        self.agent_config.agent_uuid, title
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to persist auto-generated title",
+                        agent_uuid=self.agent_config.agent_uuid,
+                        exc_info=True,
+                    )
+
         result = self._build_agent_result(response_message, stop_reason)
         result.generated_files = generated_files
         result.cost = cost
@@ -1542,6 +1562,24 @@ class AnthropicAgent(Agent):
             await self._emit_meta_final(result, queue, stream_formatter)
 
         return result
+
+    @staticmethod
+    def _derive_title(user_message: Message) -> str | None:
+        """Derive a short session title from the first user message."""
+        text_parts: list[str] = []
+        for block in user_message.content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text_parts.append(block["text"])
+            elif isinstance(block, str):
+                text_parts.append(block)
+        text = " ".join(text_parts).strip()
+        if not text:
+            return None
+        text = " ".join(text.split())  # normalize whitespace
+        max_len = 72
+        if len(text) <= max_len:
+            return text
+        return text[: max_len - 1].rstrip() + "\u2026"
 
     async def _persist_state(self) -> None:
         """Save agent config, conversation, and run logs to storage adapters."""
