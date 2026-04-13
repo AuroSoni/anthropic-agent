@@ -17,8 +17,16 @@ from .conversation_log import (
     ConversationLog,
     ConversationLogEntry,
     MessageLogEntry,
+    RollbackLogEntry,
+    StreamEventLogEntry,
     ToolLogProjection,
     ToolResultLogEntry,
+)
+from .end_turn_hook import (
+    EndTurnContext,
+    EndTurnHook,
+    EndTurnHookEvent,
+    EndTurnHookResult,
 )
 from .messages import Message, Usage, MessageFormatter
 from .provider import Provider
@@ -33,8 +41,14 @@ __all__ = [
     "ConversationLog",
     "ConversationLogEntry",
     "MessageLogEntry",
+    "RollbackLogEntry",
+    "StreamEventLogEntry",
     "ToolLogProjection",
     "ToolResultLogEntry",
+    "EndTurnContext",
+    "EndTurnHook",
+    "EndTurnHookEvent",
+    "EndTurnHookResult",
     # Messages
     "Message",
     "Usage",

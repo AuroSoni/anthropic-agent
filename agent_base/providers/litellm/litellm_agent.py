@@ -13,6 +13,7 @@ import litellm
 from agent_base.core.abort_types import AgentPhase, STREAM_ABORT_TEXT
 from agent_base.core.config import AgentConfig, Conversation, CostBreakdown, PendingToolRelay
 from agent_base.core.conversation_log import ConversationLog
+from agent_base.core.end_turn_hook import EndTurnHook
 from agent_base.core.messages import Message, Usage
 from agent_base.core.result import AgentResult, LogEntry
 from agent_base.core.types import ContentBlock, Role, TextContent, ToolResultBase, ToolUseContent
@@ -100,7 +101,7 @@ class LiteLLMAgent(AnthropicAgent):
         memory_store: "MemoryStore | None" = None,
         sandbox: "Sandbox | None" = None,
         sandbox_factory: Callable[[str], "Sandbox"] | None = None,
-        final_answer_check: Optional[Callable[[str], tuple[bool, str]]] = None,
+        end_turn_hook: EndTurnHook | None = None,
         agent_uuid: str | None = None,
         config_adapter: "AgentConfigAdapter | None" = None,
         conversation_adapter: "ConversationAdapter | None" = None,
@@ -114,7 +115,7 @@ class LiteLLMAgent(AnthropicAgent):
         self.memory_store = memory_store or NoOpMemoryStore()
         self._sandbox = sandbox
         self._sandbox_factory = sandbox_factory
-        self.final_answer_check = final_answer_check
+        self.end_turn_hook = end_turn_hook
         self._constructor_tools: list[Callable[..., Any]] | None = tools
         self._constructor_frontend_tools: list[Callable[..., Any]] | None = frontend_tools
         self.tool_registry: ToolRegistry = ToolRegistry()
@@ -539,12 +540,14 @@ class LiteLLMAgent(AnthropicAgent):
                         return self._build_aborted_result()
 
                 elif stop_reason in ("end_turn", "stop", None):
-                    if self.final_answer_check:
-                        final_text = self._extract_text(response_message)
-                        success, error_message = self.final_answer_check(final_text)
-                        if not success:
-                            self.agent_config.context_messages.append(Message.user(error_message))
-                            continue
+                    should_retry = await self._run_end_turn_hook(
+                        response_message,
+                        stop_reason="end_turn",
+                        queue=queue,
+                        stream_formatter=stream_formatter,
+                    )
+                    if should_retry:
+                        continue
                     return await self._finalize_run(response_message, "end_turn", queue, stream_formatter)
                 elif stop_reason == "max_tokens":
                     return await self._finalize_run(response_message, "max_tokens", queue, stream_formatter)

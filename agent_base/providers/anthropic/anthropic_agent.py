@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
+import inspect
 import json
 import mimetypes
 import uuid
@@ -14,6 +15,12 @@ import anthropic
 
 from agent_base.core.abort_types import AgentPhase, STREAM_ABORT_TEXT
 from agent_base.core.conversation_log import ConversationLog, ToolLogProjection
+from agent_base.core.end_turn_hook import (
+    EndTurnContext,
+    EndTurnHook,
+    EndTurnHookEvent,
+    EndTurnHookResult,
+)
 from agent_base.providers.anthropic.abort_types import StreamResult
 from agent_base.core.agent_base import Agent
 from agent_base.core.config import AgentConfig, Conversation, CostBreakdown, LLMConfig, PendingToolRelay
@@ -40,7 +47,7 @@ from agent_base.storage.adapters.memory import (
 from agent_base.media_backend.local import LocalMediaBackend
 from agent_base.media_backend.media_types import MediaMetadata
 from agent_base.tools.registry import ToolCallInfo, ToolRegistry
-from agent_base.streaming.types import MetaDelta
+from agent_base.streaming.types import MetaDelta, RollbackDelta
 from agent_base.tools.tool_types import ToolResultEnvelope
 from agent_base.logging import get_logger
 from .compaction import CompactionConfig, CompactionController
@@ -137,7 +144,7 @@ class AnthropicAgent(Agent):
         memory_store: MemoryStore | None = None,
         sandbox: Sandbox | None = None,
         sandbox_factory: Callable[[str], Sandbox] | None = None,
-        final_answer_check: Optional[Callable[[str], tuple[bool, str]]] = None,
+        end_turn_hook: EndTurnHook | None = None,
         agent_uuid: str | None = None,
         # Storage and Media Adapter Configurations.
         config_adapter: AgentConfigAdapter | None = None,
@@ -171,8 +178,8 @@ class AnthropicAgent(Agent):
         self._sandbox = sandbox
         self._sandbox_factory = sandbox_factory
 
-        # Final answer validation checker. Cannot be loaded from database.
-        self.final_answer_check = final_answer_check
+        # End-turn validation hook. Cannot be loaded from database.
+        self.end_turn_hook = end_turn_hook
 
         # Store original tool callables for child agent cloning (SubAgentTool).
         self._constructor_tools: list[Callable[..., Any]] | None = tools
@@ -872,17 +879,14 @@ class AnthropicAgent(Agent):
                             return self._build_aborted_result()
 
                 elif stop_reason == "end_turn":
-
-                    if self.final_answer_check:
-                        # Extract text for validation.
-                        final_text = self._extract_text(response_message)
-                        success, error_message = self.final_answer_check(final_text)
-                        if not success:
-                            # Append error to context only (not conversation history).
-                            self.agent_config.context_messages.append(
-                                Message.user(error_message)
-                            )
-                            continue
+                    should_retry = await self._run_end_turn_hook(
+                        response_message,
+                        stop_reason="end_turn",
+                        queue=queue,
+                        stream_formatter=stream_formatter,
+                    )
+                    if should_retry:
+                        continue
 
                     return await self._finalize_run(response_message, "end_turn", queue, stream_formatter)
 
@@ -1172,6 +1176,281 @@ class AnthropicAgent(Agent):
                     agent_uuid=effective_agent_uuid,
                     timestamp=timestamp,
                 )
+
+    def _append_rollback_to_logs(
+        self,
+        rollback_message: str,
+        *,
+        rollback_code: str | None = None,
+        details: dict[str, Any] | None = None,
+        agent_uuid: str | None = None,
+        timestamp: str | None = None,
+    ) -> None:
+        effective_agent_uuid = agent_uuid or self.agent_uuid
+        if not effective_agent_uuid:
+            return
+
+        self._ensure_registered_agent()
+        rollback_details = details or {}
+
+        self.agent_config.conversation_log.add_rollback(
+            rollback_message,
+            agent_uuid=effective_agent_uuid,
+            code=rollback_code,
+            details=rollback_details,
+            timestamp=timestamp,
+        )
+        if self.conversation:
+            self.conversation.conversation_log.add_rollback(
+                rollback_message,
+                agent_uuid=effective_agent_uuid,
+                code=rollback_code,
+                details=rollback_details,
+                timestamp=timestamp,
+            )
+
+    def _append_stream_event_to_logs(
+        self,
+        stream_type: str,
+        payload: dict[str, Any],
+        *,
+        agent_uuid: str | None = None,
+        timestamp: str | None = None,
+    ) -> None:
+        effective_agent_uuid = agent_uuid or self.agent_uuid
+        if not effective_agent_uuid:
+            return
+
+        self._ensure_registered_agent()
+        self.agent_config.conversation_log.add_stream_event(
+            stream_type,
+            agent_uuid=effective_agent_uuid,
+            payload=payload,
+            timestamp=timestamp,
+        )
+        if self.conversation:
+            self.conversation.conversation_log.add_stream_event(
+                stream_type,
+                agent_uuid=effective_agent_uuid,
+                payload=payload,
+                timestamp=timestamp,
+            )
+
+    def _build_end_turn_context(
+        self,
+        response_message: Message,
+        *,
+        stop_reason: str,
+    ) -> EndTurnContext:
+        final_text = self._extract_text(response_message)
+        return EndTurnContext(
+            agent_uuid=self.agent_uuid or "",
+            run_id=self._run_id or None,
+            provider=self.agent_config.provider,
+            model=self.agent_config.model,
+            stop_reason=stop_reason,
+            response_message=response_message,
+            final_text=final_text,
+            current_step=self.agent_config.current_step,
+            max_steps=(
+                None
+                if self.max_steps == float("inf")
+                else int(self.max_steps)
+            ),
+            agent_config=self.agent_config,
+            conversation=self.conversation,
+            sandbox=self._sandbox,
+            media_backend=self.media_backend,
+            memory_store=self.memory_store,
+        )
+
+    async def _emit_end_turn_validation(
+        self,
+        status: str,
+        queue: asyncio.Queue | None,
+        stream_formatter: StreamFormatter | None,
+        *,
+        result: str | None = None,
+    ) -> None:
+        if queue is None or stream_formatter is None:
+            return
+
+        delta = MetaDelta(
+            agent_uuid=self.agent_config.agent_uuid,
+            type="meta_end_turn_validation",
+            payload={
+                "status": status,
+                "result": result,
+                "hook": "end_turn_hook",
+            },
+            is_final=True,
+        )
+        await stream_formatter.format_delta(delta, queue)
+
+    async def _emit_rollback_delta(
+        self,
+        rollback_message: str,
+        queue: asyncio.Queue | None,
+        stream_formatter: StreamFormatter | None,
+        *,
+        rollback_code: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        if queue is None or stream_formatter is None:
+            return
+
+        delta = RollbackDelta(
+            agent_uuid=self.agent_config.agent_uuid,
+            message=rollback_message,
+            code=rollback_code,
+            details=details or {},
+            collapse_previous_assistant=True,
+            is_final=True,
+        )
+        await stream_formatter.format_delta(delta, queue)
+
+    async def _emit_hook_event(
+        self,
+        stream_type: str,
+        payload: dict[str, Any],
+        queue: asyncio.Queue | None,
+        stream_formatter: StreamFormatter | None,
+    ) -> None:
+        if queue is None or stream_formatter is None:
+            return
+
+        delta = MetaDelta(
+            agent_uuid=self.agent_config.agent_uuid,
+            type=stream_type,
+            payload=payload,
+            is_final=True,
+        )
+        await stream_formatter.format_delta(delta, queue)
+
+    async def _apply_end_turn_hook_events(
+        self,
+        events: list[EndTurnHookEvent],
+        queue: asyncio.Queue | None,
+        stream_formatter: StreamFormatter | None,
+    ) -> None:
+        for event in events:
+            if event.persist_to_conversation_log:
+                self._append_stream_event_to_logs(
+                    event.stream_type,
+                    event.payload,
+                )
+            await self._emit_hook_event(
+                event.stream_type,
+                event.payload,
+                queue,
+                stream_formatter,
+            )
+
+    async def _resolve_end_turn_hook_result(
+        self,
+        response_message: Message,
+        *,
+        stop_reason: str,
+    ) -> EndTurnHookResult | None:
+        if self.end_turn_hook is None:
+            return None
+
+        hook_result = self.end_turn_hook(
+            self._build_end_turn_context(
+                response_message,
+                stop_reason=stop_reason,
+            )
+        )
+        if inspect.isawaitable(hook_result):
+            hook_result = await hook_result
+
+        if not isinstance(hook_result, EndTurnHookResult):
+            raise TypeError(
+                "end_turn_hook must return EndTurnHookResult"
+            )
+        return hook_result
+
+    async def _run_end_turn_hook(
+        self,
+        response_message: Message,
+        *,
+        stop_reason: str,
+        queue: asyncio.Queue | None,
+        stream_formatter: StreamFormatter | None,
+    ) -> bool:
+        if self.end_turn_hook is None:
+            return False
+
+        await self._emit_end_turn_validation(
+            "start",
+            queue,
+            stream_formatter,
+        )
+
+        try:
+            hook_result = await self._resolve_end_turn_hook_result(
+                response_message,
+                stop_reason=stop_reason,
+            )
+        except Exception:
+            await self._emit_end_turn_validation(
+                "end",
+                queue,
+                stream_formatter,
+                result="error",
+            )
+            raise
+
+        if hook_result is None or hook_result.action == "pass":
+            if hook_result is not None and hook_result.events:
+                await self._apply_end_turn_hook_events(
+                    hook_result.events,
+                    queue,
+                    stream_formatter,
+                )
+            await self._emit_end_turn_validation(
+                "end",
+                queue,
+                stream_formatter,
+                result="pass",
+            )
+            return False
+
+        rollback_message = hook_result.rollback_message or ""
+        rollback_details = hook_result.details or {}
+        rollback_prompt = Message.user(
+            [
+                TextContent(
+                    text=rollback_message,
+                    kwargs={
+                        "synthetic_kind": "rollback",
+                        "visible_to_user": False,
+                        "rollback_code": hook_result.rollback_code,
+                    },
+                )
+            ]
+        )
+        self.agent_config.context_messages.append(rollback_prompt)
+        self._append_rollback_to_logs(
+            rollback_message,
+            rollback_code=hook_result.rollback_code,
+            details=rollback_details,
+        )
+        await self._emit_rollback_delta(
+            rollback_message,
+            queue,
+            stream_formatter,
+            rollback_code=hook_result.rollback_code,
+            details=rollback_details,
+        )
+        await self._emit_end_turn_validation(
+            "end",
+            queue,
+            stream_formatter,
+            result="retry",
+        )
+        await self._persist_state()
+        return True
 
     def _append_messages_to_histories(self, messages: list[Message]) -> None:
         """Append persisted messages to context and conversation logs."""

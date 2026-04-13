@@ -211,7 +211,71 @@ class ToolResultLogEntry:
         )
 
 
-ConversationLogEntry = MessageLogEntry | ToolResultLogEntry
+@dataclass
+class RollbackLogEntry:
+    entry_type: str = field(default="rollback", init=False)
+    agent_uuid: str = ""
+    message: str = ""
+    code: str | None = None
+    details: dict[str, Any] = field(default_factory=dict)
+    targets_previous_assistant_message: bool = True
+    timestamp: str = field(default_factory=_now_iso)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "entry_type": self.entry_type,
+            "agent_uuid": self.agent_uuid,
+            "message": self.message,
+            "code": self.code,
+            "details": _serialize_value(self.details),
+            "targets_previous_assistant_message": self.targets_previous_assistant_message,
+            "timestamp": self.timestamp,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RollbackLogEntry":
+        return cls(
+            agent_uuid=data["agent_uuid"],
+            message=data.get("message", ""),
+            code=data.get("code"),
+            details=data.get("details", {}),
+            targets_previous_assistant_message=bool(
+                data.get("targets_previous_assistant_message", True)
+            ),
+            timestamp=data.get("timestamp") or _now_iso(),
+        )
+
+
+@dataclass
+class StreamEventLogEntry:
+    entry_type: str = field(default="stream_event", init=False)
+    agent_uuid: str = ""
+    stream_type: str = ""
+    payload: dict[str, Any] = field(default_factory=dict)
+    timestamp: str = field(default_factory=_now_iso)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "entry_type": self.entry_type,
+            "agent_uuid": self.agent_uuid,
+            "stream_type": self.stream_type,
+            "payload": _serialize_value(self.payload),
+            "timestamp": self.timestamp,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "StreamEventLogEntry":
+        return cls(
+            agent_uuid=data["agent_uuid"],
+            stream_type=data.get("stream_type", ""),
+            payload=data.get("payload", {}),
+            timestamp=data.get("timestamp") or _now_iso(),
+        )
+
+
+ConversationLogEntry = (
+    MessageLogEntry | ToolResultLogEntry | RollbackLogEntry | StreamEventLogEntry
+)
 
 
 def conversation_log_entry_from_dict(data: dict[str, Any]) -> ConversationLogEntry:
@@ -220,6 +284,10 @@ def conversation_log_entry_from_dict(data: dict[str, Any]) -> ConversationLogEnt
         return MessageLogEntry.from_dict(data)
     if entry_type == "tool_result":
         return ToolResultLogEntry.from_dict(data)
+    if entry_type == "rollback":
+        return RollbackLogEntry.from_dict(data)
+    if entry_type == "stream_event":
+        return StreamEventLogEntry.from_dict(data)
     raise ValueError(f"Unknown conversation log entry type: {entry_type!r}")
 
 
@@ -295,6 +363,44 @@ class ConversationLog:
         entry = ToolResultLogEntry(
             agent_uuid=agent_uuid,
             tool=tool,
+            timestamp=timestamp or _now_iso(),
+        )
+        self.entries.append(entry)
+        return entry
+
+    def add_rollback(
+        self,
+        message: str,
+        *,
+        agent_uuid: str,
+        code: str | None = None,
+        details: dict[str, Any] | None = None,
+        targets_previous_assistant_message: bool = True,
+        timestamp: str | None = None,
+    ) -> RollbackLogEntry:
+        entry = RollbackLogEntry(
+            agent_uuid=agent_uuid,
+            message=message,
+            code=code,
+            details=details or {},
+            targets_previous_assistant_message=targets_previous_assistant_message,
+            timestamp=timestamp or _now_iso(),
+        )
+        self.entries.append(entry)
+        return entry
+
+    def add_stream_event(
+        self,
+        stream_type: str,
+        *,
+        agent_uuid: str,
+        payload: dict[str, Any] | None = None,
+        timestamp: str | None = None,
+    ) -> StreamEventLogEntry:
+        entry = StreamEventLogEntry(
+            agent_uuid=agent_uuid,
+            stream_type=stream_type,
+            payload=payload or {},
             timestamp=timestamp or _now_iso(),
         )
         self.entries.append(entry)
