@@ -99,6 +99,8 @@ class SubAgentParentContext:
     sandbox: "Sandbox | None" = None
     sandbox_factory: Callable[[str], "Sandbox"] | None = None
     memory_store: "MemoryStore | None" = None
+    parent_cancellation_event: asyncio.Event | None = None
+    parent_agent: "AnthropicAgent | None" = None
 
 
 @dataclass
@@ -217,6 +219,15 @@ Args:
     def set_parent_context(self, context: SubAgentParentContext) -> None:
         self._parent_context = context
 
+    def set_cancellation_event(self, event: asyncio.Event | None) -> None:
+        """Share the parent's cancellation event with spawned children.
+
+        Called from the owning agent's ``_inject_stream_context_to_tools``
+        each time the resume loop (re)starts, so the event reference
+        tracks the parent's per-run cancellation primitive.
+        """
+        self._parent_context.parent_cancellation_event = event
+
     def _default_child_agent_builder(
         self,
         spec: SubAgentSpec,
@@ -275,12 +286,47 @@ Args:
                 instance._parent_context,
             )
 
+            # Inline-await relay for fresh children: their frontend pauses
+            # park on an asyncio.Future instead of returning stop_reason="relay"
+            # upward as a completed SubAgentEnvelope (which would leave them
+            # stranded). Rehydrated (resume_agent_uuid) children keep the
+            # default persist-return path so existing cold-resume flows work.
+            if resume_agent_uuid is None:
+                child._relay_mode = "inline_await"
+
+            # Propagate owner snapshot (organization_id, member_id,
+            # root_agent_uuid) through ``agent_config.extras["owner"]`` so
+            # the relay registry has auth context at registration time.
+            # The host (e.g. nova_backend) populates it on the root agent;
+            # we copy it down the tree here. We defer the copy until after
+            # ``child.initialize()`` runs, because fresh ``child.agent_config``
+            # may not exist yet. For resume, ``agent_config`` already exists
+            # but we still wait — ``run_stream`` calls ``initialize()`` which
+            # will respect the parent's extras via the pre-run hook below.
+            parent_agent = instance._parent_context.parent_agent
+            parent_owner = None
+            if parent_agent is not None and parent_agent.agent_config is not None:
+                parent_owner = parent_agent.agent_config.extras.get("owner")
+
+            # Share cumulative usage/cost upward so credits deducted from
+            # the root ``AgentResult.cost`` reflect the whole subtree.
+            if parent_agent is not None:
+                child._parent_usage_forward = parent_agent
+
+            async def _propagate_owner() -> None:
+                if not child._initialized:
+                    await child.initialize()
+                if parent_owner is not None and child.agent_config is not None:
+                    child.agent_config.extras.setdefault("owner", parent_owner)
+
             try:
+                await _propagate_owner()
                 if instance._parent_context.queue is not None:
                     result = await child.run_stream(
                         prompt=task,
                         queue=instance._parent_context.queue,
                         stream_formatter=instance._parent_context.formatter or "json",
+                        cancellation_event=instance._parent_context.parent_cancellation_event,
                     )
                 else:
                     result = await child.run(prompt=task)

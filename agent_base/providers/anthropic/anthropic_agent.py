@@ -231,6 +231,20 @@ class AnthropicAgent(Agent):
         self._cancellation_event: asyncio.Event | None = None
         self._abort_completion: asyncio.Event | None = None
 
+        # Relay mode for frontend-tool pauses. Root agents ``persist_return``
+        # (serialize ``pending_relay``, close SSE, resume via a new stream on
+        # ``/tool_results``). Inline-await children pause on an
+        # ``asyncio.Future`` and continue the loop when it resolves, without
+        # ever returning from ``_resume_loop``. Set at spawn time by
+        # ``SubAgentTool`` for fresh children only (not rehydrated resumes).
+        self._relay_mode: str = "persist_return"
+
+        # Optional upstream forward for cumulative usage/cost so inline-await
+        # children fold their per-step tokens and $ into the root's
+        # ``_run_cumulative_usage`` and ``_cumulative_cost`` — credits are
+        # deducted from the root ``AgentResult.cost``.
+        self._parent_usage_forward: "AnthropicAgent | None" = None
+
         ####################################################################
         # The agent's persistable state. This is the state that is saved to the database.
         ####################################################################
@@ -594,14 +608,36 @@ class AnthropicAgent(Agent):
         self._run_cumulative_usage = Usage()
         self._cumulative_cost = CostBreakdown()
 
-        # Build a tool result message combining:
-        # 1. Backend results that were already computed
-        # 2. Incoming relay results from frontend/user
-        all_result_blocks: list[ContentBlock] = []
+        # Resolve string formatter names to actual StreamFormatter instances
+        # before the on_relay_result loop so hooks can use queue/formatter.
+        if isinstance(stream_formatter, str):
+            from agent_base.streaming import get_formatter
+            stream_formatter = get_formatter(stream_formatter)
 
+        await self._splice_relay_results(relay_results, queue, stream_formatter)
+
+        # Resume the agent loop.
+        return await self._resume_loop(queue, stream_formatter)
+
+    async def _splice_relay_results(
+        self,
+        relay_results: list[ContentBlock],
+        queue: asyncio.Queue | None,
+        stream_formatter: StreamFormatter | None,
+    ) -> None:
+        """Fold completed backend + incoming frontend results into context.
+
+        Shared by the rehydrated root resume path (``resume_with_relay_results``)
+        and the inline-await subagent branch in ``_resume_loop``. Assumes
+        ``self.agent_config.pending_relay`` is populated; clears it on success.
+        """
+        pending = self.agent_config.pending_relay
+        if pending is None:
+            raise RuntimeError("_splice_relay_results called without pending_relay")
+
+        all_result_blocks: list[ContentBlock] = []
         for completed_msg in pending.completed_results:
             all_result_blocks.extend(completed_msg.content)
-
         if isinstance(relay_results, list):
             all_result_blocks.extend(relay_results)
 
@@ -618,13 +654,6 @@ class AnthropicAgent(Agent):
 
         self._append_message_variants(context_message, combined_message)
 
-        # Resolve string formatter names to actual StreamFormatter instances
-        # before the on_relay_result loop so hooks can use queue/formatter.
-        if isinstance(stream_formatter, str):
-            from agent_base.streaming import get_formatter
-            stream_formatter = get_formatter(stream_formatter)
-
-        # Fire on_relay_result hook for each relay result before resuming.
         for block in relay_results:
             if isinstance(block, ToolResultBase):
                 tool_name = block.tool_name or self._get_relay_tool_name(block.tool_id, pending)
@@ -637,15 +666,111 @@ class AnthropicAgent(Agent):
                     stream_formatter=stream_formatter,
                 )
 
-        # Clear pending relay.
         self.agent_config.pending_relay = None
 
-        # Emit meta_init for the resumed stream.
         if queue and stream_formatter:
             await self._emit_meta_init(combined_message, queue, stream_formatter)
 
-        # Resume the agent loop.
-        return await self._resume_loop(queue, stream_formatter)
+    async def _await_inline_relay(
+        self,
+        pending_tool_ids: list[str],
+        classification,
+        queue: asyncio.Queue | None,
+        stream_formatter: StreamFormatter | None,
+    ) -> AgentResult | None:
+        """Pause this subagent on the relay registry until results arrive.
+
+        Returns ``None`` on successful resume (the caller should ``continue``
+        the ``_resume_loop`` to make the next LLM call), or an
+        ``AgentResult`` if the child was cancelled while waiting (the caller
+        should return it upward like the normal cancel path).
+
+        The Future wait races against ``self._cancellation_event`` so an
+        abort/steer on the parent wakes every blocked child; ``finally``
+        guarantees the registry entry is cleaned up on every exit path.
+        """
+        from agent_base.relay import get_inline_relay_registry
+
+        owner = (self.agent_config.extras or {}).get("owner")
+        if not isinstance(owner, dict):
+            raise RuntimeError(
+                "inline-await subagent missing agent_config.extras['owner']; "
+                "the host must populate it on the root agent before run_stream"
+            )
+        organization_id = str(owner["organization_id"])
+        member_id = str(owner["member_id"])
+        root_agent_uuid = str(owner["root_agent_uuid"])
+
+        registry = get_inline_relay_registry()
+        future = await registry.register(
+            child_agent_uuid=self.agent_config.agent_uuid,
+            root_agent_uuid=root_agent_uuid,
+            organization_id=organization_id,
+            member_id=member_id,
+            pending_tool_use_ids=set(pending_tool_ids),
+        )
+
+        # Emit the awaiting_frontend_tools delta so the client sees the
+        # pause and knows which tools to run — same event shape the root
+        # uses, just carrying this child's agent_uuid.
+        if queue is not None:
+            fmt = stream_formatter if stream_formatter is not None else get_formatter(DEFAULT_STREAM_FORMATTER)
+            pending_tools = [
+                {"tool_use_id": tc.tool_id, "name": tc.name, "input": tc.input}
+                for tc in (*classification.frontend_calls, *classification.confirmation_calls)
+            ]
+            delta = MetaDelta(
+                agent_uuid=self.agent_config.agent_uuid,
+                type="awaiting_frontend_tools",
+                payload={"tools": pending_tools},
+                is_final=True,
+            )
+            await fmt.format_delta(delta, queue)
+
+        cancel_event = self._cancellation_event
+        try:
+            if cancel_event is not None:
+                cancel_task = asyncio.create_task(cancel_event.wait())
+                done, pending = await asyncio.wait(
+                    {future, cancel_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if cancel_task in done and future not in done:
+                    # Abort/steer/disconnect reached us before results did.
+                    for p in pending:
+                        p.cancel()
+                    self._phase = AgentPhase.IDLE
+                    if self._abort_completion is not None:
+                        self._abort_completion.set()
+                    return self._build_aborted_result()
+                # Future done; tidy up the cancel waiter.
+                for p in pending:
+                    p.cancel()
+            else:
+                try:
+                    await future
+                except asyncio.CancelledError:
+                    # drop_tree (client disconnect / turn teardown) cancelled
+                    # the future — fall through to the aborted-result path
+                    # rather than letting the cancellation propagate.
+                    pass
+
+            if future.cancelled():
+                # Registry dropped us (e.g. client disconnect drop_tree).
+                self._phase = AgentPhase.IDLE
+                if self._abort_completion is not None:
+                    self._abort_completion.set()
+                return self._build_aborted_result()
+
+            relay_results = future.result()
+        finally:
+            registry.pop(self.agent_config.agent_uuid)
+
+        # Splice backend + incoming frontend results and persist once so a
+        # subsequent turn can resume by ``resume_agent_uuid=<child>``.
+        await self._splice_relay_results(relay_results, queue, stream_formatter)
+        await self._persist_state()
+        return None
 
     async def _resume_loop(self, queue: asyncio.Queue | None = None, stream_formatter: str | StreamFormatter | None = None) -> AgentResult:
 
@@ -819,10 +944,38 @@ class AnthropicAgent(Agent):
                             run_id=self._run_id,
                         )
 
-                        # Persist state before pausing.
+                        pending_tool_ids = [
+                            tc.tool_id
+                            for tc in (*classification.frontend_calls, *classification.confirmation_calls)
+                        ]
+
+                        if self._relay_mode == "inline_await":
+                            # Subagent branch: do NOT persist pending_relay
+                            # (the parent's ``asyncio.gather`` still holds the
+                            # child coroutine; on a worker crash the root's
+                            # last checkpoint predates the spawn tool_use so
+                            # resuming from DB would give wrong state), do
+                            # NOT return — instead park on an asyncio.Future
+                            # keyed by this child's uuid and let the relay
+                            # registry wake us when results arrive.
+                            relay_result = await self._await_inline_relay(
+                                pending_tool_ids=pending_tool_ids,
+                                classification=classification,
+                                queue=queue,
+                                stream_formatter=stream_formatter,
+                            )
+                            if relay_result is not None:
+                                return relay_result
+                            # Future resolved with results and were spliced in;
+                            # continue the loop to make the next LLM call.
+                            continue
+
+                        # Root branch (persist_return): serialize state, emit
+                        # the frontend notification, close the turn with
+                        # stop_reason="relay"; the client's POST to
+                        # ``/tool_results`` rehydrates and continues.
                         await self._persist_state()
 
-                        # Emit awaiting_frontend_tools event to notify the frontend.
                         if queue is not None:
                             fmt = stream_formatter if stream_formatter is not None else get_formatter(DEFAULT_STREAM_FORMATTER)
                             pending_tools = [
@@ -1486,6 +1639,7 @@ class AnthropicAgent(Agent):
                         sandbox=self._sandbox,
                         sandbox_factory=self._sandbox_factory,
                         memory_store=self.memory_store,
+                        parent_agent=self,
                     ))
 
     # ─── Mid-Run Reconfiguration ──────────────────────────────────────
@@ -1621,6 +1775,9 @@ class AnthropicAgent(Agent):
                 set_ctx = getattr(tool_instance, 'set_run_context', None)
                 if callable(set_ctx):
                     set_ctx(queue, formatter)
+                set_cancel = getattr(tool_instance, 'set_cancellation_event', None)
+                if callable(set_cancel):
+                    set_cancel(self._cancellation_event)
 
     def _extract_tool_calls(self, message: Message) -> list[ToolCallInfo]:
         """Extract local client tool calls from an assistant message.
@@ -1777,6 +1934,70 @@ class AnthropicAgent(Agent):
                 self._cumulative_cost.breakdown[k] = round(
                     self._cumulative_cost.breakdown.get(k, 0.0) + v, 6
                 )
+
+        # Bubble this step into the parent's sinks for inline-await children
+        # so credits deducted from the root ``AgentResult.cost`` reflect the
+        # whole tree. Pass the already-computed ``step_cost`` to avoid
+        # re-pricing with the parent's (possibly different) model.
+        if self._parent_usage_forward is not None:
+            self._parent_usage_forward._ingest_child_usage(step_usage, step_cost)
+
+    def _ingest_child_usage(
+        self,
+        step_usage: Usage,
+        step_cost: "CostBreakdown | None",
+    ) -> None:
+        """Fold an inline-await child's step usage/cost into this agent's sinks.
+
+        Mirrors ``_accumulate_usage`` but skips the ``calculate_step_cost``
+        call (the child already priced with its own model) and does not
+        touch ``last_known_*_tokens`` or ``session_cumulative_usage``
+        (those describe this agent's own last step).
+        """
+        self._run_cumulative_usage.input_tokens += step_usage.input_tokens
+        self._run_cumulative_usage.output_tokens += step_usage.output_tokens
+        self._cumulative_usage.input_tokens += step_usage.input_tokens
+        self._cumulative_usage.output_tokens += step_usage.output_tokens
+        if step_usage.cache_write_tokens:
+            self._run_cumulative_usage.cache_write_tokens = (
+                (self._run_cumulative_usage.cache_write_tokens or 0)
+                + step_usage.cache_write_tokens
+            )
+            self._cumulative_usage.cache_write_tokens = (
+                (self._cumulative_usage.cache_write_tokens or 0)
+                + step_usage.cache_write_tokens
+            )
+        if step_usage.cache_read_tokens:
+            self._run_cumulative_usage.cache_read_tokens = (
+                (self._run_cumulative_usage.cache_read_tokens or 0)
+                + step_usage.cache_read_tokens
+            )
+            self._cumulative_usage.cache_read_tokens = (
+                (self._cumulative_usage.cache_read_tokens or 0)
+                + step_usage.cache_read_tokens
+            )
+        if step_usage.thinking_tokens:
+            self._run_cumulative_usage.thinking_tokens = (
+                (self._run_cumulative_usage.thinking_tokens or 0)
+                + step_usage.thinking_tokens
+            )
+            self._cumulative_usage.thinking_tokens = (
+                (self._cumulative_usage.thinking_tokens or 0)
+                + step_usage.thinking_tokens
+            )
+
+        if step_cost:
+            self._cumulative_cost.total_cost = round(
+                self._cumulative_cost.total_cost + step_cost.total_cost, 6
+            )
+            for k, v in step_cost.breakdown.items():
+                self._cumulative_cost.breakdown[k] = round(
+                    self._cumulative_cost.breakdown.get(k, 0.0) + v, 6
+                )
+
+        # Chain: if this agent is itself an inline-await child, forward up.
+        if self._parent_usage_forward is not None:
+            self._parent_usage_forward._ingest_child_usage(step_usage, step_cost)
 
     def _build_agent_result(
         self,
