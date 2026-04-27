@@ -28,6 +28,8 @@ from agent_base.core.messages import Message, Usage
 from agent_base.core.result import AgentResult, LogEntry
 from agent_base.core.types import (
     ContentBlock,
+    Contribution,
+    ContributionPosition,
     Role,
     ServerToolResultContent,
     TextContent,
@@ -222,6 +224,13 @@ class AnthropicAgent(Agent):
         self._awaiting_tool_results = False
         self._compaction_controller: CompactionController | None = None
         self._context_externalizer: ContextExternalizer | None = None
+
+        # Per-run runtime contributions (memory, future system_help, etc.).
+        # Applied to the target user message at render time only — never
+        # persisted into context_messages. Reset at the start of each run.
+        # NOTE: instance state, lost on cold-load resume — known v1 limitation.
+        self._runtime_contributions: list[Contribution] = []
+        self._runtime_target_msg_id: str | None = None
 
         # Composition
         self.provider = AnthropicProvider(fallback_api_keys=fallback_api_keys)
@@ -513,6 +522,62 @@ class AnthropicAgent(Agent):
         self.agent_config.context_messages.append(context_message)
         self._append_message_to_logs(history_variant)
 
+    async def _build_runtime_contributions(self, prompt: Message) -> list[Contribution]:
+        """Collect per-run augmentations (memory, future hooks) as Contributions.
+
+        Returns a fresh list each run; callers store it on instance state and
+        apply it to the target user message at render time only. The Contributions
+        produced here are NEVER appended to ``prompt.contributions`` directly,
+        which would cause them to be persisted in ``context_messages`` and then
+        re-injected on every replay turn.
+        """
+        runtime: list[Contribution] = []
+        if self.memory_store:
+            memories = await self.memory_store.retrieve(
+                user_message=prompt,
+                messages=self.agent_config.context_messages,
+            )
+            if memories:
+                runtime.append(
+                    Contribution(
+                        slot="memory",
+                        content=memories,
+                        source="memory",
+                        position=ContributionPosition.BEFORE.value,
+                    )
+                )
+        return runtime
+
+    def _select_tail_for_mode(self) -> str | None:
+        """Return the tail instruction for the current agent mode.
+
+        Base implementation returns ``None`` so the renderer falls back to its
+        default (``DEFAULT_TAIL_INSTRUCTION``). Subclasses (e.g. NovaAgent) can
+        override to vary the tail per mode (plan/ask/full).
+        """
+        return None
+
+    def _build_render_view(self, messages: list[Message]) -> list[Message]:
+        """Render every message for the LLM wire, applying runtime contributions
+        to the target user message only.
+
+        Runtime contributions (memory, etc.) are applied transiently — they are
+        never persisted — so each provider call within a single run sees the same
+        rendered shape, but the underlying ``context_messages`` stays clean.
+        """
+        target_id = self._runtime_target_msg_id
+        runtime = self._runtime_contributions
+        tail = self._select_tail_for_mode()
+        rendered: list[Message] = []
+        for msg in messages:
+            view_msg = (
+                msg.with_runtime_contributions(runtime)
+                if (msg.id == target_id and runtime)
+                else msg
+            )
+            rendered.append(view_msg.render(tail_instruction=tail))
+        return rendered
+
     async def run(self, prompt: str | Message) -> AgentResult:
         if not self._initialized:
             await self.initialize()
@@ -524,13 +589,8 @@ class AnthropicAgent(Agent):
 
         self.initialize_run(prompt)
 
-        if self.memory_store:
-            memories = await self.memory_store.retrieve(
-                user_message=prompt,
-                messages=self.agent_config.context_messages
-            )
-            if memories:
-                prompt.content.extend(memories)
+        self._runtime_contributions = await self._build_runtime_contributions(prompt)
+        self._runtime_target_msg_id = prompt.id
 
         if self._context_externalizer is not None:
             context_prompt = await self._context_externalizer.externalize_prompt(prompt)
@@ -561,13 +621,8 @@ class AnthropicAgent(Agent):
 
         self.initialize_run(prompt)
 
-        if self.memory_store:
-            memories = await self.memory_store.retrieve(
-                user_message=prompt,
-                messages=self.agent_config.context_messages
-            )
-            if memories:
-                prompt.content.extend(memories)
+        self._runtime_contributions = await self._build_runtime_contributions(prompt)
+        self._runtime_target_msg_id = prompt.id
 
         if self._context_externalizer is not None:
             context_prompt = await self._context_externalizer.externalize_prompt(prompt)
@@ -816,10 +871,11 @@ class AnthropicAgent(Agent):
                         self._replace_context_messages(compacted_messages)
 
                 try:
+                    render_view = self._build_render_view(self.agent_config.context_messages)
                     if queue:
                         stream_result: StreamResult = await self.provider.generate_stream(
                             system_prompt=self.agent_config.system_prompt,
-                            messages=self.agent_config.context_messages,
+                            messages=render_view,
                             tool_schemas=self.agent_config.tool_schemas,
                             llm_config=self.agent_config.llm_config,
                             model=self.agent_config.model,
@@ -842,7 +898,7 @@ class AnthropicAgent(Agent):
                     else:
                         response_message = await self.provider.generate(
                             system_prompt=self.agent_config.system_prompt,
-                            messages=self.agent_config.context_messages,
+                            messages=render_view,
                             tool_schemas=self.agent_config.tool_schemas,
                             llm_config=self.agent_config.llm_config,
                             model=self.agent_config.model,
