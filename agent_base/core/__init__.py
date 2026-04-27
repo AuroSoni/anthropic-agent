@@ -11,7 +11,16 @@ their respective modules to avoid circular imports:
 - ``agent_base.core.provider``: Provider
 """
 
-from .types import ContentBlock, Role, ContentBlockType
+from .types import (
+    Attachment,
+    AttachmentKind,
+    ContentBlock,
+    ContentBlockType,
+    Contribution,
+    ContributionPosition,
+    Role,
+)
+from .renderer import DEFAULT_TAIL_INSTRUCTION, render_user_message
 from .conversation_log import (
     AgentDescriptor,
     ConversationLog,
@@ -36,6 +45,14 @@ __all__ = [
     "ContentBlock",
     "Role",
     "ContentBlockType",
+    # Prompt-input primitives
+    "Attachment",
+    "AttachmentKind",
+    "Contribution",
+    "ContributionPosition",
+    # Renderer
+    "DEFAULT_TAIL_INSTRUCTION",
+    "render_user_message",
     # Conversation log
     "AgentDescriptor",
     "ConversationLog",

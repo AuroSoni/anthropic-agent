@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from agent_base.core.messages import Message, Usage
-from agent_base.core.types import ContentBlock, Role
+from agent_base.core.types import Attachment, ContentBlock, Contribution, Role
 
 
 def _now_iso() -> str:
@@ -128,6 +128,11 @@ class MessageLogEntry:
     agent_uuid: str = ""
     role: Role = Role.USER
     content: list[ContentBlock] = field(default_factory=list)
+    # USER-side prompt-input metadata (empty for non-USER messages). Carrying
+    # these on the log entry preserves the canonical Message shape so audit /
+    # replay can reconstruct exactly what the user supplied.
+    attachments: list[Attachment] = field(default_factory=list)
+    contributions: list[Contribution] = field(default_factory=list)
     stop_reason: str | None = None
     usage: Usage | None = None
     provider: str = ""
@@ -146,6 +151,8 @@ class MessageLogEntry:
             agent_uuid=agent_uuid,
             role=message.role,
             content=list(message.content),
+            attachments=list(message.attachments),
+            contributions=list(message.contributions),
             stop_reason=message.stop_reason,
             usage=message.usage,
             provider=message.provider,
@@ -159,6 +166,8 @@ class MessageLogEntry:
             "agent_uuid": self.agent_uuid,
             "role": self.role.value,
             "content": [block.to_dict() for block in self.content],
+            "attachments": [a.to_dict() for a in self.attachments],
+            "contributions": [c.to_dict() for c in self.contributions],
             "stop_reason": self.stop_reason,
             "usage": self.usage.to_dict() if self.usage else None,
             "provider": self.provider,
@@ -172,6 +181,8 @@ class MessageLogEntry:
             agent_uuid=data["agent_uuid"],
             role=Role(data["role"]),
             content=[ContentBlock.from_dict(block) for block in data.get("content", [])],
+            attachments=[Attachment.from_dict(a) for a in data.get("attachments", [])],
+            contributions=[Contribution.from_dict(c) for c in data.get("contributions", [])],
             stop_reason=data.get("stop_reason"),
             usage=Usage.from_dict(data["usage"]) if data.get("usage") else None,
             provider=data.get("provider", ""),
